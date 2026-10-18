@@ -1,4 +1,4 @@
-// Package go2sa lowering: AST -> SA text (S2f: S2e + switch tag/case/default).
+// Package go2sa lowering: AST -> SA text (S2g: S2f + multi-func i32 params/return).
 package go2sa
 
 import (
@@ -21,6 +21,12 @@ type saGen struct {
 	lbl      int
 	vars     map[string]bool
 	varOrder []string
+	// curFunc tracks current function scope (S2g): params/ret + per-func state.
+	curFunc *funcScope
+	// funcs indexes all top-level funcs for call checking (S2g).
+	funcs map[string]*funcScope
+	// callTmps tracks call-result temps needing `!` after single use (S2g, per func).
+	callTmps map[string]bool
 	// term tracks whether current sequential flow already terminated (S2e).
 	term bool
 	// loopStack tracks enclosing for labels for break/continue (S2e).
@@ -30,6 +36,13 @@ type saGen struct {
 	// nestIsFor orders for(true)/switch(false) nesting for break targeting (S2f).
 	nestIsFor []bool
 	refusals  []Refusal
+}
+
+// funcScope holds per-function lowering state (S2g).
+type funcScope struct {
+	name   string
+	params []string
+	ret    bool
 }
 
 // loopTarget holds top/post/end labels of one enclosing for (S2e).
@@ -100,9 +113,9 @@ func (g *saGen) internStr(s string) string {
 }
 
 // saLowerFile lowers one parsed Go file to SA text.
-// S2f: S2e + switch tag/case/default (no init, no tag-less, no fallthrough); all else loud refusal.
+// S2g: S2f + top-level `func name(p,...i32) [i32]` + calls + return; all else loud refusal.
 func saLowerFile(fset *token.FileSet, f *ast.File, _ string) *Output {
-	g := &saGen{fset: fset, hasImp: map[string]bool{}, strPool: map[string]int{}, vars: map[string]bool{}}
+	g := &saGen{fset: fset, hasImp: map[string]bool{}, strPool: map[string]int{}}
 	if f.Name == nil || f.Name.Name != "main" {
 		g.refuseAt(f.Package, "go2sa only supports package main (got %q)", f.Name.Name)
 		return &Output{Refusals: g.refusals}
@@ -113,57 +126,190 @@ func saLowerFile(fset *token.FileSet, f *ast.File, _ string) *Output {
 			g.refuseAt(imp.Pos(), "go2sa S2a only supports import \"fmt\"")
 		}
 	}
+	var order []*ast.FuncDecl
+	byName := map[string]*funcScope{}
 	var mainFn *ast.FuncDecl
+	// Shared pools across functions (aliased, not copied): imports/consts/strPool.
+	g.imports = nil
+	g.consts = nil
+	g.strPool = map[string]int{}
+	g.hasImp = map[string]bool{}
 	for _, decl := range f.Decls {
 		if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.IMPORT {
 			continue // imports checked above
 		}
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok {
-			g.refuseAt(decl.Pos(), "go2sa S2a only supports func main (no top-level %T)", decl)
+			g.refuseAt(decl.Pos(), "go2sa S2g only supports func declarations (no top-level %T)", decl)
 			continue
 		}
-		if fn.Recv != nil || fn.Name.Name != "main" {
-			g.refuseAt(fn.Pos(), "go2sa S2a only supports func main (got %q)", fn.Name.Name)
+		if fn.Recv != nil {
+			g.refuseAt(fn.Pos(), "go2sa S2g methods not supported (got %q)", fn.Name.Name)
 			continue
 		}
-		if mainFn != nil {
-			g.refuseAt(fn.Pos(), "duplicate func main")
+		if _, dup := byName[fn.Name.Name]; dup {
+			g.refuseAt(fn.Pos(), "duplicate func %q", fn.Name.Name)
 			continue
 		}
-		mainFn = fn
+		params, ret, ok := checkFuncSig(g, fn)
+		if !ok {
+			continue
+		}
+		byName[fn.Name.Name] = &funcScope{name: fn.Name.Name, params: params, ret: ret}
+		order = append(order, fn)
+		if fn.Name.Name == "main" {
+			if len(params) != 0 || ret {
+				g.refuseAt(fn.Pos(), "go2sa S2g func main must be main() with no result")
+				continue
+			}
+			mainFn = fn
+		}
 	}
 	if len(g.refusals) > 0 {
 		return &Output{Refusals: g.refusals}
 	}
 	if mainFn == nil {
-		g.refuseAt(f.Package, "go2sa S2a requires func main")
+		g.refuseAt(f.Package, "go2sa S2g requires func main")
 		return &Output{Refusals: g.refusals}
 	}
-	var body strings.Builder
-	old := g.sb
-	g.sb = body
-	g.lowerBlock(mainFn.Body)
-	bodyStr := g.sb.String()
-	g.sb = old
-	if len(g.refusals) > 0 {
-		return &Output{Refusals: g.refusals}
+	g.funcs = byName
+	// Emit each function with isolated scope; shared imports/consts/strPool.
+	type fnOut struct {
+		header string
+		body   string
+		footer []string
+	}
+	var outs []fnOut
+	for _, fn := range order {
+		sc := byName[fn.Name.Name]
+		fg := &saGen{
+			fset: fset, hasImp: g.hasImp,
+			strPool: g.strPool, consts: g.consts, imports: g.imports,
+			vars:  map[string]bool{},
+			funcs: byName, curFunc: sc,
+		}
+		// Share pools by reference via copying back after each func.
+		fg.tmp = g.tmp
+		fg.lbl = g.lbl
+		var params []string
+		for _, p := range sc.params {
+			fg.vars[p] = true
+			fg.varOrder = append(fg.varOrder, p)
+			params = append(params, p+": i32")
+		}
+		fg.sb.WriteString("")
+		fg.lowerBlock(fn.Body)
+		if len(fg.refusals) > 0 {
+			g.refusals = append(g.refusals, fg.refusals...)
+			return &Output{Refusals: g.refusals}
+		}
+		g.tmp = fg.tmp
+		g.lbl = fg.lbl
+		g.consts = fg.consts
+		g.imports = fg.imports
+		var header string
+		if fn.Name.Name == "main" {
+			header = "@main() -> i32:\n"
+		} else if sc.ret {
+			header = fmt.Sprintf("@%s(%s) -> i32:\n", fn.Name.Name, strings.Join(params, ", "))
+		} else {
+			header = fmt.Sprintf("@%s(%s) -> void:\n", fn.Name.Name, strings.Join(params, ", "))
+		}
+		body := fg.sb.String()
+		var footer []string
+		if fg.term {
+			// Terminated (return/break): no trailing releases (unreachable).
+			// Params are owned by caller; locals already released inline.
+		} else {
+			for _, name := range fg.varOrder {
+				footer = append(footer, fmt.Sprintf("  !%s", name))
+			}
+		}
+		if fn.Name.Name == "main" {
+			footer = append(footer, "  ret 0")
+		} else if !sc.ret && !fg.term {
+			footer = append(footer, "  return")
+		}
+		outs = append(outs, fnOut{header: header, body: body, footer: footer})
+		if sc.ret && !fg.term {
+			g.refuseAt(fn.Body.Rbrace, "go2sa S2g func %q with i32 result must end with return", fn.Name.Name)
+			return &Output{Refusals: g.refusals}
+		}
 	}
 	var out strings.Builder
-	out.WriteString("// Generated by go2sa S2f: parse(go/parser) -> lower -> emit(SA text + sci macros)\n")
+	out.WriteString("// Generated by go2sa S2g: parse(go/parser) -> lower -> emit(SA text + sci macros)\n")
 	for _, imp := range g.imports {
 		fmt.Fprintf(&out, "@import %q\n", imp)
 	}
 	for _, c := range g.consts {
 		out.WriteString(c + "\n")
 	}
-	out.WriteString("@main() -> i32:\n")
-	out.WriteString(bodyStr)
-	for _, name := range g.varOrder {
-		fmt.Fprintf(&out, "  !%s\n", name)
+	for _, o := range outs {
+		out.WriteString(o.header)
+		out.WriteString(o.body)
+		for _, l := range o.footer {
+			out.WriteString(l + "\n")
+		}
 	}
-	out.WriteString("  ret 0\n")
 	return &Output{SAI: out.String()}
+}
+
+// checkFuncSig validates S2g signature: params all `name int`, at most one `int` result.
+func checkFuncSig(g *saGen, fn *ast.FuncDecl) ([]string, bool, bool) {
+	var params []string
+	if fn.Type.Params != nil {
+		for _, field := range fn.Type.Params.List {
+			if !isIntType(field.Type) {
+				g.refuseAt(field.Type.Pos(), "go2sa S2g params must be int (func %q)", fn.Name.Name)
+				return nil, false, false
+			}
+			if len(field.Names) == 0 {
+				g.refuseAt(field.Type.Pos(), "go2sa S2g params need names (func %q)", fn.Name.Name)
+				return nil, false, false
+			}
+			for _, nm := range field.Names {
+				params = append(params, nm.Name)
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, p := range params {
+		if seen[p] {
+			g.refuseAt(fn.Pos(), "go2sa S2g duplicate param %q (func %q)", p, fn.Name.Name)
+			return nil, false, false
+		}
+		seen[p] = true
+	}
+	ret := false
+	if fn.Type.Results != nil {
+		n := 0
+		for _, field := range fn.Type.Results.List {
+			k := len(field.Names)
+			if k == 0 {
+				k = 1
+			}
+			for i := 0; i < k; i++ {
+				n++
+				typ := field.Type
+				if !isIntType(typ) {
+					g.refuseAt(field.Type.Pos(), "go2sa S2g result must be int (func %q)", fn.Name.Name)
+					return nil, false, false
+				}
+			}
+		}
+		if n > 1 {
+			g.refuseAt(fn.Type.Results.Pos(), "go2sa S2g at most one result (func %q)", fn.Name.Name)
+			return nil, false, false
+		}
+		ret = n == 1
+	}
+	return params, ret, true
+}
+
+// isIntType reports whether e is plain `int`.
+func isIntType(e ast.Expr) bool {
+	id, ok := e.(*ast.Ident)
+	return ok && id.Name == "int"
 }
 
 func (g *saGen) lowerBlock(b *ast.BlockStmt) {
@@ -197,8 +343,10 @@ func (g *saGen) lowerStmt(s ast.Stmt) {
 		g.lowerBranchStmt(n)
 	case *ast.SwitchStmt:
 		g.lowerSwitchStmt(n)
+	case *ast.ReturnStmt:
+		g.lowerReturnStmt(n)
 	default:
-		g.refuseAt(s.Pos(), "go2sa S2f unsupported statement %T", s)
+		g.refuseAt(s.Pos(), "go2sa S2g unsupported statement %T", s)
 	}
 }
 
@@ -333,6 +481,37 @@ func (g *saGen) lowerBranchStmt(n *ast.BranchStmt) {
 	}
 }
 
+// lowerReturnStmt lowers `return [expr]` (S2g): main 禁 return；值函数须 1 个 i32，空函数须裸 return。
+func (g *saGen) lowerReturnStmt(n *ast.ReturnStmt) {
+	if g.curFunc == nil || g.curFunc.name == "main" {
+		g.refuseAt(n.Pos(), "go2sa S2g return outside value function")
+		return
+	}
+	if !g.curFunc.ret {
+		if len(n.Results) != 0 {
+			g.refuseAt(n.Pos(), "go2sa S2g void func %q must use bare return", g.curFunc.name)
+			return
+		}
+		fmt.Fprintf(&g.sb, "  return\n")
+		g.term = true
+		return
+	}
+	if len(n.Results) != 1 {
+		g.refuseAt(n.Pos(), "go2sa S2g func %q must return exactly 1 value", g.curFunc.name)
+		return
+	}
+	v := g.lowerI32(n.Results[0])
+	if v == "" {
+		return
+	}
+	// `return v` moves ownership to caller: no trailing `!v`.
+	fmt.Fprintf(&g.sb, "  return %s\n", v)
+	if g.callTmps != nil {
+		delete(g.callTmps, v)
+	}
+	g.term = true
+}
+
 // inForBodyForSwitch is superseded by nestIsFor ordering (kept for reference).
 func (g *saGen) inForBodyForSwitch() bool {
 	return len(g.loopStack) > 0
@@ -353,6 +532,16 @@ func (g *saGen) lowerSwitchStmt(n *ast.SwitchStmt) {
 	tag := g.lowerI32(n.Tag)
 	if tag == "" {
 		return
+	}
+	// Call-temp tags are single-use linear: spill to a hidden var for multi-case reuse.
+	if g.callTmps != nil && g.callTmps[tag] {
+		delete(g.callTmps, tag)
+		hidden := fmt.Sprintf("sw_tag_%d", g.lbl+1)
+		g.declareVar(hidden, n.Tag.Pos())
+		fmt.Fprintf(&g.sb, "  !%s\n", hidden)
+		fmt.Fprintf(&g.sb, "  %s = add %s, 0\n", hidden, tag)
+		fmt.Fprintf(&g.sb, "  !%s\n", tag)
+		tag = hidden
 	}
 	g.lbl++
 	endL := g.lbl
@@ -547,6 +736,8 @@ func (g *saGen) lowerCond(e ast.Expr) string {
 			}
 			t := g.nextTmp()
 			fmt.Fprintf(&g.sb, "  %s = %s %s, %s\n", t, op, l, r)
+			g.releaseIfCallTemp(l)
+			g.releaseIfCallTemp(r)
 			return t
 		}
 	}
@@ -556,6 +747,7 @@ func (g *saGen) lowerCond(e ast.Expr) string {
 	}
 	t := g.nextTmp()
 	fmt.Fprintf(&g.sb, "  %s = ne %s, 0\n", t, v)
+	g.releaseIfCallTemp(v)
 	return t
 }
 func (g *saGen) lowerAssignStmt(n *ast.AssignStmt) {
@@ -580,6 +772,7 @@ func (g *saGen) lowerAssignStmt(n *ast.AssignStmt) {
 		g.declareVar(id.Name, n.Pos())
 		fmt.Fprintf(&g.sb, "  !%s\n", id.Name)
 		fmt.Fprintf(&g.sb, "  %s = add %s, 0\n", id.Name, v)
+		g.releaseIfCallTemp(v)
 		return
 	}
 	if !g.vars[id.Name] {
@@ -588,12 +781,30 @@ func (g *saGen) lowerAssignStmt(n *ast.AssignStmt) {
 	}
 	fmt.Fprintf(&g.sb, "  !%s\n", id.Name)
 	fmt.Fprintf(&g.sb, "  %s = add %s, 0\n", id.Name, v)
+	g.releaseIfCallTemp(v)
 }
 
 func (g *saGen) lowerExprStmt(n *ast.ExprStmt) {
 	call, ok := n.X.(*ast.CallExpr)
 	if !ok {
-		g.refuseAt(n.Pos(), "go2sa S2a only supports fmt.Println calls")
+		g.refuseAt(n.Pos(), "go2sa S2g only supports calls as statements")
+		return
+	}
+	if id, ok := call.Fun.(*ast.Ident); ok {
+		sc, found := g.funcs[id.Name]
+		if !found {
+			g.refuseAt(call.Pos(), "go2sa S2g call to undefined func %q", id.Name)
+			return
+		}
+		if sc.ret {
+			g.refuseAt(call.Pos(), "go2sa S2g value func %q result must be used", id.Name)
+			return
+		}
+		args := g.lowerCallArgs(call, sc)
+		if args == nil {
+			return
+		}
+		fmt.Fprintf(&g.sb, "  call @%s(%s)\n", id.Name, strings.Join(args, ", "))
 		return
 	}
 	sel, ok := call.Fun.(*ast.SelectorExpr)
@@ -641,6 +852,7 @@ func (g *saGen) lowerPrintlnArg(arg ast.Expr) {
 		return
 	}
 	g.emitPrintI32(v)
+	g.releaseIfCallTemp(v)
 }
 
 func (g *saGen) emitPrintI32(v string) {
@@ -742,8 +954,71 @@ func (g *saGen) lowerI32(e ast.Expr) string {
 			return ""
 		}
 		return n.Name
+	case *ast.CallExpr:
+		return g.lowerCallValue(n)
 	default:
 		g.refuseAt(e.Pos(), "go2sa S2b Println needs string or integer expression")
 		return ""
 	}
+}
+
+// lowerCallValue lowers a call to a user value-func returning i32 (S2g).
+func (g *saGen) lowerCallValue(n *ast.CallExpr) string {
+	id, ok := n.Fun.(*ast.Ident)
+	if !ok {
+		g.refuseAt(n.Pos(), "go2sa S2g only supports direct calls to local funcs")
+		return ""
+	}
+	sc, ok := g.funcs[id.Name]
+	if !ok {
+		g.refuseAt(n.Pos(), "go2sa S2g call to undefined func %q", id.Name)
+		return ""
+	}
+	if !sc.ret {
+		g.refuseAt(n.Pos(), "go2sa S2g void func %q cannot be used as a value", id.Name)
+		return ""
+	}
+	args := g.lowerCallArgs(n, sc)
+	if args == nil {
+		return ""
+	}
+	t := g.nextTmp()
+	fmt.Fprintf(&g.sb, "  %s = call @%s(%s)\n", t, id.Name, strings.Join(args, ", "))
+	for _, a := range args {
+		g.releaseIfCallTemp(a)
+	}
+	if g.callTmps == nil {
+		g.callTmps = map[string]bool{}
+	}
+	g.callTmps[t] = true
+	return t
+}
+
+// releaseIfCallTemp emits `!v` if v is a pending call-result temp (S2g single-use chain).
+func (g *saGen) releaseIfCallTemp(v string) {
+	if g.callTmps != nil && g.callTmps[v] {
+		delete(g.callTmps, v)
+		fmt.Fprintf(&g.sb, "  !%s\n", v)
+	}
+}
+
+// lowerCallArgs checks arity and lowers i32 args (S2g).
+func (g *saGen) lowerCallArgs(n *ast.CallExpr, sc *funcScope) []string {
+	if len(n.Args) != len(sc.params) {
+		g.refuseAt(n.Pos(), "go2sa S2g func %q wants %d args (got %d)", sc.name, len(sc.params), len(n.Args))
+		return nil
+	}
+	if n.Ellipsis.IsValid() {
+		g.refuseAt(n.Pos(), "go2sa S2g variadic call not supported (func %q)", sc.name)
+		return nil
+	}
+	var args []string
+	for _, a := range n.Args {
+		v := g.lowerI32(a)
+		if v == "" {
+			return nil
+		}
+		args = append(args, v)
+	}
+	return args
 }
