@@ -1,0 +1,3 @@
+# S2h P1 go/types 门禁：未定义变量必须定位拒收（真 Go 本体形）
+go/types:
+undefined: undefined_var

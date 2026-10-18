@@ -13,9 +13,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/importer"
 	goparser "go/parser"
 	"go/scanner"
 	"go/token"
+	gotypes "go/types"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,14 +45,15 @@ type Output struct {
 }
 
 // TranspileSA lowers one Go source file to SA text.
-// S1 skeleton: parse only; lowering lands in S2 -> loud refusal for now.
+// S2h P1: parse (go/parser, full object resolution) + type gate (go/types)
+// before lowering; type errors are loud refusals with positions.
 func TranspileSA(_ context.Context, input string, options Options) *Output {
 	fname := options.FileName
 	if fname == "" {
 		fname = "module.go"
 	}
 	fset := token.NewFileSet()
-	f, err := goparser.ParseFile(fset, fname, input, goparser.SkipObjectResolution)
+	f, err := goparser.ParseFile(fset, fname, input, 0)
 	if err != nil {
 		if el, ok := err.(scanner.ErrorList); ok && len(el) > 0 {
 			p := el[0].Pos
@@ -63,6 +67,27 @@ func TranspileSA(_ context.Context, input string, options Options) *Output {
 			return &Output{Refusals: []Refusal{{Line: line, Col: col, Msg: el[0].Msg}}}
 		}
 		return &Output{Refusals: []Refusal{{Line: 1, Col: 1, Msg: err.Error()}}}
+	}
+	// P1 type gate: go/types checks undefined vars, arity, type mismatches.
+	// importer.Default() reads gc export data (fmt available via toolchain).
+	conf := gotypes.Config{Importer: importer.Default()}
+	info := &gotypes.Info{
+		Defs: make(map[*ast.Ident]gotypes.Object),
+		Uses: make(map[*ast.Ident]gotypes.Object),
+	}
+	if _, err := conf.Check("main", fset, []*ast.File{f}, info); err != nil {
+		if el, ok := err.(scanner.ErrorList); ok && len(el) > 0 {
+			p := el[0].Pos
+			line, col := p.Line, p.Column
+			if line <= 0 {
+				line = 1
+			}
+			if col <= 0 {
+				col = 1
+			}
+			return &Output{Refusals: []Refusal{{Line: line, Col: col, Msg: "go/types: " + el[0].Msg}}}
+		}
+		return &Output{Refusals: []Refusal{{Line: 1, Col: 1, Msg: "go/types: " + err.Error()}}}
 	}
 	return saLowerFile(fset, f, input)
 }
