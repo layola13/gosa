@@ -45,8 +45,8 @@ type Output struct {
 }
 
 // TranspileSA lowers one Go source file to SA text.
-// S2h P1: parse (go/parser, full object resolution) + type gate (go/types)
-// before lowering; type errors are loud refusals with positions.
+// S2i P2: P1 gate + types.Info.Types threaded into lowering; hand int checks
+// replaced by type-driven isI32Expr (untyped consts accepted as i32).
 func TranspileSA(_ context.Context, input string, options Options) *Output {
 	fname := options.FileName
 	if fname == "" {
@@ -72,8 +72,9 @@ func TranspileSA(_ context.Context, input string, options Options) *Output {
 	// importer.Default() reads gc export data (fmt available via toolchain).
 	conf := gotypes.Config{Importer: importer.Default()}
 	info := &gotypes.Info{
-		Defs: make(map[*ast.Ident]gotypes.Object),
-		Uses: make(map[*ast.Ident]gotypes.Object),
+		Defs:  make(map[*ast.Ident]gotypes.Object),
+		Uses:  make(map[*ast.Ident]gotypes.Object),
+		Types: make(map[ast.Expr]gotypes.TypeAndValue),
 	}
 	if _, err := conf.Check("main", fset, []*ast.File{f}, info); err != nil {
 		if el, ok := err.(scanner.ErrorList); ok && len(el) > 0 {
@@ -89,7 +90,7 @@ func TranspileSA(_ context.Context, input string, options Options) *Output {
 		}
 		return &Output{Refusals: []Refusal{{Line: 1, Col: 1, Msg: "go/types: " + err.Error()}}}
 	}
-	return saLowerFile(fset, f, input)
+	return saLowerFile(fset, f, info)
 }
 
 // RunSA implements `go2sa --sa [--out O] <file.go> [...]`.
