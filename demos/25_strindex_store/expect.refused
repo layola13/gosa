@@ -1,0 +1,3 @@
+# S2u string 索引写拒收：变量串 s[0]= 只读（真 Go 本体形，P1 go/types 先于 S2u 守卫）
+go/types:
+cannot assign to s[0]
