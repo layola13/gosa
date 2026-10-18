@@ -1,0 +1,2 @@
+# S2r float 拒收：float 字面不能进 i32（真 Go 本体形）
+needs i32

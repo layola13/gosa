@@ -1,0 +1,2 @@
+# S2r float 拒收：签名仅 int（真 Go 本体形）
+must be int

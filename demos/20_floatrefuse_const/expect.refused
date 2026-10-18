@@ -1,0 +1,2 @@
+# S2r float 拒收：const 仅 int/bool/string（真 Go 本体形）
+must be int/bool/string literal
