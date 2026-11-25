@@ -29,8 +29,12 @@ type emitter struct {
 	ind       int
 	useVec    bool
 	useMap    bool
+	useChan   bool
 	rangeIncr []string // increment lines for enclosing range loops (continue support)
 	tmpSeq    int
+	scopes    []goScope // goroutine/channel lifetime scopes (emit_chan.go)
+	fnBase    int       // scopes index where the current function starts
+	loopDepth int
 }
 
 func (e *emitter) refuse(pos token.Pos, format string, args ...any) *Refusal {
@@ -90,6 +94,9 @@ func Transpile(path string) (string, error) {
 	if e.useMap {
 		hdr += "@import \"sa_std/hashmap.sa\"\n@import \"sa_std/core/option.sa\"\n"
 	}
+	if e.useChan {
+		hdr += "@import \"sa_std/task.sai\"\n@import \"sa_std/thread.sa\"\n@import \"sa_std/core/result.sa\"\n"
+	}
 	return hdr + "\n" + e.sb.String(), nil
 }
 
@@ -119,6 +126,11 @@ func (e *emitter) slaType(t types.Type) (string, bool) {
 		if kok && vok {
 			e.useMap = true
 			return "HashMap<" + kt + ", " + vt + ">", true
+		}
+	case *types.Chan:
+		if et, ok := e.slaType(u.Elem()); ok {
+			e.useChan = true
+			return "Chan<" + et + ">", true
 		}
 	case *types.Array:
 		if et, ok := e.slaType(u.Elem()); ok {
@@ -252,11 +264,14 @@ func (e *emitter) funcDecl(fn *ast.FuncDecl) error {
 	}
 	e.line("fn %s(%s) -> %s {", name, strings.Join(params, ", "), ret)
 	e.ind++
+	e.fnBase = len(e.scopes)
+	e.pushScope()
 	if fn.Body != nil {
 		if err := e.block(fn.Body, false); err != nil {
 			return err
 		}
 	}
+	e.popScopeEmitCleanup()
 	if isMain {
 		e.line("return 0;")
 	}
@@ -270,6 +285,7 @@ func (e *emitter) block(b *ast.BlockStmt, scoped bool) error {
 	if scoped {
 		e.line("{")
 		e.ind++
+		e.pushScope()
 	}
 	for _, s := range b.List {
 		if err := e.stmt(s); err != nil {
@@ -277,6 +293,7 @@ func (e *emitter) block(b *ast.BlockStmt, scoped bool) error {
 		}
 	}
 	if scoped {
+		e.popScopeEmitCleanup()
 		e.ind--
 		e.line("}")
 	}

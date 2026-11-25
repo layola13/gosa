@@ -1,0 +1,38 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/task.sai"
+@import "sa_std/thread.sa"
+@import "sa_std/core/result.sa"
+
+fn producer(out: Chan<i64>, done: Chan<bool>) -> void {
+    let i = 1;
+    while (i <= 100) {
+        out.send((i * i));
+        i = (i + 1);
+    }
+    done.send(true);
+}
+
+fn main() -> i32 {
+    let ch: Chan<i64> = Chan::new(0);
+    let done: Chan<bool> = Chan::new(0);
+    let __t1 = thread::spawn(^|| producer(ch, done));
+    let total = 0;
+    let remaining = true;
+    while remaining {
+        select {
+            case let (v, __t2) = ch.recv() {
+                total = (total + v);
+            }
+            case let (__t3, __t4) = done.recv() {
+                remaining = false;
+            }
+        }
+    }
+    println("{}", total);
+    let __t1_jr = __t1.join();
+    ch.destroy();
+    done.destroy();
+    return 0;
+}
+

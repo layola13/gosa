@@ -91,7 +91,16 @@ func (e *emitter) stmt(s ast.Stmt) error {
 		return e.assign(st)
 	case *ast.IncDecStmt:
 		return e.incDec(st)
+	case *ast.GoStmt:
+		return e.goStmt(st)
+	case *ast.SendStmt:
+		return e.sendStmt(st)
+	case *ast.SelectStmt:
+		return e.selectStmt(st)
 	case *ast.ReturnStmt:
+		if e.liveGo() {
+			return e.refuse(s.Pos(), "return with live goroutines/channels not yet supported")
+		}
 		if len(st.Results) == 0 {
 			e.line("return;")
 			return nil
@@ -222,6 +231,8 @@ func (e *emitter) bindMake(name string, c *ast.CallExpr, define bool) error {
 	switch ct.Underlying().(type) {
 	case *types.Slice:
 		return e.emitMakeSlice(name, c, define)
+	case *types.Chan:
+		return e.makeChan(name, c, define)
 	case *types.Map:
 		e.useMap = true
 		e.bind(name, "HashMap::new()", define)
@@ -232,6 +243,12 @@ func (e *emitter) bindMake(name string, c *ast.CallExpr, define bool) error {
 }
 
 func (e *emitter) assign(st *ast.AssignStmt) error {
+	// Receive assignment: v := <-ch / v, ok := <-ch (any target count).
+	if len(st.Rhs) == 1 {
+		if chX, isRecv := recvChan(st.Rhs[0]); isRecv {
+			return e.recvAssign(st.Lhs, chX, st.Tok == token.DEFINE, st.Pos())
+		}
+	}
 	if len(st.Lhs) != 1 || len(st.Rhs) != 1 {
 		return e.refuse(st.Pos(), "multiple assignment not yet supported")
 	}
@@ -415,7 +432,10 @@ func (e *emitter) forStmt(st *ast.ForStmt) error {
 	}
 	e.line("while %s {", cond)
 	e.ind++
-	if err := e.block(st.Body, false); err != nil {
+	e.loopDepth++
+	err := e.block(st.Body, false)
+	e.loopDepth--
+	if err != nil {
 		return err
 	}
 	if st.Post != nil {
@@ -468,7 +488,9 @@ func (e *emitter) rangeStmt(st *ast.RangeStmt) error {
 		}
 	}
 	e.rangeIncr = append(e.rangeIncr, incr)
+	e.loopDepth++
 	err = e.block(st.Body, false)
+	e.loopDepth--
 	e.rangeIncr = e.rangeIncr[:len(e.rangeIncr)-1]
 	if err != nil {
 		return err

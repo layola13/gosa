@@ -1,2 +1,0 @@
-# goroutine/chan/select 尚未落地：chan 形参在 gosla 门禁定位拒收（真 Go 本体形）
-unsupported param type
