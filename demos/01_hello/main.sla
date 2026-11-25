@@ -1,0 +1,8 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    println("hello world");
+    return 0;
+}
+

@@ -1,0 +1,11 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    println("{}", (2 + (3 * 4)));
+    println("{}", ((20 - 8) / 3));
+    println("{}", (17 % 5));
+    println("{}", (-(2 + 3)));
+    return 0;
+}
+

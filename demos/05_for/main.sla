@@ -1,0 +1,19 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    let sum = 0;
+    let i = 0;
+    while (i < 10) {
+        sum = (sum + i);
+        i = i + 1;
+    }
+    println("{}", sum);
+    let j = 10;
+    while (j > 0) {
+        println("{}", j);
+        j = j - 1;
+    }
+    return 0;
+}
+

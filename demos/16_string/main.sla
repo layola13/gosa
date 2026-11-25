@@ -1,0 +1,16 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    let s = "hello";
+    println(s);
+    println("{}", len(s));
+    let t = s;
+    println(t);
+    s = "world!";
+    println(s);
+    println("{}", len(s));
+    println(t);
+    return 0;
+}
+

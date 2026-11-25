@@ -1,2 +1,2 @@
-# S2r float 拒收：float 字面不能进 i32（真 Go 本体形）
-needs i32
+# float 字面拒收：gosla 增量1 不支持 float 字面（真 Go 本体形）
+unsupported literal FLOAT
