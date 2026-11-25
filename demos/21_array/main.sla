@@ -1,0 +1,23 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    let a = [0, 0, 0];
+    a[0] = 7;
+    a[1] = 8;
+    println("{}", (a[0] + a[1]));
+    println("{}", len(a));
+    let b = [10, 20];
+    println("{}", (b[0] + b[1]));
+    let c = [0, 100, 200];
+    println("{}", ((c[0] + c[1]) + c[2]));
+    let sum = 0;
+    let i = 0;
+    while (i < len(a)) {
+        sum = (sum + a[i]);
+        i = i + 1;
+    }
+    println("{}", sum);
+    return 0;
+}
+

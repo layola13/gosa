@@ -1,0 +1,32 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+struct Flag {
+    on: bool,
+    n: i64,
+}
+
+fn main() -> i32 {
+    let p = Point { x: 3, y: 4 };
+    println("{}", p.x);
+    println("{}", p.y);
+    p.x = 10;
+    println("{}", (p.x + p.y));
+    let q = Point { x: 1, y: 2 };
+    println("{}", (q.x + q.y));
+    let f = Flag { on: true, n: 7 };
+    if f.on {
+        println("{}", f.n);
+    } else {
+        println("{}", 0);
+    };
+    f.n = (f.n + 1);
+    println("{}", f.n);
+    return 0;
+}
+

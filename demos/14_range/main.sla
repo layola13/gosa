@@ -1,0 +1,49 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/vec.sa"
+
+fn main() -> i32 {
+    let s = Vec::new();
+    let __t1 = 0;
+    while __t1 < 0 {
+        s.push(0);
+        __t1 = __t1 + 1;
+    }
+    s.push(10);
+    s.push(20);
+    s.push(30);
+    let sum = 0;
+    let __t2 = 0;
+    while __t2 < len(s) {
+        let i = __t2;
+        let v = s[__t2];
+        sum = ((sum + i) + v);
+        __t2 = __t2 + 1;
+    }
+    println("{}", sum);
+    let prod = 0;
+    let __t3 = 0;
+    while __t3 < len(s) {
+        let i = __t3;
+        prod = (prod + i);
+        if (i == 1) {
+            break;
+        };
+        __t3 = __t3 + 1;
+    }
+    println("{}", prod);
+    let cnt = 0;
+    let __t4 = 0;
+    while __t4 < len(s) {
+        let v = s[__t4];
+        if (v == 20) {
+            __t4 = __t4 + 1;
+            continue;
+        };
+        cnt = (cnt + v);
+        __t4 = __t4 + 1;
+    }
+    println("{}", cnt);
+    return 0;
+}
+

@@ -1,0 +1,2 @@
+# 字符串拼接尚未落地：SLA 无源级 Str concat 面（sla_string_concat 仅 ptr/len 句柄级），gosla 定位拒收（真 Go 本体形）
+string concatenation not yet supported

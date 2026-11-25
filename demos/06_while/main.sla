@@ -1,0 +1,28 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    let i = 0;
+    while (i < 10) {
+        i = i + 1;
+        if (i == 3) {
+            continue;
+        };
+        if (i == 8) {
+            break;
+        };
+        println("{}", i);
+    }
+    let sum = 0;
+    let j = 0;
+    while (j < 5) {
+        j = j + 1;
+        if ((j % 2) == 0) {
+            continue;
+        };
+        sum = (sum + j);
+    }
+    println("{}", sum);
+    return 0;
+}
+

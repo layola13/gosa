@@ -1,0 +1,20 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+@import "sa_std/hashmap.sa"
+@import "sa_std/core/option.sa"
+
+fn main() -> i32 {
+    let m = HashMap::new();
+    m.insert(1, 10);
+    m.insert(2, 20);
+    println("{}", m.get(1).copied().unwrap_or_default());
+    println("{}", m.get(2).copied().unwrap_or_default());
+    println("{}", len(m));
+    m.insert(1, (m.get(1).copied().unwrap_or_default() + m.get(2).copied().unwrap_or_default()));
+    println("{}", m.get(1).copied().unwrap_or_default());
+    m.remove(1);
+    println("{}", len(m));
+    println("{}", m.get(2).copied().unwrap_or_default());
+    return 0;
+}
+

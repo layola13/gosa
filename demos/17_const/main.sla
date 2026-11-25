@@ -1,0 +1,21 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    println("{}", (40 + 2));
+    if true {
+        println("top");
+    } else {
+        println("no");
+    };
+    println("hi");
+    let sum = 40;
+    let i = 0;
+    while (i < 2) {
+        sum = (sum + i);
+        i = i + 1;
+    }
+    println("{}", sum);
+    return 0;
+}
+

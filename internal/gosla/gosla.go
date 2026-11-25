@@ -1,12 +1,12 @@
 // Package gosla transpiles a single-file Go program (package main) to SLA text.
-// Increment 1 scope: int funcs (incl. recursion), var/:=/assign, if/else,
-// C-style for, inc/dec, int/string expressions, fmt.Println.
-// Anything outside scope is a positioned Refusal — never a silent approximation.
+// Scope grows by demo-gated increments; anything outside scope is a positioned
+// Refusal — never a silent approximation.
 package gosla
 
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/importer"
 	"go/parser"
 	"go/token"
@@ -23,10 +23,14 @@ type Refusal struct {
 func (r *Refusal) Error() string { return fmt.Sprintf("%s: gosla: %s", r.Pos, r.Msg) }
 
 type emitter struct {
-	fset *token.FileSet
-	info *types.Info
-	sb   strings.Builder
-	ind  int
+	fset      *token.FileSet
+	info      *types.Info
+	sb        strings.Builder
+	ind       int
+	useVec    bool
+	useMap    bool
+	rangeIncr []string // increment lines for enclosing range loops (continue support)
+	tmpSeq    int
 }
 
 func (e *emitter) refuse(pos token.Pos, format string, args ...any) *Refusal {
@@ -37,6 +41,11 @@ func (e *emitter) line(format string, args ...any) {
 	e.sb.WriteString(strings.Repeat("    ", e.ind))
 	e.sb.WriteString(fmt.Sprintf(format, args...))
 	e.sb.WriteString("\n")
+}
+
+func (e *emitter) tmp() string {
+	e.tmpSeq++
+	return fmt.Sprintf("__t%d", e.tmpSeq)
 }
 
 // Transpile reads a .go file and returns SLA source text.
@@ -60,7 +69,6 @@ func Transpile(path string) (string, error) {
 		return "", &Refusal{Pos: fset.Position(file.Pos()), Msg: "go/types: " + err.Error()}
 	}
 	e := &emitter{fset: fset, info: info}
-	e.sb.WriteString("@import \"sa_std/io/print.sai\"\n@import \"sa_std/fmt.sai\"\n\n")
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
@@ -68,31 +76,139 @@ func Transpile(path string) (string, error) {
 				return "", err
 			}
 		case *ast.GenDecl:
-			// imports only in increment 1; other top-level decls refused.
-			if d.Tok != token.IMPORT {
-				return "", e.refuse(d.Pos(), "top-level %s declarations not yet supported", d.Tok)
+			if err := e.genDecl(d); err != nil {
+				return "", err
 			}
 		default:
 			return "", e.refuse(decl.Pos(), "unsupported declaration %T", decl)
 		}
 	}
-	return e.sb.String(), nil
+	hdr := "@import \"sa_std/io/print.sai\"\n@import \"sa_std/fmt.sai\"\n"
+	if e.useVec {
+		hdr += "@import \"sa_std/vec.sa\"\n"
+	}
+	if e.useMap {
+		hdr += "@import \"sa_std/hashmap.sa\"\n@import \"sa_std/core/option.sa\"\n"
+	}
+	return hdr + "\n" + e.sb.String(), nil
+}
+
+// slaType maps a Go type to its SLA annotation; ok=false when unmapped.
+func (e *emitter) slaType(t types.Type) (string, bool) {
+	if t == nil {
+		return "", false
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Basic:
+		switch u.Kind() {
+		case types.Int:
+			return "i64", true
+		case types.Bool:
+			return "bool", true
+		case types.String:
+			return "Str", true
+		}
+	case *types.Slice:
+		if et, ok := e.slaType(u.Elem()); ok {
+			e.useVec = true
+			return "Vec<" + et + ">", true
+		}
+	case *types.Map:
+		kt, kok := e.slaType(u.Key())
+		vt, vok := e.slaType(u.Elem())
+		if kok && vok {
+			e.useMap = true
+			return "HashMap<" + kt + ", " + vt + ">", true
+		}
+	case *types.Array:
+		if et, ok := e.slaType(u.Elem()); ok {
+			return fmt.Sprintf("[%s; %d]", et, u.Len()), true
+		}
+	case *types.Struct:
+		if named, ok := t.(*types.Named); ok {
+			return named.Obj().Name(), true
+		}
+	}
+	if named, ok := t.(*types.Named); ok {
+		if _, isStruct := t.Underlying().(*types.Struct); isStruct {
+			return named.Obj().Name(), true
+		}
+	}
+	return "", false
 }
 
 func (e *emitter) isInt(t types.Type) bool {
-	if t == nil {
-		return false
-	}
 	b, ok := t.Underlying().(*types.Basic)
 	return ok && b.Kind() == types.Int
 }
 
 func (e *emitter) isString(t types.Type) bool {
-	if t == nil {
-		return false
-	}
 	b, ok := t.Underlying().(*types.Basic)
 	return ok && b.Kind() == types.String
+}
+
+// constLiteral folds a *types.Const reference to its SLA literal text.
+func constLiteral(obj types.Object) (string, bool) {
+	c, ok := obj.(*types.Const)
+	if !ok {
+		return "", false
+	}
+	v := c.Val()
+	switch v.Kind() {
+	case constant.Int:
+		return v.ExactString(), true
+	case constant.Bool:
+		return fmt.Sprintf("%v", constant.BoolVal(v)), true
+	case constant.String:
+		return fmt.Sprintf("%q", constant.StringVal(v)), true
+	}
+	return "", false
+}
+
+// fieldName maps a Go struct field name to SLA form (first rune lower-cased).
+func fieldName(goName string) string {
+	if goName == "" {
+		return goName
+	}
+	r := []rune(goName)
+	if r[0] >= 'A' && r[0] <= 'Z' {
+		r[0] += 'a' - 'A'
+	}
+	return string(r)
+}
+
+func (e *emitter) genDecl(d *ast.GenDecl) error {
+	switch d.Tok {
+	case token.IMPORT:
+		return nil
+	case token.CONST:
+		return nil // constants fold at use sites via go/types
+	case token.TYPE:
+		for _, spec := range d.Specs {
+			ts := spec.(*ast.TypeSpec)
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				return e.refuse(ts.Pos(), "only struct type declarations are supported (%q)", ts.Name.Name)
+			}
+			e.line("struct %s {", ts.Name.Name)
+			e.ind++
+			for _, f := range st.Fields.List {
+				ft, okk := e.slaType(e.info.TypeOf(f.Type))
+				if !okk {
+					return e.refuse(f.Pos(), "unsupported struct field type (%q)", ts.Name.Name)
+				}
+				for _, n := range f.Names {
+					e.line("%s: %s,", fieldName(n.Name), ft)
+				}
+			}
+			e.ind--
+			e.line("}")
+			e.sb.WriteString("\n")
+		}
+		return nil
+	default:
+		return e.refuse(d.Pos(), "top-level %s declarations not yet supported", d.Tok)
+	}
 }
 
 func (e *emitter) funcDecl(fn *ast.FuncDecl) error {
@@ -103,33 +219,35 @@ func (e *emitter) funcDecl(fn *ast.FuncDecl) error {
 	var params []string
 	if fn.Type.Params != nil {
 		for _, field := range fn.Type.Params.List {
-			if !e.isInt(e.info.TypeOf(field.Type)) {
-				return e.refuse(field.Pos(), "params must be int (func %q)", name)
+			pt, ok := e.slaType(e.info.TypeOf(field.Type))
+			if !ok {
+				return e.refuse(field.Pos(), "unsupported param type (func %q)", name)
 			}
 			for _, n := range field.Names {
-				params = append(params, n.Name+": i64")
+				params = append(params, n.Name+": "+pt)
 			}
 		}
 	}
 	results := 0
+	ret := "void"
 	if fn.Type.Results != nil {
 		results = fn.Type.Results.NumFields()
 		if results > 1 {
 			return e.refuse(fn.Type.Results.Pos(), "multiple results not yet supported (func %q)", name)
 		}
-		if results == 1 && !e.isInt(e.info.TypeOf(fn.Type.Results.List[0].Type)) {
-			return e.refuse(fn.Type.Results.Pos(), "result must be int (func %q)", name)
+		if results == 1 {
+			rt, ok := e.slaType(e.info.TypeOf(fn.Type.Results.List[0].Type))
+			if !ok {
+				return e.refuse(fn.Type.Results.Pos(), "unsupported result type (func %q)", name)
+			}
+			ret = rt
 		}
 	}
 	isMain := name == "main"
-	if isMain && (len(params) > 0 || results > 0) {
-		return e.refuse(fn.Pos(), "main must have no params or results")
-	}
-	ret := "i64"
-	if results == 0 {
-		ret = "void"
-	}
 	if isMain {
+		if len(params) > 0 || results > 0 {
+			return e.refuse(fn.Pos(), "main must have no params or results")
+		}
 		ret = "i32"
 	}
 	e.line("fn %s(%s) -> %s {", name, strings.Join(params, ", "), ret)
@@ -163,249 +281,4 @@ func (e *emitter) block(b *ast.BlockStmt, scoped bool) error {
 		e.line("}")
 	}
 	return nil
-}
-
-func (e *emitter) stmt(s ast.Stmt) error {
-	switch st := s.(type) {
-	case *ast.DeclStmt:
-		gd, ok := st.Decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.VAR {
-			return e.refuse(s.Pos(), "unsupported declaration statement")
-		}
-		for _, spec := range gd.Specs {
-			vs := spec.(*ast.ValueSpec)
-			if len(vs.Values) != len(vs.Names) {
-				return e.refuse(s.Pos(), "var declaration without explicit value not yet supported")
-			}
-			for i, n := range vs.Names {
-				v, err := e.expr(vs.Values[i])
-				if err != nil {
-					return err
-				}
-				e.line("let %s = %s;", n.Name, v)
-			}
-		}
-		return nil
-	case *ast.AssignStmt:
-		if len(st.Lhs) != 1 || len(st.Rhs) != 1 {
-			return e.refuse(s.Pos(), "multiple assignment not yet supported")
-		}
-		lhs, ok := st.Lhs[0].(*ast.Ident)
-		if !ok {
-			return e.refuse(s.Pos(), "assignment target must be a plain variable in increment 1")
-		}
-		rhs, err := e.expr(st.Rhs[0])
-		if err != nil {
-			return err
-		}
-		if st.Tok == token.DEFINE {
-			e.line("let %s = %s;", lhs.Name, rhs)
-		} else if st.Tok == token.ASSIGN {
-			e.line("%s = %s;", lhs.Name, rhs)
-		} else {
-			// compound assignment x op= y  →  x = x op y
-			op := map[token.Token]string{
-				token.ADD_ASSIGN: "+", token.SUB_ASSIGN: "-", token.MUL_ASSIGN: "*",
-				token.QUO_ASSIGN: "/", token.REM_ASSIGN: "%",
-			}[st.Tok]
-			if op == "" {
-				return e.refuse(s.Pos(), "unsupported assignment operator %s", st.Tok)
-			}
-			e.line("%s = (%s %s %s);", lhs.Name, lhs.Name, op, rhs)
-		}
-		return nil
-	case *ast.IncDecStmt:
-		id, ok := st.X.(*ast.Ident)
-		if !ok {
-			return e.refuse(s.Pos(), "inc/dec target must be a plain variable")
-		}
-		op := "+"
-		if st.Tok == token.DEC {
-			op = "-"
-		}
-		e.line("%s = %s %s 1;", id.Name, id.Name, op)
-		return nil
-	case *ast.ReturnStmt:
-		if len(st.Results) == 0 {
-			e.line("return;")
-			return nil
-		}
-		if len(st.Results) > 1 {
-			return e.refuse(s.Pos(), "multiple return values not yet supported")
-		}
-		v, err := e.expr(st.Results[0])
-		if err != nil {
-			return err
-		}
-		e.line("return %s;", v)
-		return nil
-	case *ast.ExprStmt:
-		v, err := e.expr(st.X)
-		if err != nil {
-			return err
-		}
-		if v != "" {
-			e.line("%s;", v)
-		}
-		return nil
-	case *ast.IfStmt:
-		if st.Init != nil {
-			return e.refuse(s.Pos(), "if with init statement not yet supported")
-		}
-		cond, err := e.expr(st.Cond)
-		if err != nil {
-			return err
-		}
-		e.line("if %s {", cond)
-		e.ind++
-		if err := e.block(st.Body, false); err != nil {
-			return err
-		}
-		e.ind--
-		switch els := st.Else.(type) {
-		case nil:
-			e.line("};")
-		case *ast.BlockStmt:
-			e.line("} else {")
-			e.ind++
-			if err := e.block(els, false); err != nil {
-				return err
-			}
-			e.ind--
-			e.line("};")
-		case *ast.IfStmt:
-			e.line("} else")
-			if err := e.stmt(els); err != nil {
-				return err
-			}
-		default:
-			return e.refuse(s.Pos(), "unsupported else shape")
-		}
-		return nil
-	case *ast.ForStmt:
-		if st.Init != nil {
-			if err := e.stmt(st.Init); err != nil {
-				return err
-			}
-		}
-		cond := "true"
-		if st.Cond != nil {
-			c, err := e.expr(st.Cond)
-			if err != nil {
-				return err
-			}
-			cond = c
-		}
-		e.line("while %s {", cond)
-		e.ind++
-		if err := e.block(st.Body, false); err != nil {
-			return err
-		}
-		if st.Post != nil {
-			if err := e.stmt(st.Post); err != nil {
-				return err
-			}
-		}
-		e.ind--
-		e.line("}")
-		return nil
-	case *ast.BlockStmt:
-		return e.block(st, true)
-	default:
-		return e.refuse(s.Pos(), "unsupported statement %T", s)
-	}
-}
-
-func (e *emitter) expr(x ast.Expr) (string, error) {
-	switch ex := x.(type) {
-	case *ast.BasicLit:
-		switch ex.Kind {
-		case token.INT, token.STRING:
-			return ex.Value, nil
-		default:
-			return "", e.refuse(x.Pos(), "unsupported literal %s", ex.Kind)
-		}
-	case *ast.Ident:
-		switch ex.Name {
-		case "true", "false", "nil":
-			return ex.Name, nil
-		}
-		return ex.Name, nil
-	case *ast.ParenExpr:
-		return e.expr(ex.X)
-	case *ast.UnaryExpr:
-		v, err := e.expr(ex.X)
-		if err != nil {
-			return "", err
-		}
-		switch ex.Op {
-		case token.SUB, token.NOT:
-			return fmt.Sprintf("(%s%s)", ex.Op, v), nil
-		default:
-			return "", e.refuse(x.Pos(), "unsupported unary operator %s", ex.Op)
-		}
-	case *ast.BinaryExpr:
-		if ex.Op == token.ADD && (e.isString(e.info.TypeOf(ex.X)) || e.isString(e.info.TypeOf(ex.Y))) {
-			return "", e.refuse(x.Pos(), "string concatenation not yet supported (increment 2: sla string concat)")
-		}
-		l, err := e.expr(ex.X)
-		if err != nil {
-			return "", err
-		}
-		r, err := e.expr(ex.Y)
-		if err != nil {
-			return "", err
-		}
-		switch ex.Op {
-		case token.ADD, token.SUB, token.MUL, token.QUO, token.REM,
-			token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ,
-			token.LAND, token.LOR:
-			return fmt.Sprintf("(%s %s %s)", l, ex.Op, r), nil
-		default:
-			return "", e.refuse(x.Pos(), "unsupported binary operator %s", ex.Op)
-		}
-	case *ast.CallExpr:
-		return e.call(ex)
-	default:
-		return "", e.refuse(x.Pos(), "unsupported expression %T", x)
-	}
-}
-
-func (e *emitter) call(c *ast.CallExpr) (string, error) {
-	if sel, ok := c.Fun.(*ast.SelectorExpr); ok {
-		if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "fmt" && sel.Sel.Name == "Println" {
-			if len(c.Args) != 1 {
-				return "", e.refuse(c.Pos(), "fmt.Println with %d args not yet supported", len(c.Args))
-			}
-			arg := c.Args[0]
-			v, err := e.expr(arg)
-			if err != nil {
-				return "", err
-			}
-			if e.isString(e.info.TypeOf(arg)) {
-				e.line("println(%s);", v)
-			} else if e.isInt(e.info.TypeOf(arg)) {
-				e.line("println(\"{}\", %s);", v)
-			} else {
-				return "", e.refuse(c.Pos(), "fmt.Println arg type not yet supported")
-			}
-			return "", nil
-		}
-		return "", e.refuse(c.Pos(), "unsupported selector call")
-	}
-	id, ok := c.Fun.(*ast.Ident)
-	if !ok {
-		return "", e.refuse(c.Pos(), "unsupported call target %T", c.Fun)
-	}
-	var args []string
-	for _, a := range c.Args {
-		v, err := e.expr(a)
-		if err != nil {
-			return "", err
-		}
-		args = append(args, v)
-	}
-	callStr := fmt.Sprintf("%s(%s)", id.Name, strings.Join(args, ", "))
-	// As an expression statement, emit it as a statement line.
-	return callStr, nil
 }

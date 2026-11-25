@@ -1,0 +1,44 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn main() -> i32 {
+    let x = 2;
+    switch x {
+        1 => {
+            println("{}", 10);
+        },
+        2 => {
+            println("{}", 20);
+        },
+        3 => {
+            println("{}", 20);
+        },
+        default => {
+            println("{}", 30);
+        },
+    };
+    let y = 9;
+    switch y {
+        1 => {
+            println("{}", 10);
+        },
+        default => {
+            println("{}", 99);
+        },
+    };
+    let i = 0;
+    while (i < 5) {
+        i = i + 1;
+        switch i {
+            2 => {
+                continue;
+            },
+            4 => {
+            },
+            default => {},
+        };
+        println("{}", i);
+    }
+    return 0;
+}
+

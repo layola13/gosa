@@ -1,0 +1,29 @@
+@import "sa_std/io/print.sai"
+@import "sa_std/fmt.sai"
+
+fn isPos(x: i64) -> bool {
+    return (x > 0);
+}
+
+fn main() -> i32 {
+    let a = true;
+    let b = false;
+    println("{}", a);
+    println("{}", (!a));
+    println("{}", (a && true));
+    println("{}", (a || b));
+    let x = 5;
+    println("{}", isPos(x));
+    println("{}", isPos((-3)));
+    if (a && isPos(x)) {
+        println("{}", 1);
+    } else {
+        println("{}", 0);
+    };
+    while b {
+        println("{}", 99);
+        break;
+    }
+    return 0;
+}
+

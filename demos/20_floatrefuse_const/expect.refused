@@ -1,2 +1,2 @@
 # float const 拒收：gosla 增量1 尚不支持顶层 const（真 Go 本体形）；增量2 落 int/string const 时此件须改走 float 值拒收
-top-level const declarations not yet supported
+unsupported constant
