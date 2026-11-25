@@ -1,0 +1,2 @@
+# goroutine/chan/select 尚未落地：chan 形参在 S2i 门禁定位拒收（真 Go 本体形）
+go2sa S2i params must be int

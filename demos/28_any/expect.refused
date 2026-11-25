@@ -1,0 +1,2 @@
+# any/interface 结果尚未落地：any 结果在 S2i 门禁定位拒收（真 Go 本体形）
+go2sa S2i result must be int
