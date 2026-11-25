@@ -1,15 +1,19 @@
-# gosa — go→sa frontend (`go2sa`)
+# gosa — go → sla → sa frontend
 
-Go 语言新增编译目标 `go2sa`：`.go` → `.sa`（`sci/sa` 消费）。
+Go 前端新线（2026-11-25 定）：`.go` → `.sla` →（sla 编译器）→ SA → 原生二进制。
 
-参考 `tsgosa`（`ts→sa`）链路与门禁，前端换 `go/parser` + `go/types`。
+旧线 `go2sa`（.go 直发 .sa）已封存于分支 `legacy/go2sa-direct-sa`，不再维护；
+本仓 main 为新线。旧线的 demos 语料（main.go + expected.stdout + expect.refused）
+全部保留为新线的差分验收规格；旧线生成的 main.sa 已随封存移出 main（分支上仍在）。
 
+管线：
 ```
-.go --[parser+types]--> analyze --[desugar]--> middle --[emit SA + sci macros]--> .sa --> [sci sa build] --> .exe/.wasm
+.go --[go/parser + go/types]--> 分析 --[emit SLA text]--> .sla
+    --[sla build-exe]--> SA --> 原生二进制
 ```
 
-- Go 源码浅克隆于 `/content/go`（只读移植源，不进本仓）。
-- CLI：`go2sa --sa [--out <dir>] <file.go> [...]`（exit 2 用法/IO，1 拒收，0 通过）。
-- 门禁：`demos/run.sh`（`--check` 逐字节比对，`.sa` 禁止手改）。
+前端只做 AST→AST 翻译与 Go 语义映射；类型检查、所有权推断、chan/select、
+动态值（any）等语义面复用 SLA 编译器与其运行时，不在前端重造。
 
-状态：S1 skeleton（parse only，lowering 未实现，一律定位拒收）。
+门禁：demos/run.sh 待按新管线重写（main.go -> emit .sla -> sla build-exe -> diff expected.stdout）；
+转不过的形状用 expect.refused 定位拒收，永不静默错码。
