@@ -73,6 +73,9 @@ func Transpile(path string) (string, error) {
 		return "", &Refusal{Pos: fset.Position(file.Pos()), Msg: "go/types: " + err.Error()}
 	}
 	e := &emitter{fset: fset, info: info}
+	if err := e.refuseInterfaces(); err != nil {
+		return "", err
+	}
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
@@ -98,6 +101,31 @@ func Transpile(path string) (string, error) {
 		hdr += "@import \"sa_std/task.sai\"\n@import \"sa_std/thread.sa\"\n@import \"sa_std/core/result.sa\"\n"
 	}
 	return hdr + "\n" + e.sb.String(), nil
+}
+
+// refuseInterfaces rejects any use of a Go interface type (any / interface{...})
+// at the earliest occurrence. AGENTS.md rule 2: dynamic values belong to the
+// SLA compiler and sla_std; the frontend does not rebuild dynamic-value
+// lowering. sla_std currently has no dynamic-value surface, so every
+// interface-typed position is a loud refusal naming the missing surface
+// (registered as LANG-CANDIDATE-SLA-STD-DYN).
+func (e *emitter) refuseInterfaces() error {
+	var first ast.Expr
+	for expr, tv := range e.info.Types {
+		if tv.Type == nil {
+			continue
+		}
+		if _, isIface := tv.Type.Underlying().(*types.Interface); !isIface {
+			continue
+		}
+		if first == nil || expr.Pos() < first.Pos() {
+			first = expr
+		}
+	}
+	if first == nil {
+		return nil
+	}
+	return e.refuse(first.Pos(), "interface/any: no dynamic-value surface in sla_std yet (frontend does not rebuild dynamic-value lowering; see LANG-CANDIDATE-SLA-STD-DYN)")
 }
 
 // slaType maps a Go type to its SLA annotation; ok=false when unmapped.
