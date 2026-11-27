@@ -1,0 +1,385 @@
+// gostd runtime helpers: the SLA-side runtime surface that
+// gosla-emitted code calls for Go language mechanics that are
+// not package APIs: slice growth (append), string <-> bytes /
+// runes conversion, and map key snapshots for iteration.
+//
+// Layering (mirrors psa_std): gosla -> gostd -> sla_std ->
+// sa_std -> SA. gostd modules are not standalone programs;
+// they are spliced into a gosla program whose emitted code
+// provides the value surface below.
+//
+// VALUE REPRESENTATION (coordinated with the gostd text
+// half's contract in NOTES-text.md, which the emitted
+// code follows):
+//   Go int / int64        -> i64
+//   Go uint64             -> u64
+//   Go float64            -> f64
+//   Go bool               -> bool
+//   Go string             -> Vec<u8>  (byte string; len()
+//                            is the BYTE length)
+//   Go []T                -> Vec<T>
+//   Go map[K]V            -> HashMap<K, V>
+//   Go chan T             -> Chan<T>
+//   Go byte               -> u8
+//   Go rune               -> i32
+//   Go error              -> GosError heap ptr (errors.sla)
+// The frontend-mapping half of gostd emits calls against
+// exactly this representation; any mismatch is an
+// integration-phase defect, not a silent adaptation.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77440 invalid UTF-8 where Go semantics demand a decision
+//         this helper refuses to guess (encode-side only;
+//         decode follows Go and substitutes U+FFFD),
+//   77441 slice capacity overflow in the append growth
+//         computation (Go panics "out of memory"-class; the
+//         loud code is the gostd surface for it),
+//   77442 rune value out of range on encode (Go substitutes
+//         U+FFFD for invalid runes in []byte(string) style
+//         conversions performed by the runtime; the gostd
+//         helper refuses instead of guessing -- see NOTES).
+//
+// Rules inherited from psa_std: guarded reads never ride on
+// && / || (SLA evaluates both sides eagerly); errors are
+// loud panics, never silent defaults.
+
+@import "sa_std/vec.sa"
+@import "sa_std/hashmap.sa"
+
+// ---- integer limits (Go math constants / runtime bounds) ----
+
+const GO_MAX_INT: i64 = 9223372036854775807;
+const GO_MIN_INT: i64 = -9223372036854775807 - 1;
+
+// ---- slice growth: Go's append capacity policy ----
+//
+// Go runtime growslice policy (the shape gosla pins):
+//   - if the required capacity more than doubles the old,
+//     grow straight to the required capacity;
+//   - if old cap < 1024, double;
+//   - otherwise grow by 1.25x repeatedly until it fits.
+// (Upstream Go additionally rounds up to memory size
+// classes; gostd does NOT model size classes -- the SLA
+// Vec allocator owns real memory layout. Divergence is
+// observable only through cap() values, and is documented
+// in NOTES-runtime.md.)
+fn go_runtime_grow_cap(old_cap: i64, needed: i64) -> i64 {
+    if needed <= old_cap {
+        return old_cap;
+    };
+    if needed < 0 {
+        panic(77441);
+    };
+    // Overflow guard: a capacity past MaxInt/2 cannot be
+    // reached by doubling without wrapping.
+    if needed > 4611686018427387903 {
+        panic(77441);
+    };
+    if needed > old_cap * 2 {
+        return needed;
+    };
+    let cap_new = old_cap;
+    if cap_new == 0 {
+        cap_new = 1;
+    };
+    while cap_new < needed {
+        if cap_new < 1024 {
+            cap_new = cap_new * 2;
+        } else {
+            cap_new = cap_new + cap_new / 4;
+        }
+    }
+    return cap_new;
+}
+
+// Append bookkeeping for the frontend: given the current
+// len/cap and the number of elements about to be appended,
+// returns the capacity the grown slice must have. The
+// frontend emits the actual Vec reserve/copy against this
+// number; gostd owns the policy, not the storage.
+fn go_runtime_append_cap(old_len: i64, old_cap: i64, add: i64) -> i64 {
+    if add < 0 {
+        panic(77441);
+    };
+    let needed = old_len + add;
+    if needed < old_len {
+        panic(77441);
+    };
+    return go_runtime_grow_cap(old_cap, needed);
+}
+
+// ---- string <-> []byte ----
+//
+// Under the gostd contract a Go string IS a Vec<u8>, so
+// both conversions are copies (Go's []byte(s) copies too).
+// The two entry points stay distinct because the frontend
+// emits both conversion directions and because a future
+// change of the string representation would land here.
+
+fn go_runtime_string_to_bytes(s: &Vec<u8>) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        out.push(s[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn go_runtime_bytes_to_string(b: &Vec<u8>) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    let n = len(b);
+    let i = 0;
+    while i < n {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- string <-> []rune (UTF-8 codec, Go semantics) ----
+//
+// Decode: Go's range-over-string / []rune(s) semantics --
+// each invalid byte decodes as U+FFFD and advances exactly
+// one byte; a truncated multi-byte sequence at end of
+// string decodes as one U+FFFD per remaining byte position
+// consumed by the decoder step (Go consumes one byte per
+// error after the first partial sequence check fails).
+// Encode: Go substitutes U+FFFD for runes that are not
+// valid Unicode code points in string(runes) conversion;
+// gostd refuses loudly instead (77442) because a silent
+// substitution inside a stdlib helper hides frontend bugs
+// -- divergence documented in NOTES-runtime.md.
+
+fn __go_utf8_decode_first(s: &Vec<u8>, i: i64, n: i64) -> (i32, i64) {
+    // Returns (rune, size). Caller guarantees i < n.
+    let b0 = s[i] as i32;
+    if b0 < 128 {
+        return (b0, 1);
+    };
+    if b0 < 194 {
+        // Continuation byte or overlong lead C0/C1: invalid.
+        return (65533, 1);
+    };
+    if b0 < 224 {
+        if i + 1 >= n {
+            return (65533, 1);
+        };
+        let b1 = s[i + 1] as i32;
+        if b1 < 128 {
+            return (65533, 1);
+        };
+        if b1 > 191 {
+            return (65533, 1);
+        };
+        // (b0 - 192) is the 5-bit payload head for b0 in
+        // [194, 223]: rr = (b0 & 0x1F) << 6 | (b1 & 0x3F).
+        let rr = (b0 - 192) * 64 + (b1 - 128);
+        return (rr, 2);
+    };
+    if b0 < 240 {
+        if i + 1 >= n {
+            return (65533, 1);
+        };
+        let b1 = s[i + 1] as i32;
+        if b1 < 128 {
+            return (65533, 1);
+        };
+        if b1 > 191 {
+            return (65533, 1);
+        };
+        // Overlong / surrogate guards on the second byte.
+        if b0 == 224 {
+            if b1 < 160 {
+                return (65533, 1);
+            };
+        };
+        if b0 == 237 {
+            if b1 > 159 {
+                return (65533, 1);
+            };
+        };
+        if i + 2 >= n {
+            return (65533, 1);
+        };
+        let b2 = s[i + 2] as i32;
+        if b2 < 128 {
+            return (65533, 1);
+        };
+        if b2 > 191 {
+            return (65533, 1);
+        };
+        let rr = (b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128);
+        return (rr, 3);
+    };
+    if b0 < 245 {
+        if i + 1 >= n {
+            return (65533, 1);
+        };
+        let b1 = s[i + 1] as i32;
+        if b1 < 128 {
+            return (65533, 1);
+        };
+        if b1 > 191 {
+            return (65533, 1);
+        };
+        if b0 == 240 {
+            if b1 < 144 {
+                return (65533, 1);
+            };
+        };
+        if b0 == 244 {
+            if b1 > 143 {
+                return (65533, 1);
+            };
+        };
+        if i + 2 >= n {
+            return (65533, 1);
+        };
+        let b2 = s[i + 2] as i32;
+        if b2 < 128 {
+            return (65533, 1);
+        };
+        if b2 > 191 {
+            return (65533, 1);
+        };
+        if i + 3 >= n {
+            return (65533, 1);
+        };
+        let b3 = s[i + 3] as i32;
+        if b3 < 128 {
+            return (65533, 1);
+        };
+        if b3 > 191 {
+            return (65533, 1);
+        };
+        let rr = (b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128);
+        return (rr, 4);
+    };
+    return (65533, 1);
+}
+
+fn go_runtime_string_to_runes(s: &Vec<u8>) -> Vec<i32> {
+    let out: Vec<i32> = Vec::new();
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        let (r, size) = __go_utf8_decode_first(s, i, n);
+        out.push(r);
+        i = i + size;
+    }
+    return out;
+}
+
+fn __go_utf8_encoded_len(r: i32) -> i64 {
+    if r < 128 {
+        return 1;
+    };
+    if r < 2048 {
+        return 2;
+    };
+    if r < 65536 {
+        return 3;
+    };
+    return 4;
+}
+
+fn __go_utf8_append_rune(out: &Vec<u8>, r: i32) -> void {
+    if r < 0 {
+        panic(77442);
+    };
+    if r > 1114111 {
+        panic(77442);
+    };
+    if r >= 55296 {
+        if r <= 57343 {
+            // Surrogate half: not a valid code point.
+            panic(77442);
+        };
+    };
+    if r < 128 {
+        out.push(r as u8);
+        return;
+    };
+    if r < 2048 {
+        out.push((192 + r / 64) as u8);
+        out.push((128 + r % 64) as u8);
+        return;
+    };
+    if r < 65536 {
+        out.push((224 + r / 4096) as u8);
+        out.push((128 + (r / 64) % 64) as u8);
+        out.push((128 + r % 64) as u8);
+        return;
+    };
+    out.push((240 + r / 262144) as u8);
+    out.push((128 + (r / 4096) % 64) as u8);
+    out.push((128 + (r / 64) % 64) as u8);
+    out.push((128 + r % 64) as u8);
+    return;
+}
+
+fn go_runtime_runes_to_string(rs: &Vec<i32>) -> Vec<u8> {
+    let buf: Vec<u8> = Vec::new();
+    let n = len(rs);
+    let i = 0;
+    while i < n {
+        __go_utf8_append_rune(&buf, rs[i]);
+        i = i + 1;
+    }
+    return buf;
+}
+
+// Byte length of the UTF-8 encoding of a rune string, for
+// frontend preallocation. Same refusal rules as encode.
+fn go_runtime_runes_byte_len(rs: &Vec<i32>) -> i64 {
+    let total = 0;
+    let n = len(rs);
+    let i = 0;
+    while i < n {
+        let r = rs[i];
+        if r < 0 {
+            panic(77442);
+        };
+        if r > 1114111 {
+            panic(77442);
+        };
+        if r >= 55296 {
+            if r <= 57343 {
+                panic(77442);
+            };
+        };
+        total = total + __go_utf8_encoded_len(r);
+        i = i + 1;
+    }
+    return total;
+}
+
+// ---- map iteration ----
+//
+// Go SPEC: iteration order over a map is unspecified, and
+// the Go runtime deliberately randomises it per run.
+// gostd does NOT randomise: the key snapshot below returns
+// keys in the SLA HashMap's internal order, which is an
+// unspecified order as far as any correct Go program is
+// concerned. A program that depends on gostd's order is
+// exactly as broken as one that depends on Go's order on a
+// given day; the divergence (deterministic vs randomised)
+// is documented in NOTES-runtime.md. The frontend's range
+// statement emits: snapshot keys, then look each value up
+// live (so deletion during iteration follows Go's rule
+// that entries not yet reached may or may not appear --
+// gostd's snapshot means a deleted key's lookup simply
+// misses and the frontend skips it).
+
+fn go_runtime_hashmap_keys_i64_i64(m: &HashMap<i64, i64>) -> Vec<i64> {
+    // SLA HashMap key enumeration surface assumed:
+    // __go_hashmap_keys is the sla_std-side enumeration the
+    // integration phase must confirm or provide; see NOTES.
+    return __go_hashmap_keys(m);
+}
+
+fn go_runtime_hashmap_keys_bytes_i64(m: &HashMap<Vec<u8>, i64>) -> Vec<Vec<u8>> {
+    return __go_hashmap_keys_bytes(m);
+}

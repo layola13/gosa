@@ -1,0 +1,901 @@
+// gostd strings: the SLA-side model of Go's strings
+// package over byte strings (Vec<u8>). Organisation
+// follows the psa_std precedent: public entry points
+// go_<pkg>_<name>, private helpers __go_<pkg>_<name>,
+// panic codes listed up front.
+//
+// Panic codes (gostd block 77400-77499):
+//   77416  strings.Repeat with a negative count
+//          (Go panics the same way)
+//   77417  strings.Repeat result would overflow
+//          (Go panics: result length overflow)
+// (77420/77421 belong to time in the whole-library
+// map in NOTES-runtime.md; the strings codes moved
+// to 77416/77417 to keep one map -- see
+// NOTES-text.md.)
+//
+// gostd reserves target id 900010 for io.EOF (see
+// errors.sla for the id space); the Reader returns it
+// in a fresh GosError whose target_id matches, so
+// go_errors_is(err, go_strings_eof()) works.
+//
+// Rune-wise operations decode UTF-8 with
+// __go_utf8_decode / __go_utf8_append from strconv.sla
+// (splice order: errors, strconv, strings, fmt).
+// Case mapping covers ASCII plus the Latin-1
+// supplement pairs; Go uses the full Unicode tables,
+// which are data gostd does not carry -- see
+// NOTES-text.md.
+
+// ---------- byte helpers ----------
+
+fn __go_str_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_str_slice(b: Vec<u8>, lo: i64, hi: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __go_str_eq(a: Vec<u8>, b: Vec<u8>) -> bool {
+    if len(a) != len(b) { return false; };
+    let i = 0;
+    while i < len(a) {
+        if a[i] != b[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Does s start with sep at byte offset i?
+fn __go_str_match_at(s: Vec<u8>, i: i64, sep: Vec<u8>) -> bool {
+    if i + len(sep) > len(s) { return false; };
+    let k = 0;
+    while k < len(sep) {
+        if s[i + k] != sep[k] { return false; };
+        k = k + 1;
+    }
+    return true;
+}
+
+// ---------- Builder ----------
+
+// strings.Builder: a growable byte buffer. Methods
+// take &GosBuilder. Go's Write* methods return
+// (int, error) with error always nil for Builder;
+// gostd returns just the count.
+struct GosBuilder {
+    buf: Vec<u8>,
+}
+
+fn go_strings_builder_new() -> GosBuilder {
+    return GosBuilder { buf: Vec::new() };
+}
+
+fn go_strings_builder_write_string(b: &GosBuilder, s: Vec<u8>) -> i64 {
+    __go_str_append(b.buf, s);
+    return len(s);
+}
+
+fn go_strings_builder_write(b: &GosBuilder, p: Vec<u8>) -> i64 {
+    __go_str_append(b.buf, p);
+    return len(p);
+}
+
+fn go_strings_builder_write_byte(b: &GosBuilder, c: u8) -> i64 {
+    b.buf.push(c);
+    return 1;
+}
+
+fn go_strings_builder_write_rune(b: &GosBuilder, r: i64) -> i64 {
+    let before = len(b.buf);
+    __go_utf8_append(b.buf, r);
+    return len(b.buf) - before;
+}
+
+// Grow is a capacity hint in Go; gostd's Vec grows
+// on push, so Grow is a no-op here. Divergence: Go
+// panics on a negative n ("strings.Builder.Grow:
+// negative count"); gostd silently accepts it --
+// flagged in NOTES-text.md.
+fn go_strings_builder_grow(b: &GosBuilder, n: i64) -> void {
+    return;
+}
+
+fn go_strings_builder_len(b: &GosBuilder) -> i64 {
+    return len(b.buf);
+}
+
+// Cap reports the current buffer length gostd-side;
+// Go's cap is the allocated capacity, which Vec does
+// not expose. Documented divergence (NOTES).
+fn go_strings_builder_cap(b: &GosBuilder) -> i64 {
+    return len(b.buf);
+}
+
+fn go_strings_builder_reset(b: &GosBuilder) -> void {
+    b.buf = Vec::new();
+    return;
+}
+
+// String returns a copy of the accumulated bytes.
+fn go_strings_builder_string(b: &GosBuilder) -> Vec<u8> {
+    return __go_str_slice(b.buf, 0, len(b.buf));
+}
+
+// ---------- search ----------
+
+// strings.Index(s, substr): first byte index or -1.
+// Index of the empty string is 0.
+fn go_strings_index(s: Vec<u8>, substr: Vec<u8>) -> i64 {
+    if len(substr) == 0 { return 0; };
+    if len(substr) > len(s) { return -1; };
+    let i = 0;
+    let last = len(s) - len(substr);
+    while i <= last {
+        if __go_str_match_at(s, i, substr) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// strings.LastIndex: last byte index or -1; the
+// empty substr matches at len(s).
+fn go_strings_last_index(s: Vec<u8>, substr: Vec<u8>) -> i64 {
+    if len(substr) == 0 { return len(s); };
+    if len(substr) > len(s) { return -1; };
+    let i = len(s) - len(substr);
+    while i >= 0 {
+        if __go_str_match_at(s, i, substr) { return i; };
+        i = i - 1;
+    }
+    return -1;
+}
+
+// strings.Contains(s, substr)
+fn go_strings_contains(s: Vec<u8>, substr: Vec<u8>) -> bool {
+    return go_strings_index(s, substr) >= 0;
+}
+
+// strings.ContainsAny(s, chars): any rune of chars
+// occurs in s.
+fn go_strings_contains_any(s: Vec<u8>, chars: Vec<u8>) -> bool {
+    return go_strings_index_any(s, chars) >= 0;
+}
+
+// strings.IndexAny(s, chars): byte index of the
+// first rune of s that appears in chars, or -1.
+fn go_strings_index_any(s: Vec<u8>, chars: Vec<u8>) -> i64 {
+    if len(chars) == 0 { return -1; };
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        let j = 0;
+        while j < len(chars) {
+            let cd = __go_utf8_decode(chars, j);
+            if cd.r == d.r { return i; };
+            j = j + cd.size;
+        }
+        i = i + d.size;
+    }
+    return -1;
+}
+
+// strings.IndexByte(s, c)
+fn go_strings_index_byte(s: Vec<u8>, c: u8) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        if s[i] == c { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// strings.IndexRune(s, r)
+fn go_strings_index_rune(s: Vec<u8>, r: i64) -> i64 {
+    if r < 128 {
+        return go_strings_index_byte(s, r as u8);
+    };
+    let enc = Vec::new();
+    __go_utf8_append(enc, r);
+    return go_strings_index(s, enc);
+}
+
+// strings.HasPrefix / HasSuffix
+fn go_strings_has_prefix(s: Vec<u8>, prefix: Vec<u8>) -> bool {
+    if len(prefix) > len(s) { return false; };
+    return __go_str_match_at(s, 0, prefix);
+}
+
+fn go_strings_has_suffix(s: Vec<u8>, suffix: Vec<u8>) -> bool {
+    if len(suffix) > len(s) { return false; };
+    return __go_str_match_at(s, len(s) - len(suffix), suffix);
+}
+
+// strings.Count(s, substr): non-overlapping count.
+// The empty substr counts rune boundaries: Go
+// returns 1 + the number of runes.
+fn go_strings_count(s: Vec<u8>, substr: Vec<u8>) -> i64 {
+    if len(substr) == 0 {
+        return 1 + __go_utf8_rune_count(s);
+    };
+    let n = 0;
+    let i = 0;
+    while i + len(substr) <= len(s) {
+        if __go_str_match_at(s, i, substr) {
+            n = n + 1;
+            i = i + len(substr);
+        } else {
+            i = i + 1;
+        };
+    }
+    return n;
+}
+
+// ---------- split & join ----------
+
+// explode: split after each UTF-8 sequence; an
+// empty input yields one empty piece (Go behaviour
+// for Split("", "")).
+fn __go_str_explode(s: Vec<u8>) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    if len(s) == 0 {
+        out.push(Vec::new());
+        return out;
+    };
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        out.push(__go_str_slice(s, i, i + d.size));
+        i = i + d.size;
+    }
+    return out;
+}
+
+// genSplit workhorse. after=true keeps the
+// separator at the end of each piece (SplitAfter).
+fn __go_str_gen_split(s: Vec<u8>, sep: Vec<u8>, after: bool, n: i64) -> Vec<Vec<u8>> {
+    if n == 0 { return Vec::new(); };
+    if len(sep) == 0 {
+        let all = __go_str_explode(s);
+        if n < 0 { return all; };
+        if n >= len(all) { return all; };
+        // n pieces: first n-1 runes, rest whole
+        let out = Vec::new();
+        let i = 0;
+        let bytepos = 0;
+        while i < len(s) {
+            if len(out) == n - 1 { break; };
+            let d = __go_utf8_decode(s, i);
+            out.push(__go_str_slice(s, i, i + d.size));
+            i = i + d.size;
+            bytepos = i;
+        }
+        out.push(__go_str_slice(s, bytepos, len(s)));
+        return out;
+    };
+    let out = Vec::new();
+    let start = 0;
+    let i = 0;
+    while i + len(sep) <= len(s) {
+        if n > 0 {
+            if len(out) == n - 1 { break; };
+        };
+        if __go_str_match_at(s, i, sep) {
+            let end = i;
+            if after { end = i + len(sep); };
+            out.push(__go_str_slice(s, start, end));
+            start = i + len(sep);
+            if after { start = end; };
+            i = i + len(sep);
+        } else {
+            i = i + 1;
+        };
+    }
+    out.push(__go_str_slice(s, start, len(s)));
+    return out;
+}
+
+// strings.Split(s, sep)
+fn go_strings_split(s: Vec<u8>, sep: Vec<u8>) -> Vec<Vec<u8>> {
+    return __go_str_gen_split(s, sep, false, -1);
+}
+
+// strings.SplitN(s, sep, n)
+fn go_strings_split_n(s: Vec<u8>, sep: Vec<u8>, n: i64) -> Vec<Vec<u8>> {
+    return __go_str_gen_split(s, sep, false, n);
+}
+
+// strings.SplitAfter(s, sep)
+fn go_strings_split_after(s: Vec<u8>, sep: Vec<u8>) -> Vec<Vec<u8>> {
+    return __go_str_gen_split(s, sep, true, -1);
+}
+
+// strings.SplitAfterN(s, sep, n)
+fn go_strings_split_after_n(s: Vec<u8>, sep: Vec<u8>, n: i64) -> Vec<Vec<u8>> {
+    return __go_str_gen_split(s, sep, true, n);
+}
+
+// strings.Join(elems, sep)
+fn go_strings_join(elems: Vec<Vec<u8>>, sep: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(elems) {
+        if i > 0 { __go_str_append(out, sep); };
+        __go_str_append(out, elems[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------- replace & repeat ----------
+
+// strings.Replace(s, old, new, n): n < 0 replaces
+// all. An empty old matches at every rune boundary
+// (start, between runes, end), as in Go.
+fn go_strings_replace(s: Vec<u8>, old: Vec<u8>, newv: Vec<u8>, n: i64) -> Vec<u8> {
+    if n == 0 { return __go_str_slice(s, 0, len(s)); };
+    if __go_str_eq(old, newv) { return __go_str_slice(s, 0, len(s)); };
+    let out = Vec::new();
+    if len(old) == 0 {
+        let done = 0;
+        let i = 0;
+        // boundary before the first rune
+        if n < 0 || done < n {
+            __go_str_append(out, newv);
+            done = done + 1;
+        };
+        while i < len(s) {
+            let d = __go_utf8_decode(s, i);
+            let k = 0;
+            while k < d.size {
+                out.push(s[i + k]);
+                k = k + 1;
+            }
+            i = i + d.size;
+            if n < 0 || done < n {
+                __go_str_append(out, newv);
+                done = done + 1;
+            };
+        }
+        return out;
+    };
+    let done = 0;
+    let i = 0;
+    while i < len(s) {
+        if i + len(old) <= len(s) {
+            if n < 0 || done < n {
+                if __go_str_match_at(s, i, old) {
+                    __go_str_append(out, newv);
+                    done = done + 1;
+                    i = i + len(old);
+                    continue;
+                };
+            };
+        };
+        out.push(s[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// strings.ReplaceAll(s, old, new)
+fn go_strings_replace_all(s: Vec<u8>, old: Vec<u8>, newv: Vec<u8>) -> Vec<u8> {
+    return go_strings_replace(s, old, newv, -1);
+}
+
+// strings.Repeat(s, count)
+fn go_strings_repeat(s: Vec<u8>, count: i64) -> Vec<u8> {
+    if count < 0 { panic(77416); };
+    if count == 0 { return Vec::new(); };
+    if len(s) > 0 {
+        if count > (9223372036854775807 / len(s)) { panic(77417); };
+    };
+    let out = Vec::new();
+    let i = 0;
+    while i < count {
+        __go_str_append(out, s);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------- trim ----------
+
+// Decode the cutset into a rune list once per call.
+fn __go_str_cutset_runes(cutset: Vec<u8>) -> Vec<i64> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(cutset) {
+        let d = __go_utf8_decode(cutset, i);
+        out.push(d.r);
+        i = i + d.size;
+    }
+    return out;
+}
+
+fn __go_str_in_runes(set: Vec<i64>, r: i64) -> bool {
+    let i = 0;
+    while i < len(set) {
+        if set[i] == r { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// Byte range of s after trimming runes in `set`
+// from the left (returns start index) / right
+// (returns end index).
+fn __go_str_trim_left_idx(s: Vec<u8>, set: Vec<i64>) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if !__go_str_in_runes(set, d.r) { break; };
+        i = i + d.size;
+    }
+    return i;
+}
+
+fn __go_str_trim_right_idx(s: Vec<u8>, set: Vec<i64>) -> i64 {
+    // find the last rune start at or before pos and
+    // walk the end down while runes are in the set
+    let end = len(s);
+    while end > 0 {
+        // back up to a rune start: continuation bytes
+        // have the 10xxxxxx shape
+        let start = end - 1;
+        while start > 0 {
+            let b = s[start] as i64;
+            if b < 128 { break; };
+            if b >= 192 { break; };
+            start = start - 1;
+        }
+        let d = __go_utf8_decode(s, start);
+        if !__go_str_in_runes(set, d.r) { break; };
+        end = start;
+    }
+    return end;
+}
+
+// strings.Trim(s, cutset)
+fn go_strings_trim(s: Vec<u8>, cutset: Vec<u8>) -> Vec<u8> {
+    let set = __go_str_cutset_runes(cutset);
+    let lo = __go_str_trim_left_idx(s, set);
+    let hi = __go_str_trim_right_idx(s, set);
+    if hi < lo { return Vec::new(); };
+    return __go_str_slice(s, lo, hi);
+}
+
+// strings.TrimLeft / TrimRight
+fn go_strings_trim_left(s: Vec<u8>, cutset: Vec<u8>) -> Vec<u8> {
+    let set = __go_str_cutset_runes(cutset);
+    let lo = __go_str_trim_left_idx(s, set);
+    return __go_str_slice(s, lo, len(s));
+}
+
+fn go_strings_trim_right(s: Vec<u8>, cutset: Vec<u8>) -> Vec<u8> {
+    let set = __go_str_cutset_runes(cutset);
+    let hi = __go_str_trim_right_idx(s, set);
+    return __go_str_slice(s, 0, hi);
+}
+
+// Go's unicode.IsSpace set: ASCII whitespace plus
+// NEL (0x85), NBSP (0xA0) and the Unicode space
+// separators gostd enumerates explicitly.
+fn __go_str_is_space(r: i64) -> bool {
+    if r == 9 { return true; };
+    if r == 10 { return true; };
+    if r == 11 { return true; };
+    if r == 12 { return true; };
+    if r == 13 { return true; };
+    if r == 32 { return true; };
+    if r == 133 { return true; };
+    if r == 160 { return true; };
+    if r == 5760 { return true; };
+    if r >= 8192 {
+        if r <= 8202 { return true; };
+    };
+    if r == 8232 { return true; };
+    if r == 8233 { return true; };
+    if r == 8239 { return true; };
+    if r == 8287 { return true; };
+    if r == 12288 { return true; };
+    return false;
+}
+
+fn __go_str_trim_space_idx_left(s: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if !__go_str_is_space(d.r) { break; };
+        i = i + d.size;
+    }
+    return i;
+}
+
+fn __go_str_trim_space_idx_right(s: Vec<u8>) -> i64 {
+    let end = len(s);
+    while end > 0 {
+        let start = end - 1;
+        while start > 0 {
+            let b = s[start] as i64;
+            if b < 128 { break; };
+            if b >= 192 { break; };
+            start = start - 1;
+        }
+        let d = __go_utf8_decode(s, start);
+        if !__go_str_is_space(d.r) { break; };
+        end = start;
+    }
+    return end;
+}
+
+// strings.TrimSpace(s)
+fn go_strings_trim_space(s: Vec<u8>) -> Vec<u8> {
+    let lo = __go_str_trim_space_idx_left(s);
+    let hi = __go_str_trim_space_idx_right(s);
+    if hi < lo { return Vec::new(); };
+    return __go_str_slice(s, lo, hi);
+}
+
+// strings.TrimPrefix / TrimSuffix
+fn go_strings_trim_prefix(s: Vec<u8>, prefix: Vec<u8>) -> Vec<u8> {
+    if go_strings_has_prefix(s, prefix) {
+        return __go_str_slice(s, len(prefix), len(s));
+    };
+    return __go_str_slice(s, 0, len(s));
+}
+
+fn go_strings_trim_suffix(s: Vec<u8>, suffix: Vec<u8>) -> Vec<u8> {
+    if go_strings_has_suffix(s, suffix) {
+        return __go_str_slice(s, 0, len(s) - len(suffix));
+    };
+    return __go_str_slice(s, 0, len(s));
+}
+
+// ---------- case mapping ----------
+
+// ASCII + Latin-1 supplement simple case mappings.
+// Go uses the full Unicode tables; the pairs gostd
+// carries are documented in NOTES-text.md.
+fn __go_str_to_upper_rune(r: i64) -> i64 {
+    if r >= 97 {
+        if r <= 122 { return r - 32; };
+    };
+    if r >= 224 {
+        if r <= 254 {
+            if r != 247 { return r - 32; };
+        };
+    };
+    if r == 255 { return 376; };
+    if r == 181 { return 924; };
+    if r == 223 { return 7838; };
+    return r;
+}
+
+fn __go_str_to_lower_rune(r: i64) -> i64 {
+    if r >= 65 {
+        if r <= 90 { return r + 32; };
+    };
+    if r >= 192 {
+        if r <= 222 {
+            if r != 215 { return r + 32; };
+        };
+    };
+    if r == 376 { return 255; };
+    if r == 924 { return 956; };
+    if r == 7838 { return 223; };
+    if r == 8490 { return 107; };
+    return r;
+}
+
+fn __go_str_map_runes(s: Vec<u8>, upper: bool) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if d.ok {
+            let m = d.r;
+            if upper {
+                m = __go_str_to_upper_rune(d.r);
+            } else {
+                m = __go_str_to_lower_rune(d.r);
+            };
+            __go_utf8_append(out, m);
+        } else {
+            out.push(s[i]);
+        };
+        i = i + d.size;
+    }
+    return out;
+}
+
+// strings.ToUpper / ToLower
+fn go_strings_to_upper(s: Vec<u8>) -> Vec<u8> {
+    return __go_str_map_runes(s, true);
+}
+
+fn go_strings_to_lower(s: Vec<u8>) -> Vec<u8> {
+    return __go_str_map_runes(s, false);
+}
+
+// ---------- EqualFold ----------
+
+// unicode.SimpleFold, gostd subset: ASCII letters,
+// the K/k/KELVIN cycle and the S/s/LONG-S cycle.
+fn __go_str_simple_fold(r: i64) -> i64 {
+    if r >= 65 {
+        if r <= 90 {
+            if r == 75 { return 107; };
+            if r == 83 { return 115; };
+            return r + 32;
+        };
+    };
+    if r >= 97 {
+        if r <= 122 {
+            if r == 107 { return 8490; };
+            if r == 115 { return 383; };
+            return r - 32;
+        };
+    };
+    if r == 8490 { return 75; };
+    if r == 383 { return 83; };
+    return r;
+}
+
+fn __go_str_fold_eq(a: i64, b: i64) -> bool {
+    if a == b { return true; };
+    let f = __go_str_simple_fold(a);
+    while f != a {
+        if f == b { return true; };
+        f = __go_str_simple_fold(f);
+    }
+    return false;
+}
+
+// strings.EqualFold(s, t)
+fn go_strings_equal_fold(s: Vec<u8>, t: Vec<u8>) -> bool {
+    let i = 0;
+    let j = 0;
+    while i < len(s) {
+        if j >= len(t) { return false; };
+        let d1 = __go_utf8_decode(s, i);
+        let d2 = __go_utf8_decode(t, j);
+        if !__go_str_fold_eq(d1.r, d2.r) { return false; };
+        i = i + d1.size;
+        j = j + d2.size;
+    }
+    if j != len(t) { return false; };
+    return true;
+}
+
+// ---------- Fields ----------
+
+// strings.Fields(s): split around runs of Unicode
+// whitespace (the __go_str_is_space set), dropping
+// empty pieces.
+fn go_strings_fields(s: Vec<u8>) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        // skip spaces
+        while i < len(s) {
+            let d = __go_utf8_decode(s, i);
+            if !__go_str_is_space(d.r) { break; };
+            i = i + d.size;
+        }
+        if i >= len(s) { break; };
+        let start = i;
+        while i < len(s) {
+            let d = __go_utf8_decode(s, i);
+            if __go_str_is_space(d.r) { break; };
+            i = i + d.size;
+        }
+        out.push(__go_str_slice(s, start, i));
+    }
+    return out;
+}
+
+// ---------- Reader ----------
+
+// io.EOF sentinel (target id 900010, see the header
+// of this file).
+fn go_strings_eof() -> ptr {
+    let msg = Vec::new();
+    msg.push(69u8); msg.push(79u8); msg.push(70u8);
+    return go_errors_new_with_id(msg, 900010);
+}
+
+// strings.Reader: a byte reader over a fixed buffer.
+// prev holds the size of the last rune read (for
+// UnreadRune), or -1.
+struct GosReader {
+    b: Vec<u8>,
+    i: i64,
+    prev: i64,
+}
+
+fn go_strings_new_reader(s: Vec<u8>) -> GosReader {
+    return GosReader { b: s, i: 0, prev: -1 };
+}
+
+// Reader.Len: bytes not yet read.
+fn go_strings_reader_len(r: &GosReader) -> i64 {
+    let n = len(r.b) - r.i;
+    if n < 0 { return 0; };
+    return n;
+}
+
+// Reader.Size: total length of the underlying input.
+fn go_strings_reader_size(r: &GosReader) -> i64 {
+    return len(r.b);
+}
+
+struct GoReaderResult {
+    n: i64,
+    err: ptr,
+}
+
+// Reader.Read(p): appends up to max bytes to dst
+// (gostd models p as an append target because SLA
+// Vecs are handles) and reports the count. At end of
+// input the error is the io.EOF sentinel.
+fn go_strings_reader_read(r: &GosReader, dst: Vec<u8>, max: i64) -> GoReaderResult {
+    if r.i >= len(r.b) {
+        return GoReaderResult { n: 0, err: go_strings_eof() };
+    };
+    let n = 0;
+    while n < max {
+        if r.i >= len(r.b) { break; };
+        dst.push(r.b[r.i]);
+        r.i = r.i + 1;
+        n = n + 1;
+    }
+    r.prev = -1;
+    return GoReaderResult { n: n, err: go_errors_nil() };
+}
+
+struct GoReaderByte {
+    b: u8,
+    err: ptr,
+}
+
+// Reader.ReadByte
+fn go_strings_reader_read_byte(r: &GosReader) -> GoReaderByte {
+    if r.i >= len(r.b) {
+        return GoReaderByte { b: 0, err: go_strings_eof() };
+    };
+    let c = r.b[r.i];
+    r.i = r.i + 1;
+    r.prev = -1;
+    return GoReaderByte { b: c, err: go_errors_nil() };
+}
+
+// Reader.UnreadByte: steps back one byte; Go returns
+// an error when the last operation was not a
+// successful ReadByte/Read -- gostd reports it as the
+// plain GosError below (msg "strings.Reader.UnreadByte:
+// at beginning of slice" / "...: previous operation
+// was not ReadByte" are collapsed into one shape and
+// flagged in NOTES).
+fn go_strings_reader_unread_byte(r: &GosReader) -> ptr {
+    if r.i <= 0 {
+        let msg = Vec::new();
+        msg.push(115u8); msg.push(116u8); msg.push(114u8); msg.push(105u8);
+        msg.push(110u8); msg.push(103u8); msg.push(115u8); msg.push(46u8);
+        msg.push(82u8); msg.push(101u8); msg.push(97u8); msg.push(100u8);
+        msg.push(101u8); msg.push(114u8); msg.push(46u8); msg.push(85u8);
+        msg.push(110u8); msg.push(114u8); msg.push(101u8); msg.push(97u8);
+        msg.push(100u8); msg.push(66u8); msg.push(121u8); msg.push(116u8);
+        msg.push(101u8); msg.push(58u8); msg.push(32u8); msg.push(97u8);
+        msg.push(116u8); msg.push(32u8); msg.push(98u8); msg.push(101u8);
+        msg.push(103u8); msg.push(105u8); msg.push(110u8); msg.push(110u8);
+        msg.push(105u8); msg.push(110u8); msg.push(103u8);
+        return go_errors_new(msg);
+    };
+    r.i = r.i - 1;
+    r.prev = -1;
+    return go_errors_nil();
+}
+
+struct GoReaderRune {
+    r: i64,
+    size: i64,
+    err: ptr,
+}
+
+// Reader.ReadRune
+fn go_strings_reader_read_rune(r: &GosReader) -> GoReaderRune {
+    if r.i >= len(r.b) {
+        return GoReaderRune { r: 0, size: 0, err: go_strings_eof() };
+    };
+    let d = __go_utf8_decode(r.b, r.i);
+    r.i = r.i + d.size;
+    r.prev = d.size;
+    return GoReaderRune { r: d.r, size: d.size, err: go_errors_nil() };
+}
+
+// Reader.UnreadRune: valid only right after a
+// successful ReadRune.
+fn go_strings_reader_unread_rune(r: &GosReader) -> ptr {
+    if r.prev < 0 {
+        // "strings.Reader.UnreadRune: previous operation
+        // was not ReadRune" (Go's message shape)
+        let msg = Vec::new();
+        msg.push(115u8); msg.push(116u8); msg.push(114u8); msg.push(105u8);
+        msg.push(110u8); msg.push(103u8); msg.push(115u8); msg.push(46u8);
+        msg.push(82u8); msg.push(101u8); msg.push(97u8); msg.push(100u8);
+        msg.push(101u8); msg.push(114u8); msg.push(46u8); msg.push(85u8);
+        msg.push(110u8); msg.push(114u8); msg.push(101u8); msg.push(97u8);
+        msg.push(100u8); msg.push(82u8); msg.push(117u8); msg.push(110u8);
+        msg.push(101u8); msg.push(58u8); msg.push(32u8); msg.push(112u8);
+        msg.push(114u8); msg.push(101u8); msg.push(118u8); msg.push(105u8);
+        msg.push(111u8); msg.push(117u8); msg.push(115u8); msg.push(32u8);
+        msg.push(111u8); msg.push(112u8); msg.push(101u8); msg.push(114u8);
+        msg.push(97u8); msg.push(116u8); msg.push(105u8); msg.push(111u8);
+        msg.push(110u8); msg.push(32u8); msg.push(119u8); msg.push(97u8);
+        msg.push(115u8); msg.push(32u8); msg.push(110u8); msg.push(111u8);
+        msg.push(116u8); msg.push(32u8); msg.push(82u8); msg.push(101u8);
+        msg.push(97u8); msg.push(100u8); msg.push(82u8); msg.push(117u8);
+        msg.push(110u8); msg.push(101u8);
+        return go_errors_new(msg);
+    };
+    r.i = r.i - r.prev;
+    r.prev = -1;
+    return go_errors_nil();
+}
+
+// Reader.Seek(offset, whence): whence 0 = start,
+// 1 = current, 2 = end (io.SeekStart/Current/End).
+// Returns the new absolute offset.
+struct GoReaderSeek {
+    pos: i64,
+    err: ptr,
+}
+
+fn go_strings_reader_seek(r: &GosReader, offset: i64, whence: i64) -> GoReaderSeek {
+    let base = 0;
+    if whence == 1 { base = r.i; };
+    if whence == 2 { base = len(r.b); };
+    if whence < 0 || whence > 2 {
+        let msg = Vec::new();
+        msg.push(105u8); msg.push(110u8); msg.push(118u8); msg.push(97u8);
+        msg.push(108u8); msg.push(105u8); msg.push(100u8); msg.push(32u8);
+        msg.push(119u8); msg.push(104u8); msg.push(101u8); msg.push(110u8);
+        msg.push(99u8); msg.push(101u8);
+        return GoReaderSeek { pos: r.i, err: go_errors_new(msg) };
+    };
+    let np = base + offset;
+    if np < 0 {
+        let msg = Vec::new();
+        msg.push(110u8); msg.push(101u8); msg.push(103u8); msg.push(97u8);
+        msg.push(116u8); msg.push(105u8); msg.push(118u8); msg.push(101u8);
+        msg.push(32u8); msg.push(115u8); msg.push(101u8); msg.push(101u8);
+        msg.push(107u8); msg.push(32u8); msg.push(112u8); msg.push(111u8);
+        msg.push(115u8); msg.push(105u8); msg.push(116u8); msg.push(105u8);
+        msg.push(111u8); msg.push(110u8);
+        return GoReaderSeek { pos: r.i, err: go_errors_new(msg) };
+    };
+    r.i = np;
+    r.prev = -1;
+    return GoReaderSeek { pos: np, err: go_errors_nil() };
+}
+
+// Reader.Reset(s): reuse the reader over new input.
+fn go_strings_reader_reset(r: &GosReader, s: Vec<u8>) -> void {
+    r.b = s;
+    r.i = 0;
+    r.prev = -1;
+    return;
+}

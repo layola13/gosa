@@ -1,0 +1,355 @@
+// gostd encoding/base64: the SLA-side model of
+// Go's encoding/base64 package. An Encoding is a
+// value struct: the 64-byte alphabet, the padding
+// character (-1 = NoPadding), and the strict flag.
+// The four standard encodings are constructors.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77407  NewEncoding with an invalid alphabet:
+//          not 64 bytes, or containing '\r' / '\n'
+//          (Go panics the same way)
+//   77414  streaming adapters (NewDecoder /
+//          NewEncoder): gostd has no streaming
+//          reader/writer surface -- loud refusal.
+//          SHARED INTENTIONALLY with encoding/hex
+//          (R1400): the same code, the same
+//          documented meaning. Both files state the
+//          sharing here so a future renumbering does
+//          not split them.
+//
+// CorruptInputError is positional: Go reports
+// "illegal base64 data at input byte N". gostd
+// builds that message with the byte index (a plain
+// GosError, no target id -- errors.As-style
+// matching on CorruptInputError is a frontend
+// concern, since the position is part of the value).
+// Where Go's exact error index is a judgement call
+// (a truncated final quantum), this file points at
+// the first byte of that quantum; the oracle phase
+// checks it.
+//
+// VALUE REPRESENTATION (gostd contract):
+//   Go []byte / string -> Vec<u8>
+//   Go error           -> GosError heap ptr
+//   pad char -1 means NoPadding.
+
+struct GosBase64Encoding {
+    alphabet: Vec<u8>,
+    pad: i64,
+    strict: bool,
+}
+
+struct GoBase64Bytes {
+    v: Vec<u8>,
+    err: ptr,
+}
+
+struct GoBase64EncodingResult {
+    enc: GosBase64Encoding,
+    err: ptr,
+}
+
+// ---------- alphabet tables ----------
+
+fn __go_b64_std_alphabet() -> Vec<u8> {
+    let a = Vec::new();
+    a.push(65u8); a.push(66u8); a.push(67u8); a.push(68u8); a.push(69u8); a.push(70u8); a.push(71u8); a.push(72u8); a.push(73u8); a.push(74u8);
+    a.push(75u8); a.push(76u8); a.push(77u8); a.push(78u8); a.push(79u8); a.push(80u8); a.push(81u8); a.push(82u8); a.push(83u8); a.push(84u8);
+    a.push(85u8); a.push(86u8); a.push(87u8); a.push(88u8); a.push(89u8); a.push(90u8); a.push(97u8); a.push(98u8); a.push(99u8); a.push(100u8);
+    a.push(101u8); a.push(102u8); a.push(103u8); a.push(104u8); a.push(105u8); a.push(106u8); a.push(107u8); a.push(108u8); a.push(109u8); a.push(110u8);
+    a.push(111u8); a.push(112u8); a.push(113u8); a.push(114u8); a.push(115u8); a.push(116u8); a.push(117u8); a.push(118u8); a.push(119u8); a.push(120u8);
+    a.push(121u8); a.push(122u8); a.push(48u8); a.push(49u8); a.push(50u8); a.push(51u8); a.push(52u8); a.push(53u8); a.push(54u8); a.push(55u8);
+    a.push(56u8); a.push(57u8); a.push(43u8); a.push(47u8);
+    return a;
+}
+
+fn __go_b64_url_alphabet() -> Vec<u8> {
+    let a = Vec::new();
+    a.push(65u8); a.push(66u8); a.push(67u8); a.push(68u8); a.push(69u8); a.push(70u8); a.push(71u8); a.push(72u8); a.push(73u8); a.push(74u8);
+    a.push(75u8); a.push(76u8); a.push(77u8); a.push(78u8); a.push(79u8); a.push(80u8); a.push(81u8); a.push(82u8); a.push(83u8); a.push(84u8);
+    a.push(85u8); a.push(86u8); a.push(87u8); a.push(88u8); a.push(89u8); a.push(90u8); a.push(97u8); a.push(98u8); a.push(99u8); a.push(100u8);
+    a.push(101u8); a.push(102u8); a.push(103u8); a.push(104u8); a.push(105u8); a.push(106u8); a.push(107u8); a.push(108u8); a.push(109u8); a.push(110u8);
+    a.push(111u8); a.push(112u8); a.push(113u8); a.push(114u8); a.push(115u8); a.push(116u8); a.push(117u8); a.push(118u8); a.push(119u8); a.push(120u8);
+    a.push(121u8); a.push(122u8); a.push(48u8); a.push(49u8); a.push(50u8); a.push(51u8); a.push(52u8); a.push(53u8); a.push(54u8); a.push(55u8);
+    a.push(56u8); a.push(57u8); a.push(45u8); a.push(95u8);
+    return a;
+}
+
+// ---------- constructors ----------
+
+fn go_base64_std_encoding() -> GosBase64Encoding {
+    return GosBase64Encoding { alphabet: __go_b64_std_alphabet(), pad: 61, strict: false };
+}
+
+fn go_base64_url_encoding() -> GosBase64Encoding {
+    return GosBase64Encoding { alphabet: __go_b64_url_alphabet(), pad: 61, strict: false };
+}
+
+fn go_base64_raw_std_encoding() -> GosBase64Encoding {
+    return GosBase64Encoding { alphabet: __go_b64_std_alphabet(), pad: -1, strict: false };
+}
+
+fn go_base64_raw_url_encoding() -> GosBase64Encoding {
+    return GosBase64Encoding { alphabet: __go_b64_url_alphabet(), pad: -1, strict: false };
+}
+
+// NewEncoding(enc): panics (77407) when the
+// alphabet is not 64 bytes or contains '\r'/'\n'.
+fn go_base64_new_encoding(enc: Vec<u8>) -> GosBase64Encoding {
+    if len(enc) != 64 { panic(77407); };
+    let i = 0;
+    while i < len(enc) {
+        if enc[i] == 10u8 { panic(77407); };
+        if enc[i] == 13u8 { panic(77407); };
+        i = i + 1;
+    }
+    return GosBase64Encoding { alphabet: enc, pad: 61, strict: false };
+}
+
+// Strict: a copy that rejects '\r' and '\n'.
+fn go_base64_strict(enc: &GosBase64Encoding) -> GosBase64Encoding {
+    return GosBase64Encoding { alphabet: enc.alphabet, pad: enc.pad, strict: true };
+}
+
+// WithPadding(c): a copy with the given padding
+// character, or NoPadding (-1).
+fn go_base64_with_padding(enc: &GosBase64Encoding, c: i64) -> GosBase64Encoding {
+    return GosBase64Encoding { alphabet: enc.alphabet, pad: c, strict: enc.strict };
+}
+
+// ---------- lengths ----------
+
+fn go_base64_encoded_len(enc: &GosBase64Encoding, n: i64) -> i64 {
+    if enc.pad == -1 {
+        return (n * 8 + 5) / 6;
+    };
+    return (n + 2) / 3 * 4;
+}
+
+fn go_base64_decoded_len(enc: &GosBase64Encoding, x: i64) -> i64 {
+    return x * 6 / 8;
+}
+
+// ---------- encode ----------
+
+// Encode(dst, src): appends the encoding of src.
+fn go_base64_encode(enc: &GosBase64Encoding, src: Vec<u8>) -> Vec<u8> {
+    return go_base64_append_encode(enc, Vec::new(), src);
+}
+
+fn go_base64_encode_to_string(enc: &GosBase64Encoding, src: Vec<u8>) -> Vec<u8> {
+    return go_base64_encode(enc, src);
+}
+
+fn go_base64_append_encode(enc: &GosBase64Encoding, dst: Vec<u8>, src: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(dst) {
+        out.push(dst[i]);
+        i = i + 1;
+    }
+    let pad = enc.pad;
+    let j = 0;
+    while j + 3 <= len(src) {
+        let b0 = src[j] as i64;
+        let b1 = src[j + 1] as i64;
+        let b2 = src[j + 2] as i64;
+        out.push(enc.alphabet[b0 >> 2]);
+        out.push(enc.alphabet[((b0 & 3) << 4) | (b1 >> 4)]);
+        out.push(enc.alphabet[((b1 & 15) << 2) | (b2 >> 6)]);
+        out.push(enc.alphabet[b2 & 63]);
+        j = j + 3;
+    }
+    let rem = len(src) - j;
+    if rem == 1 {
+        let b0 = src[j] as i64;
+        out.push(enc.alphabet[b0 >> 2]);
+        out.push(enc.alphabet[(b0 & 3) << 4]);
+        if pad != -1 {
+            out.push(pad as u8);
+            out.push(pad as u8);
+        };
+    };
+    if rem == 2 {
+        let b0 = src[j] as i64;
+        let b1 = src[j + 1] as i64;
+        out.push(enc.alphabet[b0 >> 2]);
+        out.push(enc.alphabet[((b0 & 3) << 4) | (b1 >> 4)]);
+        out.push(enc.alphabet[(b1 & 15) << 2]);
+        if pad != -1 {
+            out.push(pad as u8);
+        };
+    };
+    return out;
+}
+
+// ---------- decode ----------
+
+fn __go_b64_val(enc: &GosBase64Encoding, c: u8) -> i64 {
+    let i = 0;
+    while i < len(enc.alphabet) {
+        if enc.alphabet[i] == c { return i; };
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn __go_b64_corrupt(idx: i64) -> ptr {
+    let m = Vec::new();
+    m.push(105u8); m.push(108u8); m.push(108u8); m.push(101u8); m.push(103u8); m.push(97u8); m.push(108u8); m.push(32u8); m.push(98u8); m.push(97u8);
+    m.push(115u8); m.push(101u8); m.push(54u8); m.push(52u8); m.push(32u8); m.push(100u8); m.push(97u8); m.push(116u8); m.push(97u8); m.push(32u8);
+    m.push(97u8); m.push(116u8); m.push(32u8); m.push(105u8); m.push(110u8); m.push(112u8); m.push(117u8); m.push(116u8); m.push(32u8); m.push(98u8);
+    m.push(121u8); m.push(116u8); m.push(101u8); m.push(32u8);
+    let d = go_strconv_format_int(idx, 10);
+    let j = 0;
+    while j < len(d) {
+        m.push(d[j]);
+        j = j + 1;
+    }
+    return go_errors_new(m);
+}
+
+// Decode(src): skips '\r'/'\n' unless strict;
+// validates every character and the padding.
+fn go_base64_decode(enc: &GosBase64Encoding, src: Vec<u8>) -> GoBase64Bytes {
+    return go_base64_append_decode(enc, Vec::new(), src);
+}
+
+fn go_base64_decode_string(enc: &GosBase64Encoding, src: Vec<u8>) -> GoBase64Bytes {
+    return go_base64_decode(enc, src);
+}
+
+fn go_base64_append_decode(enc: &GosBase64Encoding, dst: Vec<u8>, src: Vec<u8>) -> GoBase64Bytes {
+    // Clean pass: values (0..63), 64 for '=', with
+    // the original index of each significant byte.
+    let vals = Vec::new();
+    let idxs = Vec::new();
+    let i = 0;
+    while i < len(src) {
+        let c = src[i];
+        if c == 13u8 || c == 10u8 {
+            if enc.strict {
+                return GoBase64Bytes { v: dst, err: __go_b64_corrupt(i) };
+            };
+            i = i + 1;
+            continue;
+        };
+        if enc.pad != -1 {
+            if c as i64 == enc.pad {
+                vals.push(64);
+                idxs.push(i);
+                i = i + 1;
+                continue;
+            };
+        };
+        let v = __go_b64_val(enc, c);
+        if v < 0 {
+            return GoBase64Bytes { v: dst, err: __go_b64_corrupt(i) };
+        };
+        vals.push(v);
+        idxs.push(i);
+        i = i + 1;
+    }
+    // Padding rules.
+    let pad_at = 0 - 1;
+    let k = 0;
+    while k < len(vals) {
+        if vals[k] == 64 { pad_at = k; break; };
+        k = k + 1;
+    }
+    if pad_at >= 0 {
+        if enc.pad == -1 {
+            return GoBase64Bytes { v: dst, err: __go_b64_corrupt(idxs[pad_at]) };
+        };
+        // All bytes after the first '=' must be '='.
+        let j = pad_at;
+        while j < len(vals) {
+            if vals[j] != 64 {
+                return GoBase64Bytes { v: dst, err: __go_b64_corrupt(idxs[j]) };
+            };
+            j = j + 1;
+        }
+        // At most 2 pads, and only in the last group.
+        let npad = len(vals) - pad_at;
+        if npad > 2 {
+            return GoBase64Bytes { v: dst, err: __go_b64_corrupt(idxs[pad_at + 2]) };
+        };
+        if pad_at < len(vals) - 4 {
+            return GoBase64Bytes { v: dst, err: __go_b64_corrupt(idxs[pad_at]) };
+        };
+        if len(vals) % 4 != 0 {
+            return GoBase64Bytes { v: dst, err: __go_b64_corrupt(idxs[pad_at]) };
+        };
+    };
+    if enc.pad != -1 {
+        if len(vals) % 4 != 0 {
+            // Truncated final quantum in padded mode.
+            let q = len(vals) - (len(vals) % 4);
+            return GoBase64Bytes { v: dst, err: __go_b64_corrupt(idxs[q]) };
+        };
+    } else {
+        if len(vals) % 4 == 1 {
+            return GoBase64Bytes { v: dst, err: __go_b64_corrupt(idxs[len(vals) - 1]) };
+        };
+    };
+    // Decode quanta.
+    let out = Vec::new();
+    let j = 0;
+    while j < len(dst) {
+        out.push(dst[j]);
+        j = j + 1;
+    }
+    let q = 0;
+    while q + 4 <= len(vals) {
+        let v0 = vals[q];
+        let v1 = vals[q + 1];
+        let v2 = vals[q + 2];
+        let v3 = vals[q + 3];
+        if v2 == 64 {
+            // xx== : one byte
+            out.push((((v0 << 2) | (v1 >> 4)) as u8));
+        } else {
+            if v3 == 64 {
+                // xxx= : two bytes
+                out.push((((v0 << 2) | (v1 >> 4)) as u8));
+                out.push((((v1 << 4) | (v2 >> 2)) as u8));
+            } else {
+                out.push((((v0 << 2) | (v1 >> 4)) as u8));
+                out.push((((v1 << 4) | (v2 >> 2)) as u8));
+                out.push((((v2 << 6) | v3) as u8));
+            };
+        };
+        q = q + 4;
+    }
+    // Raw trailing partial quantum: 2 chars -> 1
+    // byte, 3 chars -> 2 bytes.
+    let rem = len(vals) - q;
+    if rem == 2 {
+        let v0 = vals[q];
+        let v1 = vals[q + 1];
+        out.push((((v0 << 2) | (v1 >> 4)) as u8));
+    };
+    if rem == 3 {
+        let v0 = vals[q];
+        let v1 = vals[q + 1];
+        let v2 = vals[q + 2];
+        out.push((((v0 << 2) | (v1 >> 4)) as u8));
+        out.push((((v1 << 4) | (v2 >> 2)) as u8));
+    };
+    return GoBase64Bytes { v: out, err: go_errors_nil() };
+}
+
+// ---------- streaming refusals (77414) ----------
+
+// NewDecoder / NewEncoder need a streaming
+// reader/writer surface, which gostd does not
+// have. Loud refusal: the frontend must refuse
+// them at the call site. (77414 is shared
+// intentionally with encoding/hex, R1400.)
+fn go_base64_new_decoder(enc: &GosBase64Encoding) -> GoBase64Bytes {
+    panic(77414);
+}
+
+fn go_base64_new_encoder(enc: &GosBase64Encoding) -> GoBase64Bytes {
+    panic(77414);
+}

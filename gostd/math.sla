@@ -1,0 +1,642 @@
+// gostd math: Go's math package over the sa_std libm
+// externs (sa_math_*). Stock sa_std exports floor / ceil /
+// sqrt / sin / cos / pow; the S1 libm landing (sci main
+// 500477e5) added exp / log / log10 / log2 / tan / asin /
+// acos / atan / atan2 / hypot / sinh / cosh / tanh /
+// expm1 / log1p / frexp under the same sa_math_ prefix.
+// The S1 extern declarations are written out below; if
+// the integration phase finds them already declared in
+// sa_std/math.sai, the duplicates come out and the import
+// alone stays (flagged in NOTES-runtime.md).
+//
+// Go's math package is specified to the last bit on
+// special values, so the special-case tables (Pow above
+// all) are written out explicitly instead of trusting
+// libm to agree on every corner -- where libm IS the
+// specification (Sin/Cos/Exp/Log/...), the extern is
+// called directly, which is also what Go does on most
+// platforms.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77451 a math function with no libm extern and no
+//         honest SLA construction (Erf, Erfc, Gamma,
+//         Lgamma, J0/J1/Y0/Y1, Ilogb): loud refusal.
+//   77452 Float64bits / Float64frombits refusal: SLA's
+//         `as` is a numeric conversion, not a bitcast,
+//         and gostd has no confirmed bitcast surface
+//         (the S3 float-repr line hit the same wall and
+//         takes bit patterns as INPUT for this reason).
+
+@import "sa_std/math.sai"
+
+@extern sa_math_exp(x: f64) -> f64
+@extern sa_math_log(x: f64) -> f64
+@extern sa_math_log10(x: f64) -> f64
+@extern sa_math_log2(x: f64) -> f64
+@extern sa_math_tan(x: f64) -> f64
+@extern sa_math_asin(x: f64) -> f64
+@extern sa_math_acos(x: f64) -> f64
+@extern sa_math_atan(x: f64) -> f64
+@extern sa_math_atan2(y: f64, x: f64) -> f64
+@extern sa_math_hypot(x: f64, y: f64) -> f64
+@extern sa_math_sinh(x: f64) -> f64
+@extern sa_math_cosh(x: f64) -> f64
+@extern sa_math_tanh(x: f64) -> f64
+@extern sa_math_expm1(x: f64) -> f64
+@extern sa_math_log1p(x: f64) -> f64
+
+// ---- constants (Go's math constants, full precision) ----
+
+const GO_MATH_PI: f64 = 3.14159265358979323846264338327950288419716939937510582097494459;
+const GO_MATH_E: f64 = 2.71828182845904523536028747135266249775724709369995957496696763;
+const GO_MATH_PHI: f64 = 1.61803398874989484820458683436563811772030917980576286213544862;
+const GO_MATH_SQRT2: f64 = 1.41421356237309504880168872420969807856967187537694807317667974;
+const GO_MATH_SQRT_E: f64 = 1.64872127070012814684865078781416357165377610071014801157507931;
+const GO_MATH_SQRT_PI: f64 = 1.77245385090551602729816748334114518279754945612238712821380779;
+const GO_MATH_SQRT_PHI: f64 = 1.27201964951406896425242246173749149171560804184009624861664038;
+const GO_MATH_LOG2E: f64 = 1.44269504088896340735992468100189213742664595415298593413544941;
+const GO_MATH_LOG10E: f64 = 0.43429448190325182765112891891660508229439700580366656611445378;
+const GO_MATH_LN2: f64 = 0.69314718055994530941723212145817656807550013436025525412068001;
+const GO_MATH_LN10: f64 = 2.30258509299404568401799145468436420760110148862877297603332790;
+
+// ---- infinity / NaN construction ----
+//
+// The SLA parser rejects the MaxFloat64 decimal literal
+// outright (the plistlib e308 lesson), so infinity is
+// built the way the psa pickle line built it: repeated
+// squaring of 2^64 overflows to +Inf in IEEE arithmetic.
+
+fn __go_math_pos_inf() -> f64 {
+    let v = 18446744073709551616.0;
+    v = v * v;
+    v = v * v;
+    v = v * v;
+    v = v * v;
+    return v;
+}
+
+fn go_math_inf(sign: i64) -> f64 {
+    if sign < 0 {
+        return -__go_math_pos_inf();
+    };
+    return __go_math_pos_inf();
+}
+
+fn go_math_nan() -> f64 {
+    let inf = __go_math_pos_inf();
+    return inf - inf;
+}
+
+fn go_math_is_nan(x: f64) -> bool {
+    return x != x;
+}
+
+fn go_math_is_inf(x: f64, sign: i64) -> bool {
+    let inf = __go_math_pos_inf();
+    if sign > 0 {
+        return x == inf;
+    };
+    if sign < 0 {
+        return x == -inf;
+    };
+    if x == inf {
+        return true;
+    };
+    return x == -inf;
+}
+
+fn __go_math_is_neg_zero(x: f64) -> bool {
+    if x != 0.0 {
+        return false;
+    };
+    return 1.0 / x < 0.0;
+}
+
+// Signbit: the sign of NaN is not observable without a
+// bitcast (77452), so NaN reports false here -- a
+// documented observability gap, not a wrong answer about
+// any number.
+fn go_math_signbit(x: f64) -> bool {
+    if x < 0.0 {
+        return true;
+    };
+    return __go_math_is_neg_zero(x);
+}
+
+fn go_math_copysign(x: f64, y: f64) -> f64 {
+    let mag = x;
+    if mag < 0.0 {
+        mag = -mag;
+    };
+    if go_math_signbit(y) {
+        return -mag;
+    };
+    return mag;
+}
+
+// MaxFloat64 / SmallestNonzeroFloat64 as functions: the
+// decimal literals for both are exactly the ones the SLA
+// parser refuses, so they are built by exact scaling
+// (multiplication by 2 is exact until overflow; halving
+// is exact down to the smallest subnormal).
+fn go_math_max_float64() -> f64 {
+    let v = 1.9999999999999998;
+    let i = 0;
+    while i < 1023 {
+        v = v * 2.0;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn go_math_smallest_nonzero_float64() -> f64 {
+    let v = 1.0;
+    let i = 0;
+    while i < 1074 {
+        v = v / 2.0;
+        i = i + 1;
+    }
+    return v;
+}
+
+// ---- basic ----
+
+fn go_math_abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return -x;
+    };
+    return x;
+}
+
+// Go math.Max: NaN in either operand gives NaN; +0 > -0.
+fn go_math_max(x: f64, y: f64) -> f64 {
+    if x != x {
+        return x;
+    };
+    if y != y {
+        return y;
+    };
+    if x == 0.0 {
+        if y == 0.0 {
+            // Max(+0, -0) = +0; Max(-0, -0) = -0.
+            if __go_math_is_neg_zero(x) {
+                if __go_math_is_neg_zero(y) {
+                    return x;
+                };
+            };
+            return y;
+        };
+    };
+    if x > y {
+        return x;
+    };
+    return y;
+}
+
+fn go_math_min(x: f64, y: f64) -> f64 {
+    if x != x {
+        return x;
+    };
+    if y != y {
+        return y;
+    };
+    if x == 0.0 {
+        if y == 0.0 {
+            if __go_math_is_neg_zero(x) {
+                return x;
+            };
+            if __go_math_is_neg_zero(y) {
+                return y;
+            };
+            return x;
+        };
+    };
+    if x < y {
+        return x;
+    };
+    return y;
+}
+
+fn go_math_dim(x: f64, y: f64) -> f64 {
+    if x > y {
+        return x - y;
+    };
+    return 0.0;
+}
+
+// ---- rounding ----
+
+fn go_math_floor(x: f64) -> f64 {
+    return sa_math_floor(x);
+}
+
+fn go_math_ceil(x: f64) -> f64 {
+    return sa_math_ceil(x);
+}
+
+fn go_math_trunc(x: f64) -> f64 {
+    if x != x {
+        return x;
+    };
+    if x >= 0.0 {
+        return sa_math_floor(x);
+    };
+    return sa_math_ceil(x);
+}
+
+// Round: half away from zero, exact on the fraction
+// (x - floor(x) is exact for doubles in the range where
+// the fraction can be non-zero at all; at |x| >= 2^52
+// every double is already an integer).
+fn go_math_round(x: f64) -> f64 {
+    if x != x {
+        return x;
+    };
+    if go_math_is_inf(x, 0) {
+        return x;
+    };
+    if x >= 0.0 {
+        let f = sa_math_floor(x);
+        if x - f >= 0.5 {
+            return f + 1.0;
+        };
+        return f;
+    };
+    let c = sa_math_ceil(x);
+    if c - x >= 0.5 {
+        return c - 1.0;
+    };
+    return c;
+}
+
+fn go_math_round_to_even(x: f64) -> f64 {
+    if x != x {
+        return x;
+    };
+    if go_math_is_inf(x, 0) {
+        return x;
+    };
+    let f = sa_math_floor(x);
+    let frac = x - f;
+    if frac > 0.5 {
+        return f + 1.0;
+    };
+    if frac < 0.5 {
+        return f;
+    };
+    // Exactly halfway: pick the even neighbour.
+    let half = f / 2.0;
+    if half == sa_math_floor(half) {
+        return f;
+    };
+    return f + 1.0;
+}
+
+// ---- roots / powers / logs ----
+
+fn go_math_sqrt(x: f64) -> f64 {
+    return sa_math_sqrt(x);
+}
+
+fn __go_math_is_odd_int(y: f64) -> bool {
+    if y != y {
+        return false;
+    };
+    if go_math_is_inf(y, 0) {
+        return false;
+    };
+    let t = go_math_trunc(y);
+    if t != y {
+        return false;
+    };
+    if go_math_abs(y) >= 9007199254740992.0 {
+        // Every double at this magnitude is an even
+        // integer (spacing >= 2).
+        return false;
+    };
+    let half = go_math_trunc(y / 2.0);
+    return half * 2.0 != y;
+}
+
+// Pow with Go's full special-case table (from the Go
+// spec of math.Pow), then libm for the general case.
+fn go_math_pow(x: f64, y: f64) -> f64 {
+    if y == 0.0 {
+        return 1.0;
+    };
+    if y == 1.0 {
+        return x;
+    };
+    if x == 1.0 {
+        return 1.0;
+    };
+    if x != x {
+        return x;
+    };
+    if y != y {
+        return y;
+    };
+    if x == 0.0 {
+        let neg_zero = __go_math_is_neg_zero(x);
+        let odd = __go_math_is_odd_int(y);
+        if y > 0.0 {
+            if neg_zero {
+                if odd {
+                    return x;
+                };
+            };
+            return 0.0;
+        };
+        // y < 0: +Inf, or -Inf for (-0, odd).
+        if neg_zero {
+            if odd {
+                return -__go_math_pos_inf();
+            };
+        };
+        return __go_math_pos_inf();
+    };
+    if go_math_is_inf(x, 1) {
+        if y > 0.0 {
+            return x;
+        };
+        return 0.0;
+    };
+    if go_math_is_inf(x, -1) {
+        let odd = __go_math_is_odd_int(y);
+        if y > 0.0 {
+            if odd {
+                return x;
+            };
+            return __go_math_pos_inf();
+        };
+        if odd {
+            return -0.0;
+        };
+        return 0.0;
+    };
+    if x == -1.0 {
+        if go_math_is_inf(y, 0) {
+            return 1.0;
+        };
+    };
+    return sa_math_pow(x, y);
+}
+
+fn go_math_pow10(n: i64) -> f64 {
+    if n == 0 {
+        return 1.0;
+    };
+    if n > 0 {
+        return sa_math_pow(10.0, n as f64);
+    };
+    return 1.0 / sa_math_pow(10.0, (0 - n) as f64);
+}
+
+fn go_math_exp(x: f64) -> f64 {
+    return sa_math_exp(x);
+}
+
+fn go_math_exp2(x: f64) -> f64 {
+    return sa_math_pow(2.0, x);
+}
+
+fn go_math_expm1(x: f64) -> f64 {
+    return sa_math_expm1(x);
+}
+
+fn go_math_log(x: f64) -> f64 {
+    return sa_math_log(x);
+}
+
+fn go_math_log10(x: f64) -> f64 {
+    return sa_math_log10(x);
+}
+
+fn go_math_log2(x: f64) -> f64 {
+    return sa_math_log2(x);
+}
+
+fn go_math_log1p(x: f64) -> f64 {
+    return sa_math_log1p(x);
+}
+
+// Frexp / Ldexp are implemented in pure SLA by exact
+// binary scaling instead of riding sa_math_frexp: the
+// extern's out-parameter shape is not confirmed at
+// gostd's layer, and scaling by powers of two is exact,
+// so the pure version cannot be wronger than the extern
+// version could be misdeclared. (If the extern shape is
+// confirmed later, swapping is a one-function change.)
+fn go_math_frexp(x: f64) -> (f64, i64) {
+    if x == 0.0 {
+        return (x, 0);
+    };
+    if x != x {
+        return (x, 0);
+    };
+    if go_math_is_inf(x, 0) {
+        return (x, 0);
+    };
+    let e: i64 = 0;
+    let f = x;
+    let a = go_math_abs(f);
+    // Chunk phase: divide by 2^32 while |f| >= 1, then
+    // single steps into [0.5, 1).
+    while a >= 4294967296.0 {
+        f = f / 4294967296.0;
+        e = e + 32;
+        a = go_math_abs(f);
+    }
+    while a >= 1.0 {
+        f = f / 2.0;
+        e = e + 1;
+        a = go_math_abs(f);
+    }
+    while a < 0.00000000023283064365386963 {
+        // 2^-32
+        f = f * 4294967296.0;
+        e = e - 32;
+        a = go_math_abs(f);
+    }
+    while a < 0.5 {
+        f = f * 2.0;
+        e = e - 1;
+        a = go_math_abs(f);
+    }
+    return (f, e);
+}
+
+fn go_math_ldexp(frac: f64, exp: i64) -> f64 {
+    if frac == 0.0 {
+        return frac;
+    };
+    if frac != frac {
+        return frac;
+    };
+    if go_math_is_inf(frac, 0) {
+        return frac;
+    };
+    let f = frac;
+    let e = exp;
+    while e >= 32 {
+        f = f * 4294967296.0;
+        if go_math_is_inf(f, 0) {
+            return f;
+        };
+        e = e - 32;
+    }
+    while e > 0 {
+        f = f * 2.0;
+        if go_math_is_inf(f, 0) {
+            return f;
+        };
+        e = e - 1;
+    }
+    while e <= -32 {
+        f = f / 4294967296.0;
+        if f == 0.0 {
+            return f;
+        };
+        e = e + 32;
+    }
+    while e < 0 {
+        f = f / 2.0;
+        if f == 0.0 {
+            return f;
+        };
+        e = e + 1;
+    }
+    return f;
+}
+
+// ---- trig / hyperbolic (libm is the spec) ----
+
+fn go_math_sin(x: f64) -> f64 {
+    return sa_math_sin(x);
+}
+
+fn go_math_cos(x: f64) -> f64 {
+    return sa_math_cos(x);
+}
+
+fn go_math_tan(x: f64) -> f64 {
+    return sa_math_tan(x);
+}
+
+fn go_math_asin(x: f64) -> f64 {
+    return sa_math_asin(x);
+}
+
+fn go_math_acos(x: f64) -> f64 {
+    return sa_math_acos(x);
+}
+
+fn go_math_atan(x: f64) -> f64 {
+    return sa_math_atan(x);
+}
+
+fn go_math_atan2(y: f64, x: f64) -> f64 {
+    return sa_math_atan2(y, x);
+}
+
+fn go_math_sinh(x: f64) -> f64 {
+    return sa_math_sinh(x);
+}
+
+fn go_math_cosh(x: f64) -> f64 {
+    return sa_math_cosh(x);
+}
+
+fn go_math_tanh(x: f64) -> f64 {
+    return sa_math_tanh(x);
+}
+
+fn go_math_hypot(x: f64, y: f64) -> f64 {
+    // Go: Hypot(+Inf, NaN) = +Inf -- libm hypot returns
+    // NaN there on some platforms, so the Inf case is
+    // pinned here first.
+    if go_math_is_inf(x, 0) {
+        return __go_math_pos_inf();
+    };
+    if go_math_is_inf(y, 0) {
+        return __go_math_pos_inf();
+    };
+    return sa_math_hypot(x, y);
+}
+
+// ---- Mod / Remainder ----
+//
+// Both are computed as x - q*y. For |x/y| beyond 2^53 the
+// quotient is not representable finely enough and the
+// result can differ from Go's exact algorithm in the last
+// bits; documented in NOTES-runtime.md. All special
+// values follow Go exactly.
+
+fn go_math_mod(x: f64, y: f64) -> f64 {
+    if y == 0.0 {
+        return go_math_nan();
+    };
+    if go_math_is_inf(x, 0) {
+        return go_math_nan();
+    };
+    if x == 0.0 {
+        return x;
+    };
+    if go_math_is_inf(y, 0) {
+        return x;
+    };
+    let q = go_math_trunc(x / y);
+    let r = x - q * y;
+    if r == 0.0 {
+        // Sign of a zero result is the sign of x in Go.
+        return go_math_copysign(0.0, x);
+    };
+    return r;
+}
+
+fn go_math_remainder(x: f64, y: f64) -> f64 {
+    if y == 0.0 {
+        return go_math_nan();
+    };
+    if go_math_is_inf(x, 0) {
+        return go_math_nan();
+    };
+    if go_math_is_inf(y, 0) {
+        return x;
+    };
+    if x == 0.0 {
+        return x;
+    };
+    let n = go_math_round_to_even(x / y);
+    let r = x - n * y;
+    if r == 0.0 {
+        return go_math_copysign(0.0, x);
+    };
+    return r;
+}
+
+// ---- loud refusals ----
+
+fn go_math_erf(x: f64) -> f64 {
+    panic(77451);
+}
+
+fn go_math_erfc(x: f64) -> f64 {
+    panic(77451);
+}
+
+fn go_math_gamma(x: f64) -> f64 {
+    panic(77451);
+}
+
+fn go_math_lgamma(x: f64) -> (f64, i64) {
+    panic(77451);
+}
+
+fn go_math_float64bits(x: f64) -> u64 {
+    panic(77452);
+}
+
+fn go_math_float64frombits(b: u64) -> f64 {
+    panic(77452);
+}

@@ -1,0 +1,984 @@
+// gostd context: Go's context package over the SLA natives the
+// gosla frontend already emits (Chan<T>, thread::spawn, select).
+//
+// ORACLE: Go 1.27.2 stdlib, /usr/local/go/src/context/context.go
+// (807 lines, read from the box). This file covers the whole
+// package surface except the String() methods (they need fmt +
+// Go type names; see "Not covered" below).
+//
+//   Covered (Go -> gostd):
+//     Background()            -> go_context_background
+//     TODO()                  -> go_context_todo
+//     WithCancel(parent)      -> go_context_with_cancel
+//       -> GoContextWithCancel { ctx, cancel: GoCancelFunc }
+//     WithCancelCause(parent) -> go_context_with_cancel_cause
+//       -> GoContextWithCancelCause { ctx, cancel: GoCancelCauseFunc }
+//     WithDeadline(parent, d) -> go_context_with_deadline
+//     WithDeadlineCause(parent, d, cause)
+//                             -> go_context_with_deadline_cause
+//     WithTimeout(parent, t)  -> go_context_with_timeout
+//     WithTimeoutCause(parent, t, cause)
+//                             -> go_context_with_timeout_cause
+//     WithValue(parent, key, val)
+//                             -> go_context_with_value
+//     WithoutCancel(parent)   -> go_context_without_cancel
+//     Cause(ctx)              -> go_context_cause
+//     AfterFunc(ctx, f)       -> go_context_after_func
+//       -> GoAfterFuncStop handle + go_context_after_func_stop
+//     ctx.Deadline()          -> go_context_deadline
+//       -> GoContextDeadline { deadline: GoTime, ok: bool }
+//     ctx.Done()              -> go_context_done
+//       -> GoContextDone { ch: Chan<i64>, ok: bool }
+//     ctx.Err()               -> go_context_err -> ptr (nil = no error)
+//     ctx.Value(key)          -> go_context_value -> GosVal (tag 0 = absent)
+//     Canceled                -> go_context_canceled (target id 900031)
+//     DeadlineExceeded        -> go_context_deadline_exceeded (id 900032)
+//     CancelFunc              -> GoCancelFunc handle + go_context_cancel
+//     CancelCauseFunc         -> GoCancelCauseFunc handle
+//                              + go_context_cancel_with_cause
+//
+// DESIGN: Go's Context is an interface with many implementations
+// (emptyCtx, cancelCtx, timerCtx, valueCtx, withoutCancelCtx).
+// gostd models all of them as ONE heap node type (GoCtxNode)
+// behind a thin handle (GoContext { node: *GoCtxNode }), exactly the
+// way GosError is a heap object behind a ptr in errors.sla:
+// copying a GoContext aliases the node, which is Go's
+// interface-value copy semantics, and every mutation goes
+// through (*node).field, so all copies always see the same
+// state. The node's `kind` selects which layers are live:
+//   0 empty (Background/TODO) -- never canceled, no values
+//   1 cancel                   -- Done/Err/cause + children
+//   2 timer                    -- cancel + deadline_ns
+//   3 value                    -- one key/value pair + parent link
+//   4 without-cancel           -- values pass through, cancellation
+//                               does not (chain is cut here)
+// A derived context's `parent` is the immediate parent node's
+// *GoCtxNode; Deadline/Done/Err/Value/Cause all walk that chain, so a
+// valueCtx wrapping a cancelCtx (or a cancelCtx wrapping a
+// valueCtx wrapping a cancelCtx) behaves exactly like Go's
+// embedding chain. The `registered_on` field records which
+// cancel node this node is registered in as a child (0 = none).
+//
+// CANCELLATION: canceling a node (first call wins, under the
+// node's GoMutex) stores err_id + the sentinel err ptr + the
+// cause, closes its Done channel (Chan::new(0) + .close(),
+// the sa_std ctx.sla idiom -- closing wakes EVERY blocked
+// receiver and every select arm at once), then cancels each
+// registered child with the same err/cause and releases the
+// parent registration. A child created under an already
+// canceled parent is canceled immediately with the parent's
+// err/cause instead of registering (Go's propagateCancel
+// does the same under the parent lock). Registration and
+// cancellation each hold at most one node lock at a time,
+// so there is no lock-ordering hazard (unlike Go, which
+// notes it acquires the child's lock while holding the
+// parent's).
+//
+// DEADLINES ride on time.sla's public surface only:
+// go_time_now / go_time_add for the arithmetic and
+// go_time_after(dur) for the fire channel. A watcher
+// goroutine selects on the fire channel vs the node's Done
+// channel: whichever fires first wins; on a manual cancel
+// the watcher exits promptly through the Done arm (Go stops
+// the timer; the observable behaviour is identical). If the
+// parent's deadline is already earlier, WithDeadlineCause
+// returns WithCancel(parent) with no timer, exactly as Go
+// does; if the deadline has already passed the node is
+// canceled synchronously with DeadlineExceeded (+ cause).
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77418  nil-context misuse: any public entry point given
+//          a GoContext (or GoCancelFunc / GoCancelCauseFunc /
+//          GoAfterFuncStop handle) whose node is null -- Go
+//          panics on a nil parent ("cannot create context
+//          from nil parent") and nil-pointer panics on a nil
+//          Context method call, so the loud failure matches.
+//          Double cancel is NOT a panic: Go specifies that
+//          later CancelFunc calls do nothing, and gostd's
+//          cancel is first-wins the same way.
+//   77405  NOT OURS -- belongs to bytes (bytes.Buffer.Truncate /
+//          Next / Peek out of range). CORRECTION (R1378): an
+//          earlier draft claimed it stayed free; it does not.
+//          AfterFunc is implemented honestly for every
+//          context (see below), so context claims no code here.
+//
+// Target ids (gostd block 900000-999999; this file):
+//   900031  context.Canceled ("context canceled")
+//   900032  context.DeadlineExceeded ("context deadline exceeded")
+//   errors.Is(err, go_context_canceled()) works through the
+//   id, as with strconv's 900001/900002 and io.EOF's 900010.
+//
+// SPLICE POSITION: this file must come AFTER fmt.sla in the
+// splice (i.e. last: errors -> runtime -> sync -> time ->
+// sort -> math -> strconv -> strings -> fmt -> context).
+// It needs GosVal from fmt.sla (values ride as GosVal, per
+// the brief) and GoMutex from sync.sla, GoTime + go_time_*
+// from time.sla, go_errors_* from errors.sla. If GosVal is
+// ever moved earlier, context can move up with it; the only
+// fmt dependency is GosVal + go_val_nil.
+//
+// LOUD DIVERGENCES (all documented, none silent):
+//   - Sentinel identity: ctx.Err() returns the SAME stored
+//     ptr on every call for one context (the sentinel is
+//     allocated once, at cancel time, and stored in the
+//     node -- Go: "successive calls to Err return the same
+//     error"). A fresh go_context_canceled() call allocates
+//     a new object with the same target id, exactly like
+//     go_strings_eof() does for io.EOF, so pointer equality
+//     against a freshly built sentinel does NOT hold;
+//     compare through errors.Is (target id), never ==.
+//   - Value keys are i64 ids assigned by the frontend (the
+//     brief's seam (c)). Go's panics for a nil key or a
+//     non-comparable key cannot occur: there is no nil i64
+//     and every i64 is comparable. Key identity is the id
+//     alone; the frontend owns id assignment (one id per
+//     Go key value) and must never reuse an id for two
+//     different keys. Values ride as GosVal (fmt.sla).
+//   - CancelFunc / CancelCauseFunc / AfterFunc's stop are
+//     NOT fn values: SLA has no proven spelling for
+//     RETURNING a fn from a function (fn types are proven
+//     only in parameter position: sync.Once.Do, sort cores).
+//     They are handle structs (GoCancelFunc /
+//     GoCancelCauseFunc / GoAfterFuncStop, each just a node
+//     *GoCtxNode/*GoAfterNode) and the frontend emits go_context_cancel /
+//     go_context_cancel_with_cause /
+//     go_context_after_func_stop for the Go call.
+//   - Done() returns GoContextDone { ch, ok } instead of a
+//     bare channel, because SLA has no nil channel literal:
+//     ok == false means Go's nil (never canceled). The ch
+//     handed out in that case is the node's own never-closed
+//     channel, so it is the same value on successive calls
+//     AND behaves exactly like Go's nil in every use:
+//     select arms on it never fire, a bare receive blocks
+//     forever. The frontend must check ok only where Go
+//     code tests Done() == nil.
+//   - Children are kept in a Vec<*GoCtxNode> with linear scans,
+//     not a map (Go: map[canceler]struct{}). Same semantics;
+//     registration order is creation order, which Go leaves
+//     unspecified.
+//   - AfterFunc's f runs in its own goroutine, as Go
+//     specifies; if the context is already canceled, f is
+//     still spawned (not run inline). If no cancelable
+//     ancestor exists (Background/TODO/WithoutCancel
+//     ancestry), NO goroutine is spawned at all -- Go
+//     registers nothing there either -- f can never run and
+//     stop() reports true.
+//   - The deadline watcher goroutine is an extra goroutine
+//     per timer context (Go's timerCtx uses the runtime
+//     timer instead). It exits promptly on manual cancel.
+//   - No String() methods (Background/TODO/WithCancel/
+//     WithDeadline/WithValue names): they need fmt + Go
+//     type names, which gostd does not carry. NOT a silent
+//     stub: there is simply no such function to call.
+//
+// Not covered (out of scope, not silent stubs):
+//   - context.String() methods (see above).
+//   - Any use of a foreign (non-gostd) Context
+//     implementation: gostd contexts are always GoCtxNode
+//     values, so Go's fallbacks for custom parents (the
+//     watcher goroutine in propagateCancel, the afterFuncer
+//     path) never arise. A frontend that hands gostd a
+//     context built any other way has no such constructor
+//     to call, so this cannot happen by accident.
+//   - The internal cancelCtxKey trick (Value(&cancelCtxKey))
+//     is unnecessary: the parent chain is walked directly.
+//
+// INTEGRATION CHECKS (debug phase must confirm; each is a
+// named check, not a hope):
+//   IC-1  select inside a thread::spawn closure (deadline
+//         watcher + AfterFunc waiter). select is proven as
+//         a statement (sa_std ctx.sla, gosa demo 27) and
+//         closures are proven (demo 27); the combination is
+//         the check. FALLBACK if it fails: replace the
+//         select with a blocking recv on the fire/done
+//         channel and accept that the watcher lingers until
+//         the deadline / cancellation (documented below).
+//   IC-2  calling a CAPTURED fn() -> void value inside a
+//         spawned closure (AfterFunc runs f()). fn params
+//         are proven (Once.Do calls f()); closure capture
+//         of locals is proven (demo 27 captures ch/done);
+//         a captured fn value is the combination.
+//   IC-3  Box::new over a struct containing Chan + GoMutex
+//         + GosVal + Vec fields (GoCtxNode, GoAfterNode).
+//         GosError (Vec fields) is the proven shape.
+//   IC-4  &(*n).mu -- borrowing a struct field through a
+//         raw-ptr deref. Field access through (*e).field
+//         is proven (errors.sla); &m.field through a borrow
+//         is proven (sync.sla); this is the combination.
+//   IC-5  GoTime literal construction + GoTime field reads
+//         from this file (foreign struct, time.sla). Same
+//         class as time.sla's GoTimer holding a GoMutex
+//         field (sync.sla) -- proven in principle.
+//   IC-6  GosVal as a struct field + go_val_nil() inside a
+//         struct literal (fmt.sla dependency, splice-last).
+//   IC-7  Splice order: context AFTER fmt.sla (see above).
+//   IC-8  select arms binding two values with underscore
+//         names (let (_fv, _fc) = fire.recv()) -- demo 27
+//         binds (__t2) style names in select arms, time.sla
+//         binds (_t, _ok) from recv() outside select.
+//   IC-9  Chan::new(0) + .close() broadcast wakes every
+//         select arm on the channel (sa_std ctx.sla comment
+//         states it; verify on the box build).
+//   IC-10 The once-guard in AfterFunc stop-vs-fire: exactly
+//         one of {f runs, stop returns true} must win under
+//         the after-node mutex. Verify with a race demo in
+//         the debug phase (stop racing a cancel).
+
+@import "sa_std/task.sai"
+@import "sa_std/thread.sai"
+@import "sa_std/vec.sa"
+
+// ---- Node kinds ----
+
+const GO_CTX_EMPTY: i64 = 0;
+const GO_CTX_CANCEL: i64 = 1;
+const GO_CTX_TIMER: i64 = 2;
+const GO_CTX_VALUE: i64 = 3;
+const GO_CTX_WITHOUT_CANCEL: i64 = 4;
+
+// ---- Target ids (gostd 900000-999999) ----
+
+const GO_CTX_ID_CANCELED: i64 = 900031;
+const GO_CTX_ID_DEADLINE: i64 = 900032;
+
+// ================= Shapes =================
+
+// The public handle. A Go Context value in emitted code.
+// Copying aliases the heap node (Go interface semantics).
+struct GoContext {
+    node: *GoCtxNode,
+}
+
+// One heap node implements every Go context kind; `kind`
+// selects the live layers (see the file header).
+struct GoCtxNode {
+    kind: i64,
+    is_todo: bool,
+    parent: *GoCtxNode,
+    registered_on: *GoCtxNode,
+    key_id: i64,
+    val: GosVal,
+    mu: GoMutex,
+    done: Chan<i64>,
+    err_id: i64,
+    err_ptr: ptr,
+    cause: ptr,
+    children: Vec<*GoCtxNode>,
+    deadline_ns: i64,
+}
+
+// Deadline() (time.Time, bool) -- multi-value Go returns
+// are small result structs (gostd contract).
+struct GoContextDeadline {
+    deadline: GoTime,
+    ok: bool,
+}
+
+// Done() <-chan struct{} -- ok == false is Go's nil
+// (never canceled); see the header for why the channel
+// handed out in that case never fires.
+struct GoContextDone {
+    ch: Chan<i64>,
+    ok: bool,
+}
+
+// WithCancel / WithDeadline / WithTimeout results: the
+// derived context plus its cancel handle.
+struct GoContextWithCancel {
+    ctx: GoContext,
+    cancel: GoCancelFunc,
+}
+
+struct GoContextWithCancelCause {
+    ctx: GoContext,
+    cancel: GoCancelCauseFunc,
+}
+
+// CancelFunc / CancelCauseFunc as handles, not fn values
+// (no proven fn-return spelling; see the header).
+struct GoCancelFunc {
+    node: *GoCtxNode,
+}
+
+struct GoCancelCauseFunc {
+    node: *GoCtxNode,
+}
+
+// AfterFunc's stop function as a handle.
+struct GoAfterFuncStop {
+    node: *GoAfterNode,
+}
+
+// One AfterFunc registration: the goroutine waits on the
+// target's Done channel vs stop_ch; the mutex is the
+// once-guard (exactly one of {f runs, stop wins}).
+// `f` itself lives only in the spawned closure's capture,
+// never in this node (no fn-typed struct field needed).
+struct GoAfterNode {
+    mu: GoMutex,
+    started: bool,
+    stopped: bool,
+    armed: bool,
+    stop_ch: Chan<i64>,
+}
+
+// ================= Sentinels =================
+
+fn __go_context_nil() -> *GoCtxNode {
+    return 0 as *GoCtxNode;
+}
+
+// Nil after-node pointer (same 0 literal, distinct type).
+fn __go_after_nil() -> *GoAfterNode {
+    return 0 as *GoAfterNode;
+}
+
+// "context canceled" (Go: errors.New, Canceled).
+fn __go_context_msg_canceled() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(99u8); s.push(111u8); s.push(110u8); s.push(116u8); s.push(101u8);
+    s.push(120u8); s.push(116u8); s.push(32u8); s.push(99u8); s.push(97u8);
+    s.push(110u8); s.push(99u8); s.push(101u8); s.push(108u8); s.push(101u8);
+    s.push(100u8);
+    return s;
+}
+
+// "context deadline exceeded" (Go: deadlineExceededError).
+fn __go_context_msg_deadline() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(99u8); s.push(111u8); s.push(110u8); s.push(116u8); s.push(101u8);
+    s.push(120u8); s.push(116u8); s.push(32u8); s.push(100u8); s.push(101u8);
+    s.push(97u8); s.push(100u8); s.push(108u8); s.push(105u8); s.push(110u8);
+    s.push(101u8); s.push(32u8); s.push(101u8); s.push(120u8); s.push(99u8);
+    s.push(101u8); s.push(101u8); s.push(100u8); s.push(101u8); s.push(100u8);
+    return s;
+}
+
+fn __go_context_sentinel(err_id: i64) -> ptr {
+    if err_id == GO_CTX_ID_DEADLINE {
+        return go_errors_new_with_id(__go_context_msg_deadline(), GO_CTX_ID_DEADLINE);
+    };
+    return go_errors_new_with_id(__go_context_msg_canceled(), GO_CTX_ID_CANCELED);
+}
+
+// context.Canceled -- a fresh node with the shared target
+// id on every call, exactly like go_strings_eof() builds
+// io.EOF. Compare through errors.Is, never == (see the
+// header: only ctx.Err() returns the stored, stable ptr).
+fn go_context_canceled() -> ptr {
+    return __go_context_sentinel(GO_CTX_ID_CANCELED);
+}
+
+// context.DeadlineExceeded -- same fresh-node convention.
+fn go_context_deadline_exceeded() -> ptr {
+    return __go_context_sentinel(GO_CTX_ID_DEADLINE);
+}
+
+// ================= Node allocation =================
+
+fn __go_context_check(c: GoContext) -> void {
+    if c.node == __go_context_nil() {
+        panic(77418);
+    };
+    return;
+}
+
+// Fresh heap node: mutex + never-closed Done channel +
+// empty children, kind-specific fields filled in by the
+// caller before the node escapes (no other goroutine can
+// see it until then).
+fn __go_context_alloc_node(kind: i64, parent: *GoCtxNode) -> *GoCtxNode {
+    let done: Chan<i64> = Chan::new(0);
+    let node = GoCtxNode {
+        kind: kind,
+        is_todo: false,
+        parent: parent,
+        registered_on: __go_context_nil(),
+        key_id: 0,
+        val: go_val_nil(),
+        mu: go_sync_mutex_new(),
+        done: done,
+        err_id: 0,
+        err_ptr: go_errors_nil(),
+        cause: go_errors_nil(),
+        children: Vec::new(),
+        deadline_ns: 0,
+    };
+    let b = Box::new(node);
+    return Box::into_raw(b);
+}
+
+fn __go_after_alloc() -> *GoAfterNode {
+    let stop_ch: Chan<i64> = Chan::new(1);
+    let b = Box::new(GoAfterNode {
+        mu: go_sync_mutex_new(),
+        started: false,
+        stopped: false,
+        armed: false,
+        stop_ch: stop_ch,
+    });
+    return Box::into_raw(b);
+}
+
+// ================= Chain walks =================
+
+// Nearest cancel/timer node at or above c, skipping value
+// layers -- Go's parentCancelCtx (Value(&cancelCtxKey))
+// in direct form. Returns nil when no cancelable ancestor
+// exists (empty root, or the chain is cut by a
+// without-cancel node): such a context can never be
+// canceled, so there is nothing to register on or watch.
+fn __go_context_cancel_node_of(c: GoContext) -> *GoCtxNode {
+    let n = c.node;
+    while n != __go_context_nil() {
+        let k = (*n).kind;
+        if k == GO_CTX_CANCEL {
+            return n;
+        };
+        if k == GO_CTX_TIMER {
+            return n;
+        };
+        if k == GO_CTX_VALUE {
+            n = (*n).parent;
+        } else {
+            return __go_context_nil();
+        };
+    }
+    return __go_context_nil();
+}
+
+// ================= Cancel core =================
+
+// Cancel node n with err_id (900031/900032). cause may be
+// nil, in which case it defaults to the error itself (Go's
+// cancel: if cause == nil { cause = err }). First call
+// wins; later calls are no-ops. Closes the Done channel,
+// cancels registered children with the same err/cause,
+// and (remove_from_parent) releases the parent
+// registration. Holds at most one node lock at a time.
+fn __go_context_cancel_node(n: *GoCtxNode, err_id: i64, cause: ptr, remove_from_parent: bool) -> void {
+    go_sync_mutex_lock(&(*n).mu);
+    if (*n).err_id != 0 {
+        go_sync_mutex_unlock(&(*n).mu);
+        return;
+    };
+    let err_ptr = __go_context_sentinel(err_id);
+    let c = cause;
+    if c == go_errors_nil() {
+        // GosError is a move type (Vec-backed): the same value cannot
+        // be stored into both err_ptr and cause. Re-construct the
+        // sentinel instead of aliasing it: both objects carry the
+        // same target id, and comparison is always via errors.Is
+        // (target id) per the S9 rule, so they are observably
+        // identical; pointer equality is banned.
+        c = __go_context_sentinel(err_id);
+    };
+    (*n).err_id = err_id;
+    (*n).err_ptr = err_ptr;
+    (*n).cause = c;
+    let kids = (*n).children;
+    (*n).children = Vec::new();
+    let done = (*n).done;
+    go_sync_mutex_unlock(&(*n).mu);
+    // Closing wakes every receiver / select arm at once
+    // (the sa_std ctx.sla broadcast idiom).
+    done.close();
+    let i = 0;
+    while i < len(kids) {
+        // c was consumed by the (*n).cause store above (field stores
+        // move the RHS local, bufio-flush class); read the cause back
+        // from the node instead -- same value, field reads do not
+        // consume, and the recursive call takes it as a call arg.
+        __go_context_cancel_node(kids[i], err_id, (*n).cause, false);
+        i = i + 1;
+    }
+    if remove_from_parent {
+        __go_context_remove_child(n);
+    };
+    return;
+}
+
+// Release n from its parent's children list (no-op when
+// never registered). The list is rebuilt without n; a
+// parent cancel racing this either snapshots n (and its
+// cancel call then no-ops, n being already canceled) or
+// misses n entirely -- both correct.
+fn __go_context_remove_child(n: *GoCtxNode) -> void {
+    let p = (*n).registered_on;
+    if p == __go_context_nil() {
+        return;
+    };
+    (*n).registered_on = __go_context_nil();
+    go_sync_mutex_lock(&(*p).mu);
+    let kept: Vec<*GoCtxNode> = Vec::new();
+    let i = 0;
+    while i < len((*p).children) {
+        let c = (*p).children[i];
+        if c != n {
+            kept.push(c);
+        };
+        i = i + 1;
+    }
+    (*p).children = kept;
+    go_sync_mutex_unlock(&(*p).mu);
+    return;
+}
+
+// Register child under the nearest cancelable ancestor of
+// parent (Go's propagateCancel, direct-registration path;
+// gostd has no foreign Context implementations, so the
+// watcher-goroutine and afterFuncer paths never arise).
+// When that ancestor is already canceled, the child is
+// canceled immediately with the ancestor's err/cause
+// instead of registering -- Go does the same under the
+// parent lock, so no registration can slip in between a
+// parent cancel and the check.
+fn __go_context_register_child(child: *GoCtxNode, parent: GoContext) -> void {
+    let p = __go_context_cancel_node_of(parent);
+    if p == __go_context_nil() {
+        return;
+    };
+    go_sync_mutex_lock(&(*p).mu);
+    if (*p).err_id != 0 {
+        let eid = (*p).err_id;
+        let cs = (*p).cause;
+        go_sync_mutex_unlock(&(*p).mu);
+        __go_context_cancel_node(child, eid, cs, false);
+        return;
+    };
+    let kids = (*p).children;
+    kids.push(child);
+    (*p).children = kids;
+    // The (*child).registered_on store below consumes p (field stores
+    // move the RHS local, bufio-flush class), so the unlock -- which
+    // still needs p -- must come first. Safe: registered_on is only
+    // read by __go_context_remove_child, which requires holding the
+    // child handle, and that handle does not escape until this
+    // function returns; the parent's children list is already
+    // updated under the lock, so a racing parent-cancel still sees
+    // the child and cancels it.
+    go_sync_mutex_unlock(&(*p).mu);
+    (*child).registered_on = p;
+    return;
+}
+
+// Arm the deadline watcher for timer node n: a goroutine
+// selects on the time.sla fire channel vs the node's Done
+// channel. Fire first -> cancel with DeadlineExceeded (+
+// the WithDeadlineCause cause, nil = default). Done first
+// -> the node was canceled by hand; exit with nothing to
+// do (Go stops the timer; the watcher exiting here is the
+// observable equivalent).
+// R1378 ^|| rewrite: body extracted to a named helper; the closure
+// is a let-bound single-expression call (the form demo 27 proves
+// parses: `thread::spawn(^|| producer(ch, done))`). Direct `^|| {`
+// is rejected by the parser (non-blocking ticket).
+fn __go_context_arm_deadline_body(n: *GoCtxNode, fire: Chan<i64>, done: Chan<i64>, cause: ptr) -> void {
+    select {
+        case let (_fv, _fc) = fire.recv() {
+            __go_context_cancel_node(n, GO_CTX_ID_DEADLINE, cause, true);
+        }
+        case let (_dv, _dc) = done.recv() {
+            return;
+        }
+    }
+}
+
+fn __go_context_arm_deadline(n: *GoCtxNode, dur: i64, cause: ptr) -> void {
+    let fire = go_time_after(dur);
+    let done = (*n).done;
+    let _f = ^|| __go_context_arm_deadline_body(n, fire, done, cause);
+    let _h = thread::spawn(_f);
+    return;
+}
+
+// ================= Roots =================
+
+// context.Background: never canceled, no values, no
+// deadline. The root of every derived chain.
+fn go_context_background() -> GoContext {
+    let n = __go_context_alloc_node(GO_CTX_EMPTY, __go_context_nil());
+    return GoContext { node: n };
+}
+
+// context.TODO: identical to Background in every
+// observable way except the (unimplemented) String()
+// spelling; the is_todo flag preserves the distinction
+// for a future String() implementation.
+fn go_context_todo() -> GoContext {
+    let n = __go_context_alloc_node(GO_CTX_EMPTY, __go_context_nil());
+    (*n).is_todo = true;
+    return GoContext { node: n };
+}
+
+// ================= WithCancel =================
+
+// context.WithCancel: the derived context's Done channel
+// closes when the returned cancel handle is invoked or
+// when the parent is canceled, whichever comes first.
+// The cancel handle does not wait for work to stop, is
+// safe to call from many goroutines at once, and does
+// nothing after the first call.
+fn go_context_with_cancel(parent: GoContext) -> GoContextWithCancel {
+    __go_context_check(parent);
+    let n = __go_context_alloc_node(GO_CTX_CANCEL, parent.node);
+    __go_context_register_child(n, parent);
+    return GoContextWithCancel {
+        ctx: GoContext { node: n },
+        cancel: GoCancelFunc { node: n },
+    };
+}
+
+// The CancelFunc call itself: cancel with Canceled.
+fn go_context_cancel(f: GoCancelFunc) -> void {
+    if f.node == __go_context_nil() {
+        panic(77418);
+    };
+    __go_context_cancel_node(f.node, GO_CTX_ID_CANCELED, go_errors_nil(), true);
+    return;
+}
+
+// context.WithCancelCause: like WithCancel, but the
+// returned handle takes the cause error. Canceling with
+// a nil cause records Canceled as the cause (Go: cancel
+// defaults a nil cause to the error).
+fn go_context_with_cancel_cause(parent: GoContext) -> GoContextWithCancelCause {
+    __go_context_check(parent);
+    let n = __go_context_alloc_node(GO_CTX_CANCEL, parent.node);
+    __go_context_register_child(n, parent);
+    return GoContextWithCancelCause {
+        ctx: GoContext { node: n },
+        cancel: GoCancelCauseFunc { node: n },
+    };
+}
+
+// The CancelCauseFunc call itself.
+fn go_context_cancel_with_cause(f: GoCancelCauseFunc, cause: ptr) -> void {
+    if f.node == __go_context_nil() {
+        panic(77418);
+    };
+    __go_context_cancel_node(f.node, GO_CTX_ID_CANCELED, cause, true);
+    return;
+}
+
+// ================= WithDeadline / WithTimeout =================
+
+// context.WithDeadlineCause: the full deadline
+// constructor; WithDeadline is this with a nil cause.
+// When the parent's deadline is already earlier, this
+// returns WithCancel(parent) with no new timer, exactly
+// as Go does (the parent's deadline governs through the
+// chain walk). When the deadline has already passed, the
+// node is canceled synchronously with DeadlineExceeded
+// (+ cause) and no watcher is spawned.
+fn go_context_with_deadline_cause(parent: GoContext, d: GoTime, cause: ptr) -> GoContextWithCancel {
+    __go_context_check(parent);
+    let pd = go_context_deadline(parent);
+    if pd.ok {
+        if pd.deadline.unix_ns < d.unix_ns {
+            return go_context_with_cancel(parent);
+        };
+    };
+    let n = __go_context_alloc_node(GO_CTX_TIMER, parent.node);
+    (*n).deadline_ns = d.unix_ns;
+    __go_context_register_child(n, parent);
+    go_sync_mutex_lock(&(*n).mu);
+    let already = (*n).err_id != 0;
+    go_sync_mutex_unlock(&(*n).mu);
+    if already {
+        return GoContextWithCancel {
+            ctx: GoContext { node: n },
+            cancel: GoCancelFunc { node: n },
+        };
+    };
+    let now = go_time_now();
+    let dur = d.unix_ns - now.unix_ns;
+    if dur <= 0 {
+        __go_context_cancel_node(n, GO_CTX_ID_DEADLINE, cause, true);
+        return GoContextWithCancel {
+            ctx: GoContext { node: n },
+            cancel: GoCancelFunc { node: n },
+        };
+    };
+    __go_context_arm_deadline(n, dur, cause);
+    return GoContextWithCancel {
+        ctx: GoContext { node: n },
+        cancel: GoCancelFunc { node: n },
+    };
+}
+
+// context.WithDeadline(parent, d).
+fn go_context_with_deadline(parent: GoContext, d: GoTime) -> GoContextWithCancel {
+    return go_context_with_deadline_cause(parent, d, go_errors_nil());
+}
+
+// context.WithTimeoutCause: WithDeadline(parent,
+// time.Now().Add(timeout)) with a cause.
+fn go_context_with_timeout_cause(parent: GoContext, timeout: i64, cause: ptr) -> GoContextWithCancel {
+    __go_context_check(parent);
+    let now = go_time_now();
+    let d = go_time_add(&now, timeout);
+    return go_context_with_deadline_cause(parent, d, cause);
+}
+
+// context.WithTimeout(parent, timeout).
+fn go_context_with_timeout(parent: GoContext, timeout: i64) -> GoContextWithCancel {
+    return go_context_with_timeout_cause(parent, timeout, go_errors_nil());
+}
+
+// ================= WithValue / WithoutCancel =================
+
+// context.WithValue: a derived context carrying val under
+// key_id. Keys are i64 ids assigned by the frontend (see
+// the header): any i64 is a valid key, so Go's nil-key /
+// non-comparable-key panics cannot occur. The value layer
+// takes no part in cancellation; Deadline/Done/Err walk
+// straight through it to the parent.
+fn go_context_with_value(parent: GoContext, key_id: i64, val: GosVal) -> GoContext {
+    __go_context_check(parent);
+    let n = __go_context_alloc_node(GO_CTX_VALUE, parent.node);
+    (*n).key_id = key_id;
+    (*n).val = val;
+    return GoContext { node: n };
+}
+
+// context.WithoutCancel: the derived context keeps the
+// parent's values but is never canceled when the parent
+// is: no Deadline, nil Done, nil Err, nil Cause. The
+// chain walk stops at this node for every cancellation
+// query and passes straight through it for values.
+fn go_context_without_cancel(parent: GoContext) -> GoContext {
+    __go_context_check(parent);
+    let n = __go_context_alloc_node(GO_CTX_WITHOUT_CANCEL, parent.node);
+    return GoContext { node: n };
+}
+
+// ================= Context operations =================
+
+// ctx.Deadline(): the first timer deadline at or above
+// this node (a timer node's own deadline is always the
+// earliest by construction -- WithDeadline refuses to arm
+// a later one when the parent's is earlier). The walk
+// stops at a without-cancel node (Go: WithoutCancel has
+// no deadline) and at an empty root.
+fn go_context_deadline(c: GoContext) -> GoContextDeadline {
+    __go_context_check(c);
+    let n = c.node;
+    while n != __go_context_nil() {
+        let k = (*n).kind;
+        if k == GO_CTX_TIMER {
+            return GoContextDeadline {
+                deadline: GoTime { unix_ns: (*n).deadline_ns, mono: 0, has_mono: false },
+                ok: true,
+            };
+        };
+        if k == GO_CTX_CANCEL {
+            n = (*n).parent;
+        } else {
+            if k == GO_CTX_VALUE {
+                n = (*n).parent;
+            } else {
+                return GoContextDeadline {
+                    deadline: GoTime { unix_ns: 0, mono: 0, has_mono: false },
+                    ok: false,
+                };
+            };
+        };
+    }
+    return GoContextDeadline {
+        deadline: GoTime { unix_ns: 0, mono: 0, has_mono: false },
+        ok: false,
+    };
+}
+
+// ctx.Done(): the cancel/timer node's Done channel with
+// ok == true; a value layer delegates to its parent.
+// ok == false is Go's nil channel (empty root,
+// without-cancel ancestry): the node's own never-closed
+// channel is handed out, so successive calls return the
+// same value and it behaves exactly like nil -- select
+// arms on it never fire, a bare receive blocks forever.
+fn go_context_done(c: GoContext) -> GoContextDone {
+    __go_context_check(c);
+    let start = c.node;
+    let n = c.node;
+    while n != __go_context_nil() {
+        let k = (*n).kind;
+        if k == GO_CTX_CANCEL {
+            let ch = (*n).done;
+            return GoContextDone { ch: ch, ok: true };
+        };
+        if k == GO_CTX_TIMER {
+            let ch = (*n).done;
+            return GoContextDone { ch: ch, ok: true };
+        };
+        if k == GO_CTX_VALUE {
+            n = (*n).parent;
+        } else {
+            let ch = (*n).done;
+            return GoContextDone { ch: ch, ok: false };
+        };
+    }
+    let ch = (*start).done;
+    return GoContextDone { ch: ch, ok: false };
+}
+
+// ctx.Err(): nil while the context is live; afterwards the
+// sentinel stored at cancel time (the SAME ptr on every
+// call -- Go: successive calls return the same error).
+// Value layers delegate to the parent; without-cancel and
+// empty roots never have an error.
+fn go_context_err(c: GoContext) -> ptr {
+    __go_context_check(c);
+    let n = c.node;
+    while n != __go_context_nil() {
+        let k = (*n).kind;
+        if k == GO_CTX_CANCEL {
+            if (*n).err_id == 0 {
+                return go_errors_nil();
+            };
+            return (*n).err_ptr;
+        };
+        if k == GO_CTX_TIMER {
+            if (*n).err_id == 0 {
+                return go_errors_nil();
+            };
+            return (*n).err_ptr;
+        };
+        if k == GO_CTX_VALUE {
+            n = (*n).parent;
+        } else {
+            return go_errors_nil();
+        };
+    }
+    return go_errors_nil();
+}
+
+// ctx.Value(key): walk the chain for the nearest value
+// layer with this key id; a miss returns the nil GosVal
+// (tag 0). Values pass through cancel, timer and
+// without-cancel layers; only an empty root ends the
+// walk. Successive calls with the same key return the
+// same GosVal (the stored one is returned by value).
+fn go_context_value(c: GoContext, key_id: i64) -> GosVal {
+    __go_context_check(c);
+    let n = c.node;
+    while n != __go_context_nil() {
+        let k = (*n).kind;
+        if k == GO_CTX_VALUE {
+            if (*n).key_id == key_id {
+                return (*n).val;
+            };
+            n = (*n).parent;
+        } else {
+            if k == GO_CTX_EMPTY {
+                return go_val_nil();
+            };
+            n = (*n).parent;
+        };
+    }
+    return go_val_nil();
+}
+
+// context.Cause(c): nil when c is not canceled, else the
+// cause recorded by the first cancellation of c or its
+// parents -- the cause passed to CancelCauseFunc /
+// WithDeadlineCause / WithTimeoutCause, defaulting to
+// Err() itself. A child canceled on its own keeps its own
+// cause when a parent later cancels (first cancellation
+// wins, enforced by __go_context_cancel_node).
+fn go_context_cause(c: GoContext) -> ptr {
+    __go_context_check(c);
+    let e = go_context_err(c);
+    if e == go_errors_nil() {
+        return go_errors_nil();
+    };
+    let n = __go_context_cancel_node_of(c);
+    if n == __go_context_nil() {
+        return e;
+    };
+    let cs = (*n).cause;
+    if cs == go_errors_nil() {
+        return e;
+    };
+    return cs;
+}
+
+// ================= AfterFunc =================
+
+// context.AfterFunc(ctx, f): arrange for f to run in its
+// own goroutine when ctx is canceled; when ctx is already
+// canceled, f is still spawned (not run inline). The
+// returned handle stops the association: stop() returns
+// true when it prevented f from running, false when f has
+// started or was already stopped. The stop function does
+// not wait for f to complete.
+//
+// Implementation: one goroutine per registration selects
+// on the nearest cancelable ancestor's Done channel vs a
+// private stop channel; the after-node mutex is the
+// once-guard, so exactly one of {f runs, stop wins}. No
+// goroutine is spawned when no cancelable ancestor exists
+// (Background / TODO / WithoutCancel ancestry): Go
+// registers nothing there either, f can never run, and
+// stop() still reports true.
+// R1378 ^|| rewrite (see __go_context_arm_deadline_body): body
+// extracted to a named helper; the closure is a let-bound
+// single-expression call.
+fn __go_after_body(a: *GoAfterNode, done: Chan<i64>, stop_ch: Chan<i64>, f: fn() -> void) -> void {
+    select {
+        case let (_v, _closed) = done.recv() {
+            go_sync_mutex_lock(&(*a).mu);
+            if (*a).stopped {
+                go_sync_mutex_unlock(&(*a).mu);
+                return;
+            };
+            (*a).started = true;
+            go_sync_mutex_unlock(&(*a).mu);
+            f();
+        }
+        case let (_w, _closed2) = stop_ch.recv() {
+            return;
+        }
+    }
+}
+
+fn go_context_after_func(c: GoContext, f: fn() -> void) -> GoAfterFuncStop {
+    __go_context_check(c);
+    let target = __go_context_cancel_node_of(c);
+    let a = __go_after_alloc();
+    if target == __go_context_nil() {
+        return GoAfterFuncStop { node: a };
+    };
+    (*a).armed = true;
+    let done = (*target).done;
+    let stop_ch = (*a).stop_ch;
+    let _f = ^|| __go_after_body(a, done, stop_ch, f);
+    let _h = thread::spawn(_f);
+    return GoAfterFuncStop { node: a };
+}
+
+// The stop function returned by AfterFunc.
+fn go_context_after_func_stop(s: GoAfterFuncStop) -> bool {
+    let a = s.node;
+    if a == __go_after_nil() {
+        panic(77418);
+    };
+    go_sync_mutex_lock(&(*a).mu);
+    if (*a).started {
+        go_sync_mutex_unlock(&(*a).mu);
+        return false;
+    };
+    if (*a).stopped {
+        go_sync_mutex_unlock(&(*a).mu);
+        return false;
+    };
+    (*a).stopped = true;
+    let armed = (*a).armed;
+    go_sync_mutex_unlock(&(*a).mu);
+    if armed {
+        let sc = (*a).stop_ch;
+        sc.send(1);
+    };
+    return true;
+}

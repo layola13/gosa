@@ -1,0 +1,171 @@
+// gostd unicode/utf8: the SLA-side model of Go's
+// unicode/utf8 package. This file is a thin layer
+// over the UTF-8 core in strconv.sla
+// (__go_utf8_decode / __go_utf8_append /
+// __go_utf8_rune_count), which already validates
+// overlong forms, surrogates and the rune range.
+// The InString variants are identical functions:
+// gostd represents a Go string as Vec<u8>, so
+// DecodeRuneInString is DecodeRune on the same
+// bytes.
+//
+// RuneError = U+FFFD = 65533. GoRune { r, size,
+// ok } comes from strconv.sla.
+//
+// No panic codes in this file.
+
+fn go_utf8_rune_error() -> i64 {
+    return 65533;
+}
+
+// AppendRune(b, r): AppendRune substitutes
+// RuneError for an invalid rune (unlike
+// EncodeRune, which writes nothing for one).
+fn go_utf8_append_rune(b: Vec<u8>, r: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(b) {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    __go_utf8_append(out, r);
+    return out;
+}
+
+// DecodeRune(p) (r, size)
+fn go_utf8_decode_rune(p: Vec<u8>) -> GoRune {
+    if len(p) == 0 {
+        return GoRune { r: 65533, size: 0, ok: false };
+    };
+    return __go_utf8_decode(p, 0);
+}
+
+fn go_utf8_decode_rune_in_string(s: Vec<u8>) -> GoRune {
+    return go_utf8_decode_rune(s);
+}
+
+// DecodeLastRune(p) (r, size): the last rune;
+// a truncated or invalid tail is (RuneError, 1).
+fn go_utf8_decode_last_rune(p: Vec<u8>) -> GoRune {
+    if len(p) == 0 {
+        return GoRune { r: 65533, size: 0, ok: false };
+    };
+    let end = len(p);
+    let start = end - 1;
+    let limit = end - 4;
+    if limit < 0 { limit = 0; };
+    while start > limit {
+        let c = p[start] as i64;
+        if c < 128 { break; };
+        if c >= 192 { break; };
+        start = start - 1;
+    }
+    let d = __go_utf8_decode(p, start);
+    if d.ok {
+        if start + d.size == end { return d; };
+    };
+    return GoRune { r: 65533, size: 1, ok: false };
+}
+
+fn go_utf8_decode_last_rune_in_string(s: Vec<u8>) -> GoRune {
+    return go_utf8_decode_last_rune(s);
+}
+
+// EncodeRune(r): the encoding of r, or empty with
+// size 0 when r is not a valid rune (negative,
+// above MaxRune, or a surrogate half). RuneError
+// itself encodes to 3 bytes.
+struct GoUtf8Encode {
+    v: Vec<u8>,
+    size: i64,
+}
+
+fn go_utf8_encode_rune(r: i64) -> GoUtf8Encode {
+    if !go_utf8_valid_rune(r) {
+        return GoUtf8Encode { v: Vec::new(), size: 0 };
+    };
+    let out = Vec::new();
+    __go_utf8_append(out, r);
+    let n = len(out);
+    return GoUtf8Encode { v: out, size: n };
+}
+
+// FullRune(p): whether p begins with a full rune.
+// An invalid encoding counts as full (it becomes
+// a width-1 error rune); a truncated valid-looking
+// sequence does not.
+fn go_utf8_full_rune(p: Vec<u8>) -> bool {
+    if len(p) == 0 { return false; };
+    let c = p[0] as i64;
+    if c < 128 { return true; };
+    let size = 0;
+    if c >= 194 {
+        if c < 224 { size = 2; };
+    };
+    if c >= 224 {
+        if c < 240 { size = 3; };
+    };
+    if c >= 240 {
+        if c < 245 { size = 4; };
+    };
+    if size == 0 { return true; };
+    if len(p) < size { return false; };
+    return true;
+}
+
+fn go_utf8_full_rune_in_string(s: Vec<u8>) -> bool {
+    return go_utf8_full_rune(s);
+}
+
+// RuneCount(p) int
+fn go_utf8_rune_count(p: Vec<u8>) -> i64 {
+    return __go_utf8_rune_count(p);
+}
+
+fn go_utf8_rune_count_in_string(s: Vec<u8>) -> i64 {
+    return __go_utf8_rune_count(s);
+}
+
+// RuneLen(r) int: -1 for an invalid rune.
+fn go_utf8_rune_len(r: i64) -> i64 {
+    if r < 0 { return 0 - 1; };
+    if r > 1114111 { return 0 - 1; };
+    if r >= 55296 {
+        if r <= 57343 { return 0 - 1; };
+    };
+    if r < 128 { return 1; };
+    if r < 2048 { return 2; };
+    if r < 65536 { return 3; };
+    return 4;
+}
+
+// RuneStart(b): whether b can be the first byte
+// of an encoded rune (not a continuation byte).
+fn go_utf8_rune_start(b: u8) -> bool {
+    return ((b as i64) & 192) != 128;
+}
+
+// Valid(p) bool
+fn go_utf8_valid(p: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(p) {
+        let d = __go_utf8_decode(p, i);
+        if !d.ok { return false; };
+        i = i + d.size;
+    }
+    return true;
+}
+
+fn go_utf8_valid_string(s: Vec<u8>) -> bool {
+    return go_utf8_valid(s);
+}
+
+// ValidRune(r) bool: in range and not a surrogate.
+fn go_utf8_valid_rune(r: i64) -> bool {
+    if r < 0 { return false; };
+    if r > 1114111 { return false; };
+    if r >= 55296 {
+        if r <= 57343 { return false; };
+    };
+    return true;
+}

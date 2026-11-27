@@ -1,0 +1,742 @@
+// gostd io: the SLA-side model of Go's io package.
+// Organisation follows the psa_std precedent: public
+// entry points go_<pkg>_<name>, private helpers
+// __go_<pkg>_<name>, panic codes listed up front.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77402  io.Pipe refusal: a pipe needs goroutine +
+//          chan synchronisation; gostd has no pipe
+//          surface (the frontend must refuse a Pipe
+//          at the call site; this stub is the loud
+//          backstop if one is ever emitted).
+//   77403  NOT io's: formally bufio's (R1400) --
+//          bufio buffer misuse (Scanner.Buffer /
+//          Split called after Scan). io claims
+//          nothing here; the old "reserved" note
+//          is superseded.
+//
+// VALUE REPRESENTATION (gostd contract):
+//   Go string            -> Vec<u8>
+//   Go []byte            -> Vec<u8>
+//   Go error             -> GosError heap ptr (errors.sla)
+//   Go int64             -> i64
+//   Go (int, error)      -> GoIoResult { n, err }
+//
+// Go's Reader/Writer/Seeker are interfaces; SLA has no
+// interface values. gostd therefore models io in two
+// layers:
+//   (1) the in-memory layer in this file: helpers over
+//       byte slices plus concrete adapter structs
+//       (LimitReader, SectionReader, MultiReader,
+//       TeeReader, Discard, MultiWriter, OffsetWriter)
+//       that wrap byte-slice sources/sinks. The
+//       frontend materialises a concrete Reader's bytes
+//       (or emits the concrete type's own primitives)
+//       and calls these; a general io.Copy over two
+//       arbitrary interface values is a FRONTEND
+//       concern (it emits the concrete copy loop),
+//       not a gostd call.
+//   (2) the error sentinels + Seek constants, which
+//       every other gostd module shares.
+//
+//   (3) the handle layer at the end of this file:
+//       GosIoReader / GosIoWriter -- tagged handles
+//       over the concrete readers/writers above, read
+//       / written through go_io_reader_read /
+//       go_io_writer_write. bufio's constructors take
+//       these handles (R1400 bufio_ctor_handles).
+//       Any other concrete reader reaches bufio by
+//       materialising its bytes and wrapping them in
+//       a LimitReader handle. A zero handle (kind 0)
+//       reads EOF; a zero writer handle reports a
+//       0-byte nil-error write -- both unreachable
+//       from the constructors, which always set the
+//       kind.
+//
+// Error sentinels (target ids; errors.sla reserves the
+// 900000-999999 range for gostd sentinel ids):
+//   900010 io.EOF            (shared with go_strings_eof;
+//                             same id, so go_errors_is
+//                             matches either constructor)
+//   900011 io.ErrClosedPipe
+//   900012 io.ErrNoProgress
+//   900013 io.ErrShortBuffer
+//   900014 io.ErrShortWrite
+//   900015 io.ErrUnexpectedEOF
+//
+// NopCloser needs no gostd surface: Close is a no-op,
+// so the frontend emits nothing for it. ReadCloser /
+// WriteCloser / ReadSeeker and the other composed
+// interfaces are frontend-level type facts, not values.
+//
+// R1426 (liii) lib_borrow: every fn in this file that APPENDS
+// into a dst takes dst: &Vec<u8>, not dst: Vec<u8>. A by-value
+// dst is a copy: pushes into it are invisible to the caller
+// (the (liii) defect, SLA-FIXES-170.md §4: the old ReadFrom
+// panicked 77415 on the first successful read because
+// len(dst) never grew). Callers pass &dst / &scratch and keep
+// owning the buffer; src params stay by value (read-only).
+// The frontend call convention changes with it: pass the
+// destination buffer by borrow.
+
+// ---------- Seek constants ----------
+
+const GO_IO_SEEK_START: i64 = 0;
+const GO_IO_SEEK_CURRENT: i64 = 1;
+const GO_IO_SEEK_END: i64 = 2;
+
+// ---------- error sentinels ----------
+
+fn __go_io_msg(text: Vec<u8>, target_id: i64) -> ptr {
+    return go_errors_new_with_id(text, target_id);
+}
+
+fn __go_io_msg_bytes(b0: u8, b1: u8, b2: u8) -> Vec<u8> {
+    let m = Vec::new();
+    m.push(b0);
+    m.push(b1);
+    m.push(b2);
+    return m;
+}
+
+// io.EOF (target id 900010; identical to
+// go_strings_eof, so Is() matches either way).
+fn go_io_eof() -> ptr {
+    return __go_io_msg(__go_io_msg_bytes(69u8, 79u8, 70u8), 900010);
+}
+
+// io.ErrClosedPipe = "io: read/write on closed pipe"
+fn go_io_err_closed_pipe() -> ptr {
+    let m = Vec::new();
+    m.push(105u8); m.push(111u8); m.push(58u8); m.push(32u8); m.push(114u8); m.push(101u8); m.push(97u8); m.push(100u8); m.push(47u8); m.push(119u8);
+    m.push(114u8); m.push(105u8); m.push(116u8); m.push(101u8); m.push(32u8); m.push(111u8); m.push(110u8); m.push(32u8); m.push(99u8); m.push(108u8);
+    m.push(111u8); m.push(115u8); m.push(101u8); m.push(100u8); m.push(32u8); m.push(112u8); m.push(105u8); m.push(112u8); m.push(101u8);
+    return __go_io_msg(m, 900011);
+}
+
+// io.ErrNoProgress = "multiple Read calls return no
+// data or error"
+fn go_io_err_no_progress() -> ptr {
+    let m = Vec::new();
+    m.push(109u8); m.push(117u8); m.push(108u8); m.push(116u8); m.push(105u8); m.push(112u8); m.push(108u8); m.push(101u8); m.push(32u8); m.push(82u8);
+    m.push(101u8); m.push(97u8); m.push(100u8); m.push(32u8); m.push(99u8); m.push(97u8); m.push(108u8); m.push(108u8); m.push(115u8); m.push(32u8);
+    m.push(114u8); m.push(101u8); m.push(116u8); m.push(117u8); m.push(114u8); m.push(110u8); m.push(32u8); m.push(110u8); m.push(111u8); m.push(32u8);
+    m.push(100u8); m.push(97u8); m.push(116u8); m.push(97u8); m.push(32u8); m.push(111u8); m.push(114u8); m.push(32u8); m.push(101u8); m.push(114u8);
+    m.push(114u8); m.push(111u8); m.push(114u8);
+    return __go_io_msg(m, 900012);
+}
+
+// io.ErrShortBuffer = "short buffer"
+fn go_io_err_short_buffer() -> ptr {
+    let m = Vec::new();
+    m.push(115u8); m.push(104u8); m.push(111u8); m.push(114u8); m.push(116u8); m.push(32u8); m.push(98u8); m.push(117u8); m.push(102u8); m.push(102u8);
+    m.push(101u8); m.push(114u8);
+    return __go_io_msg(m, 900013);
+}
+
+// io.ErrShortWrite = "short write"
+fn go_io_err_short_write() -> ptr {
+    let m = Vec::new();
+    m.push(115u8); m.push(104u8); m.push(111u8); m.push(114u8); m.push(116u8); m.push(32u8); m.push(119u8); m.push(114u8); m.push(105u8); m.push(116u8);
+    m.push(101u8);
+    return __go_io_msg(m, 900014);
+}
+
+// io.ErrUnexpectedEOF = "unexpected EOF"
+fn go_io_err_unexpected_eof() -> ptr {
+    let m = Vec::new();
+    m.push(117u8); m.push(110u8); m.push(101u8); m.push(120u8); m.push(112u8); m.push(101u8); m.push(99u8); m.push(116u8); m.push(101u8); m.push(100u8);
+    m.push(32u8); m.push(69u8); m.push(79u8); m.push(70u8);
+    return __go_io_msg(m, 900015);
+}
+
+// ---------- shared result shapes ----------
+
+// Go (int, error) / (int64, error).
+struct GoIoResult {
+    n: i64,
+    err: ptr,
+}
+
+// Go ([]byte, error).
+struct GoIoBytes {
+    v: Vec<u8>,
+    err: ptr,
+}
+
+fn __go_io_append(dst: &Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_io_slice(b: Vec<u8>, lo: i64, hi: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------- Copy / ReadAll / ReadAtLeast / ReadFull ----------
+
+// io.Copy(dst, src): appends all of src to dst.
+// The slice form: (written, nil). The general
+// interface form is a frontend copy loop; this is
+// the in-memory case the demos and the section/
+// limit readers build on.
+fn go_io_copy(dst: &Vec<u8>, src: Vec<u8>) -> GoIoResult {
+    __go_io_append(dst, src);
+    return GoIoResult { n: len(src), err: go_errors_nil() };
+}
+
+// io.CopyBuffer: identical to Copy over byte slices
+// (there is no buffer to tune in-memory).
+fn go_io_copy_buffer(dst: &Vec<u8>, src: Vec<u8>) -> GoIoResult {
+    return go_io_copy(dst, src);
+}
+
+// io.CopyN(dst, src, n): appends at most n bytes.
+fn go_io_copy_n(dst: &Vec<u8>, src: Vec<u8>, n: i64) -> GoIoResult {
+    let m = n;
+    if m > len(src) { m = len(src); };
+    if m < 0 { m = 0; };
+    let i = 0;
+    while i < m {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    if len(src) < n {
+        return GoIoResult { n: m, err: go_io_eof() };
+    };
+    return GoIoResult { n: m, err: go_errors_nil() };
+}
+
+// io.ReadAll(r): the slice form returns a copy of
+// src with a nil error (the reader is already
+// materialised; EOF is the normal end, not an error).
+fn go_io_read_all(src: Vec<u8>) -> GoIoBytes {
+    return GoIoBytes { v: __go_io_slice(src, 0, len(src)), err: go_errors_nil() };
+}
+
+// io.ReadAtLeast(r, buf, min): read up to n bytes
+// starting at pos. Go semantics: n >= min -> nil;
+// n < min and n > 0 and the source is exhausted ->
+// ErrUnexpectedEOF; n == 0 and exhausted -> EOF;
+// len(buf) < min -> ErrShortBuffer (here: n < min
+// is the caller's error, reported the same way).
+fn go_io_read_at_least(src: Vec<u8>, pos: i64, n: i64, min: i64) -> GoIoBytes {
+    if n < min {
+        return GoIoBytes { v: Vec::new(), err: go_io_err_short_buffer() };
+    };
+    let avail = len(src) - pos;
+    if avail < 0 { avail = 0; };
+    let m = n;
+    if m > avail { m = avail; };
+    let out = __go_io_slice(src, pos, pos + m);
+    if m >= min {
+        return GoIoBytes { v: out, err: go_errors_nil() };
+    };
+    if m > 0 {
+        return GoIoBytes { v: out, err: go_io_err_unexpected_eof() };
+    };
+    return GoIoBytes { v: out, err: go_io_eof() };
+}
+
+// io.ReadFull(r, buf): ReadAtLeast with min == len.
+fn go_io_read_full(src: Vec<u8>, pos: i64, n: i64) -> GoIoBytes {
+    return go_io_read_at_least(src, pos, n, n);
+}
+
+// io.WriteString(w, s): appends s, returns (len, nil).
+fn go_io_write_string(dst: &Vec<u8>, s: Vec<u8>) -> GoIoResult {
+    __go_io_append(dst, s);
+    return GoIoResult { n: len(s), err: go_errors_nil() };
+}
+
+// ---------- Pipe (loud refusal) ----------
+
+// io.Pipe() (*PipeReader, *PipeWriter): needs a
+// goroutine + chan rendezvous. gostd has no pipe
+// surface; the frontend must refuse Pipe at the
+// call site. This stub panics if ever emitted.
+fn go_io_pipe() -> (ptr, ptr) {
+    panic(77402);
+}
+
+// ---------- LimitReader / LimitedReader ----------
+
+// io.LimitReader(r, n) Reader: a *LimitedReader.
+// The gostd form wraps a byte-slice source; n < 0
+// is treated as an empty reader (Go: LimitReader
+// with negative n reads nothing -- it returns EOF
+// immediately because N <= 0).
+struct GosLimitReader {
+    src: Vec<u8>,
+    pos: i64,
+    n: i64,
+}
+
+fn go_io_limit_reader(src: Vec<u8>, n: i64) -> GosLimitReader {
+    return GosLimitReader { src: src, pos: 0, n: n };
+}
+
+// LimitedReader.Read: appends up to max bytes to dst,
+// honouring the remaining limit; EOF once the limit
+// is reached (even if the source has more) or the
+// source is exhausted.
+fn go_io_limit_reader_read(r: &GosLimitReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if r.n <= 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let avail = len(r.src) - r.pos;
+    if avail < 0 { avail = 0; };
+    let m = max;
+    if m > avail { m = avail; };
+    if m > r.n { m = r.n; };
+    if m <= 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let i = 0;
+    while i < m {
+        dst.push(r.src[r.pos + i]);
+        i = i + 1;
+    }
+    r.pos = r.pos + m;
+    r.n = r.n - m;
+    return GoIoResult { n: m, err: go_errors_nil() };
+}
+
+fn go_io_limit_reader_remaining(r: &GosLimitReader) -> i64 {
+    return r.n;
+}
+
+// ---------- SectionReader ----------
+
+// io.SectionReader over a byte-slice source: the
+// frontend supplies the underlying bytes (a ReaderAt
+// materialised by reading its range, or a bytes /
+// strings reader's backing slice). off is the base
+// offset within src; limit is the section length;
+// pos is the current offset from the section start.
+struct GosSectionReader {
+    src: Vec<u8>,
+    base: i64,
+    off: i64,
+    limit: i64,
+    pos: i64,
+}
+
+fn go_io_new_section_reader(src: Vec<u8>, off: i64, n: i64) -> GosSectionReader {
+    let base = off;
+    if base < 0 { base = 0; };
+    if base > len(src) { base = len(src); };
+    let limit = n;
+    if limit < 0 { limit = 0; };
+    if base + limit > len(src) { limit = len(src) - base; };
+    return GosSectionReader { src: src, base: base, off: base, limit: limit, pos: 0 };
+}
+
+fn go_io_section_reader_read(r: &GosSectionReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    let avail = r.limit - r.pos;
+    if avail <= 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let m = max;
+    if m > avail { m = avail; };
+    if m <= 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let i = 0;
+    while i < m {
+        dst.push(r.src[r.off + r.pos + i]);
+        i = i + 1;
+    }
+    r.pos = r.pos + m;
+    return GoIoResult { n: m, err: go_errors_nil() };
+}
+
+// SectionReader.ReadAt: reads len bytes at offset
+// off within the section. Go: off < 0 or off >=
+// Size() returns (0, EOF); a short read also ends
+// with EOF.
+fn go_io_section_reader_read_at(r: &GosSectionReader, dst: &Vec<u8>, max: i64, off: i64) -> GoIoResult {
+    if off < 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    if off >= r.limit {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let avail = r.limit - off;
+    if avail <= 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let m = max;
+    if m > avail { m = avail; };
+    let i = 0;
+    while i < m {
+        dst.push(r.src[r.off + off + i]);
+        i = i + 1;
+    }
+    if m < max {
+        return GoIoResult { n: m, err: go_io_eof() };
+    };
+    return GoIoResult { n: m, err: go_errors_nil() };
+}
+
+// SectionReader.Seek: whence 0/1/2; invalid whence
+// or a negative resulting position returns an error
+// (Go: "Seek: invalid whence" / "Seek: invalid
+// offset", the shared io sentinels errWhence /
+// errOffset).
+fn go_io_section_reader_seek(r: &GosSectionReader, offset: i64, whence: i64) -> GoIoResult {
+    let base = 0;
+    if whence == 0 {
+        base = 0;
+    } else {
+        if whence == 1 {
+            base = r.pos;
+        } else {
+            if whence == 2 {
+                base = r.limit;
+            } else {
+                let m = Vec::new();
+                m.push(83u8); m.push(101u8); m.push(101u8); m.push(107u8); m.push(58u8); m.push(32u8); m.push(105u8); m.push(110u8); m.push(118u8); m.push(97u8);
+                m.push(108u8); m.push(105u8); m.push(100u8); m.push(32u8); m.push(119u8); m.push(104u8); m.push(101u8); m.push(110u8); m.push(99u8); m.push(101u8);
+                return GoIoResult { n: 0, err: go_errors_new(m) };
+            };
+        };
+    };
+    let np = base + offset;
+    if np < 0 {
+        let m = Vec::new();
+        m.push(83u8); m.push(101u8); m.push(101u8); m.push(107u8); m.push(58u8); m.push(32u8); m.push(105u8); m.push(110u8); m.push(118u8); m.push(97u8);
+        m.push(108u8); m.push(105u8); m.push(100u8); m.push(32u8); m.push(111u8); m.push(102u8); m.push(102u8); m.push(115u8); m.push(101u8); m.push(116u8);
+        return GoIoResult { n: 0, err: go_errors_new(m) };
+    };
+    r.pos = np;
+    return GoIoResult { n: np, err: go_errors_nil() };
+}
+
+fn go_io_section_reader_size(r: &GosSectionReader) -> i64 {
+    return r.limit;
+}
+
+// ---------- MultiReader ----------
+
+// io.MultiReader(readers ...Reader): the gostd form
+// concatenates byte-slice sources in order.
+struct GosMultiReader {
+    parts: Vec<Vec<u8>>,
+    cur: i64,
+    pos: i64,
+}
+
+fn go_io_multi_reader(parts: Vec<Vec<u8>>) -> GosMultiReader {
+    return GosMultiReader { parts: parts, cur: 0, pos: 0 };
+}
+
+fn go_io_multi_reader_read(r: &GosMultiReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    let total = 0;
+    while total < max {
+        if r.cur >= len(r.parts) {
+            break;
+        };
+        let part = r.parts[r.cur];
+        let avail = len(part) - r.pos;
+        if avail <= 0 {
+            r.cur = r.cur + 1;
+            r.pos = 0;
+            continue;
+        };
+        let m = max - total;
+        if m > avail { m = avail; };
+        let i = 0;
+        while i < m {
+            dst.push(part[r.pos + i]);
+            i = i + 1;
+        }
+        r.pos = r.pos + m;
+        total = total + m;
+        if r.pos >= len(part) {
+            r.cur = r.cur + 1;
+            r.pos = 0;
+        };
+    }
+    if total == 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    return GoIoResult { n: total, err: go_errors_nil() };
+}
+
+// ---------- TeeReader ----------
+
+// io.TeeReader(r, w): reads from src while copying
+// what is read into w (a byte-slice sink the
+// frontend owns). The sink is part of the struct so
+// the copy is visible to the caller through the &.
+struct GosTeeReader {
+    src: Vec<u8>,
+    pos: i64,
+    w: Vec<u8>,
+}
+
+fn go_io_tee_reader(src: Vec<u8>, w: Vec<u8>) -> GosTeeReader {
+    return GosTeeReader { src: src, pos: 0, w: w };
+}
+
+fn go_io_tee_reader_read(r: &GosTeeReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    let avail = len(r.src) - r.pos;
+    if avail <= 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let m = max;
+    if m > avail { m = avail; };
+    if m <= 0 {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let i = 0;
+    while i < m {
+        dst.push(r.src[r.pos + i]);
+        r.w.push(r.src[r.pos + i]);
+        i = i + 1;
+    }
+    r.pos = r.pos + m;
+    return GoIoResult { n: m, err: go_errors_nil() };
+}
+
+// ---------- Discard ----------
+
+// io.Discard: a Writer that drops everything and
+// counts. The count is the only observable state.
+struct GosDiscard {
+    n: i64,
+}
+
+fn go_io_discard_new() -> GosDiscard {
+    return GosDiscard { n: 0 };
+}
+
+fn go_io_discard_write(d: &GosDiscard, p: Vec<u8>) -> GoIoResult {
+    d.n = d.n + len(p);
+    return GoIoResult { n: len(p), err: go_errors_nil() };
+}
+
+fn go_io_discard_written(d: &GosDiscard) -> i64 {
+    return d.n;
+}
+
+// ---------- MultiWriter ----------
+
+// io.MultiWriter(writers ...Writer): writes the
+// same bytes to every sink. Sinks are byte-slice
+// buffers the frontend owns; Vec is a handle, so
+// appends through the indexed sink are visible.
+struct GosMultiWriter {
+    sinks: Vec<Vec<u8>>,
+}
+
+fn go_io_multi_writer(sinks: Vec<Vec<u8>>) -> GosMultiWriter {
+    return GosMultiWriter { sinks: sinks };
+}
+
+fn go_io_multi_writer_write(w: &GosMultiWriter, p: Vec<u8>) -> GoIoResult {
+    let i = 0;
+    while i < len(w.sinks) {
+        __go_io_append(&w.sinks[i], p);
+        i = i + 1;
+    }
+    return GoIoResult { n: len(p), err: go_errors_nil() };
+}
+
+// ---------- OffsetWriter ----------
+
+// io.OffsetWriter(w, off): writes at offset off,
+// advancing it; a gap past the current end is
+// zero-filled (the file-like WriteAt semantics over
+// an in-memory sink).
+struct GosOffsetWriter {
+    w: Vec<u8>,
+    off: i64,
+}
+
+fn go_io_new_offset_writer(w: Vec<u8>, off: i64) -> GosOffsetWriter {
+    return GosOffsetWriter { w: w, off: off };
+}
+
+fn go_io_offset_writer_write(w: &GosOffsetWriter, p: Vec<u8>) -> GoIoResult {
+    // Zero-fill any gap past the current end, then
+    // overwrite in place (indexed assignment on the
+    // shared Vec handle) or append past the end.
+    while len(w.w) < w.off {
+        w.w.push(0u8);
+    }
+    let i = 0;
+    while i < len(p) {
+        let idx = w.off + i;
+        if idx < len(w.w) {
+            w.w[idx] = p[i];
+        } else {
+            w.w.push(p[i]);
+        };
+        i = i + 1;
+    }
+    w.off = w.off + len(p);
+    return GoIoResult { n: len(p), err: go_errors_nil() };
+}
+
+// ---------- io handles (R1400 bufio_ctor_handles) ----------
+
+// bufio's constructors take io handles, not bare fn
+// values (central ruling R1400; the closure-adapter
+// route was proven impossible in RULING-EXEC-170.md
+// §3.2). A handle is a tagged value holding one
+// concrete reader/writer; the dispatch below calls
+// that reader's/writer's own method. Handles are
+// passed BY VALUE to bufio's constructors (bufio
+// owns the copy; do not reuse the original after
+// handing it over) and BY REFERENCE (&) to transient
+// calls (WriteTo / ReadFrom), where the caller keeps
+// the handle and sees the state updates. A zero
+// handle (kind 0) reads EOF; a zero writer handle
+// reports a 0-byte nil-error write. Both are
+// unreachable from the constructors, which always
+// set the kind; the fall-throughs exist so the
+// dispatch is total.
+
+const GO_IO_READER_LIMIT: i64 = 1;
+const GO_IO_READER_SECTION: i64 = 2;
+const GO_IO_READER_MULTI: i64 = 3;
+const GO_IO_READER_TEE: i64 = 4;
+
+struct GosIoReader {
+    kind: i64,
+    limit: GosLimitReader,
+    section: GosSectionReader,
+    multi: GosMultiReader,
+    tee: GosTeeReader,
+}
+
+fn go_io_reader_from_limit(r: GosLimitReader) -> GosIoReader {
+    let empty: Vec<u8> = Vec::new();
+    let no_parts: Vec<Vec<u8>> = Vec::new();
+    return GosIoReader {
+        kind: GO_IO_READER_LIMIT,
+        limit: r,
+        section: go_io_new_section_reader(empty, 0, 0),
+        multi: go_io_multi_reader(no_parts),
+        tee: go_io_tee_reader(empty, empty),
+    };
+}
+
+fn go_io_reader_from_section(r: GosSectionReader) -> GosIoReader {
+    let empty: Vec<u8> = Vec::new();
+    let no_parts: Vec<Vec<u8>> = Vec::new();
+    return GosIoReader {
+        kind: GO_IO_READER_SECTION,
+        limit: go_io_limit_reader(empty, 0),
+        section: r,
+        multi: go_io_multi_reader(no_parts),
+        tee: go_io_tee_reader(empty, empty),
+    };
+}
+
+fn go_io_reader_from_multi(r: GosMultiReader) -> GosIoReader {
+    let empty: Vec<u8> = Vec::new();
+    let no_parts: Vec<Vec<u8>> = Vec::new();
+    return GosIoReader {
+        kind: GO_IO_READER_MULTI,
+        limit: go_io_limit_reader(empty, 0),
+        section: go_io_new_section_reader(empty, 0, 0),
+        multi: r,
+        tee: go_io_tee_reader(empty, empty),
+    };
+}
+
+fn go_io_reader_from_tee(r: GosTeeReader) -> GosIoReader {
+    let empty: Vec<u8> = Vec::new();
+    let no_parts: Vec<Vec<u8>> = Vec::new();
+    return GosIoReader {
+        kind: GO_IO_READER_TEE,
+        limit: go_io_limit_reader(empty, 0),
+        section: go_io_new_section_reader(empty, 0, 0),
+        multi: go_io_multi_reader(no_parts),
+        tee: r,
+    };
+}
+
+fn go_io_reader_read(h: &GosIoReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if h.kind == GO_IO_READER_LIMIT {
+        return go_io_limit_reader_read(&h.limit, dst, max);
+    };
+    if h.kind == GO_IO_READER_SECTION {
+        return go_io_section_reader_read(&h.section, dst, max);
+    };
+    if h.kind == GO_IO_READER_MULTI {
+        return go_io_multi_reader_read(&h.multi, dst, max);
+    };
+    if h.kind == GO_IO_READER_TEE {
+        return go_io_tee_reader_read(&h.tee, dst, max);
+    };
+    return GoIoResult { n: 0, err: go_io_eof() };
+}
+
+const GO_IO_WRITER_DISCARD: i64 = 1;
+const GO_IO_WRITER_MULTI: i64 = 2;
+const GO_IO_WRITER_OFFSET: i64 = 3;
+
+struct GosIoWriter {
+    kind: i64,
+    discard: GosDiscard,
+    multi: GosMultiWriter,
+    offset: GosOffsetWriter,
+}
+
+fn go_io_writer_from_discard(d: GosDiscard) -> GosIoWriter {
+    let empty: Vec<u8> = Vec::new();
+    let no_sinks: Vec<Vec<u8>> = Vec::new();
+    return GosIoWriter {
+        kind: GO_IO_WRITER_DISCARD,
+        discard: d,
+        multi: go_io_multi_writer(no_sinks),
+        offset: go_io_new_offset_writer(empty, 0),
+    };
+}
+
+fn go_io_writer_from_multi(w: GosMultiWriter) -> GosIoWriter {
+    let empty: Vec<u8> = Vec::new();
+    return GosIoWriter {
+        kind: GO_IO_WRITER_MULTI,
+        discard: go_io_discard_new(),
+        multi: w,
+        offset: go_io_new_offset_writer(empty, 0),
+    };
+}
+
+fn go_io_writer_from_offset(w: GosOffsetWriter) -> GosIoWriter {
+    let no_sinks: Vec<Vec<u8>> = Vec::new();
+    return GosIoWriter {
+        kind: GO_IO_WRITER_OFFSET,
+        discard: go_io_discard_new(),
+        multi: go_io_multi_writer(no_sinks),
+        offset: w,
+    };
+}
+
+fn go_io_writer_write(h: &GosIoWriter, p: Vec<u8>) -> GoIoResult {
+    if h.kind == GO_IO_WRITER_DISCARD {
+        return go_io_discard_write(&h.discard, p);
+    };
+    if h.kind == GO_IO_WRITER_MULTI {
+        return go_io_multi_writer_write(&h.multi, p);
+    };
+    if h.kind == GO_IO_WRITER_OFFSET {
+        return go_io_offset_writer_write(&h.offset, p);
+    };
+    return GoIoResult { n: 0, err: go_errors_nil() };
+}

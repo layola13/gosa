@@ -1,0 +1,2005 @@
+// gostd slices: the SLA-side model of Go's slices package.
+//
+// Oracle: Go 1.27.2 stdlib src/slices (read 2026-11-27):
+//   slices.go (531 lines), sort.go (196 lines), iter.go (114 lines),
+//   zsortanyfunc.go (479 lines), zsortordered.go (481 lines).
+// Census: CENSUS-170.md rev1 section 7.2.1, wave 1b -- slices,
+// prerequisite "generic instantiation first (frontend generic
+// instantiation, section 8 gap)"; SLA side instantiates per
+// concrete element type (see below).
+//
+// Organisation follows the psa_std / gostd precedent: one .sla
+// file per Go package, public entry points go_<pkg>_<name>,
+// private helpers __go_<pkg>_<name>, panic codes listed up
+// front, loud refusals instead of silent approximations.
+//
+// CONCRETE-TYPE INSTANTIATION (the census prerequisite,
+// handled SLA-side). SLA has no Go-style generics in this
+// file, so every slices function is written once per element
+// type the splice needs:
+//   _i64   Go []int / []int64      -> Vec<i64>
+//   _bytes Go []byte               -> Vec<u8> (element u8)
+//   _str   Go []string             -> Vec<Vec<u8>> (each
+//          string is a Vec<u8>; see strings.sla)
+// The _str form differs from _bytes wherever an element is
+// copied or returned (string elements are Vec<u8> values,
+// see the copy rule below); where the code is identical
+// apart from the element type it is still written out in
+// full -- no generics are used in this file, per the brief.
+// Generic Compare/Equal for an arbitrary element type E is
+// NOT in this file: the frontend's generic instantiation
+// maps each Go slices.Fn[T] call site to the matching
+// go_slices_<Fn>_<type> below (seam (a) in the manifest).
+// A Go instantiation over any other element type (bool,
+// float64, a struct, ...) has no function here yet; the
+// frontend must refuse it or request another instantiation
+// (seam (b)).
+//
+// VALUE REPRESENTATION (gostd contract):
+//   Go []T           -> Vec<T> (Vec<i64> / Vec<u8> /
+//                       Vec<Vec<u8>>)
+//   Go int           -> i64
+//   Go bool          -> bool
+//   Go (int, bool)   -> GoSlicesSearchResult { index, found }
+//   Go string        -> Vec<u8> (gostd strings)
+//   Go nil slice     -> NOT modelled: there is no nil Vec
+//                       in gostd (same as bytes.sla, which
+//                       returns an empty Vec for Clone of
+//                       nil). Empty and nil are treated
+//                       identically everywhere here, exactly
+//                       as Go's Equal does; a Go `s == nil`
+//                       test has no gostd spelling and is a
+//                       frontend concern.
+//   Go cap(s)        -> NOT modelled: gostd Vec has no
+//                       observable capacity. Grow and Clip
+//                       are therefore no-ops returning s
+//                       (Grow still panics on n < 0, as Go
+//                       does); see "Divergences".
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77429  slices bounds backstop -- every genuine Go panic
+//          on inputs in this file: Insert i > len(s) or
+//          i < 0; Delete/Replace i < 0, j < i, j > len(s);
+//          Grow n < 0; Chunk n < 1; Min/Max/MinFunc/
+//          MaxFunc on an empty slice; Concat/Repeat
+//          length overflow. Go panics with a message in
+//          each case; SLA panic() takes only a code, so
+//          the code is the whole signal (same shape as
+//          every other gostd panic).
+//   77430  NOT USED -- assigned by the brief for the
+//          iterator/range-over-func loud refusal, but
+//          grep shows 77430 falls inside sort's reserved
+//          block 77430-77439 (sort.sla header, log.sla
+//          header, NOTES-runtime.md: "no codes used").
+//          fmt renumbered off 77430/77431 for exactly
+//          this reason (fmt.sla:14, NOTES-text.md:113).
+//          Per the brief's collision rule the code is
+//          NOT claimed here; the iterator refusal needs
+//          a fresh code from the coordinator (TODO in
+//          MANIFEST-slices.md). No other 774xx code is
+//          used by this file.
+// No other code in this file panics. Nothing is a silent
+// stub: every function either implements Go's semantics
+// or is absent (iterators, below).
+//
+// Target ids: NONE claimed. slices has no error values
+// in Go (no sentinel, no (T, error) result), so the
+// assigned 900040/900041 are left unclaimed; do not
+// invent sentinels for them.
+//
+// THE SEAMS -- integration checks. None of these is
+// decided silently inside this file; each names the
+// party that must confirm it at integration time.
+//
+// (a) COMPARATORS ARE FN-VALUE PARAMETERS, never
+//     closures. Every *Func variant takes its comparison
+//     or predicate as a fn parameter, mirroring sort.sla's
+//     `less: fn(&T, &T) -> bool` precedent (go_sort_vec):
+//       eq / del / f : fn(&T) -> bool, fn(&T, &T) -> bool
+//       cmp          : fn(&T, &T) -> i64 (-1 / 0 / +1)
+//     The frontend MUST emit a named top-level fn for
+//     each Go func value used as a comparator or
+//     predicate (e.g. __go_slices_cmp_i64 per call site)
+//     and pass that named fn as the argument. A closure
+//     literal (^|| ...) at the call site is REJECTED by
+//     the checker in every position (R1400: closure->
+//     fn_ptr proven impossible, 4 forms tried); the
+//     frontend must hoist the closure body to a named
+//     fn first. There is no adapter that closes over a
+//     comparator (no capture exists in SLA), so the cmp
+//     is threaded as a parameter through every sort
+//     helper instead -- see (g).
+// (b) GENERIC INSTANTIATION. Only i64 / u8 / Vec<u8>
+//     element types exist here. Any other T needs a new
+//     instantiation (same shapes, new suffix); the
+//     frontend owns that mapping and must not silently
+//     route another T through these three.
+// (c) VARIADIC PACKING. Go's Insert/Replace take v ...E
+//     and Concat takes slices ...S. SLA has no variadics:
+//     the frontend packs the variadic arguments into one
+//     Vec<T> (Insert/Replace) or one Vec<Vec<T>>
+//     (Concat) and passes that. Concat of zero slices
+//     returns an empty Vec (Go returns nil; nil is
+//     unmodelled, see above).
+// (d) CHUNK IS EAGER. Go's Chunk returns iter.Seq[Slice]
+//     (lazy); SLA has no iterator surface, so
+//     go_slices_chunk_<t> returns Vec<Vec<T>> -- all
+//     chunks collected up front, each a fresh Vec of up
+//     to n elements, the last clipped. Same elements, same
+//     order, same n < 1 panic; laziness is the divergence.
+// (e) ITERATORS ARE OUT (loud refusal, no functions).
+//     All, Backward, Values, AppendSeq, Collect, Sorted,
+//     SortedFunc, SortedStableFunc (iter.go) take or return
+//     iter.Seq values, which have no SLA spelling. The
+//     frontend must refuse them at the call site. The
+//     panic code for that refusal is the 77430 TODO above
+//     (NOT claimed here); until the coordinator allocates
+//     one, the refusal is a frontend-side refusal with no
+//     gostd code. No stub for any of these exists in this
+//     file, deliberately: a stub would be callable.
+// (f) LENGTH-CHANGING OPS RETURN A FRESH VEC. Insert,
+//     Delete, DeleteFunc, Replace, Clone, Compact,
+//     CompactFunc, Grow, Clip, Concat, Repeat, Chunk
+//     never mutate their input Vec; they build a fresh
+//     Vec and return it (the bytes.sla truncate /
+//     __go_fmt_truncate rebuild precedent). Go's versions
+//     shift in place when capacity allows, so a second
+//     Go slice header aliasing the same backing array
+//     would observe the shift; in gostd it does not.
+//     The frontend must rebind every live header to the
+//     returned value (which Go callers must do anyway --
+//     Go's own docs require using Delete's return).
+//     In-place operations (Reverse, Sort, SortFunc,
+//     SortStableFunc) DO mutate through the handle: they
+//     take &Vec<T>, like sort.sla's go_sort_vec.
+// (g) SORT ALGORITHM. Go's slices.Sort uses pdqsort
+//     (zsortordered.go / zsortanyfunc.go, read). This
+//     file does NOT transcribe pdqsort: Sort reuses
+//     sort.sla's go_sort_vec (introsort: median-of-three
+//     quicksort, insertion below 12, heapsort on depth
+//     exhaustion -- sort.sla's own documented divergence
+//     from Go 1.19+ pdqsort, "observable difference is
+//     speed only, never the resulting order, for a strict
+//     weak ordering"); SortFunc / SortStableFunc use
+//     cmp-threaded transcriptions of the same introsort
+//     / merge-sort shapes written in this file, because
+//     a cmp (i64-returning) cannot be adapted to sort.sla's
+//     bool less without a closure (seam (a)). Same
+//     resulting order as Go for a strict weak ordering;
+//     different speed, different pivot/partition choices.
+// (h) BINARYSEARCHFUNC E == T. Go allows the target type
+//     T to differ from the element type E. This
+//     instantiation keeps E == T (the splice needs
+//     element-vs-element search); a cross-type target is
+//     a frontend generic-instantiation matter.
+// (i) COPY RULE (Vec::push moves; fn args do not). A
+//     Vec value pushed into another Vec is MOVED out of
+//     its source; a Vec passed as a plain fn argument is
+//     NOT consumed (R1400). So: i64/u8 elements are
+//     pushed directly (Copy); Vec<u8> (string) elements
+//     are NEVER pushed out of a live slice -- every
+//     _str element copy goes through go_bytes_clone
+//     (bytes.sla, public), which takes the element as a
+//     fn argument and returns a fresh Vec. A deep copy
+//     of a string element is unobservable (Go strings
+//     are immutable), so this is exact. The _str stable
+//     sort builds its scratch from clones for the same
+//     reason; the merge itself reads each slot once and
+//     writes it back before any re-read (the sort.sla
+//     swap shape).
+//
+// DIVERGENCES (all deliberate, all noted here):
+//   - nil vs empty not distinguished (see above).
+//   - capacity not modelled; Grow/Clip are no-ops.
+//   - length-changing ops return fresh Vecs; aliases
+//     do not observe the change (seam (f)).
+//   - Chunk is eager, not lazy (seam (d)).
+//   - Sort is introsort, not pdqsort (seam (g)); same
+//     order for a strict weak ordering.
+//   - Repeat is in slices.go but was NOT in the brief's
+//     function list; it is included here (trivial,
+//     oracle-covered) and flagged in the manifest.
+//   - Concat/Repeat overflow panics use 77429 (the
+//     bounds backstop); the Concat check catches a total
+//     in [2^63, 2^64) per add and the Repeat check is an
+//     exact maxInt/len division -- a total >= 2^64 is
+//     unreachable (it would need > 2^64 elements).
+//   - BinarySearch uses i + (j - i) / 2 (sort.sla's
+//     go_sort_search shape) instead of Go's
+//     uint(i+j) >> 1; identical results, no overflow
+//     at any reachable length.
+//
+// Cross-file dependencies (all in earlier splice files):
+//   sort.sla   go_sort_vec (Sort_i64/_bytes/_str)
+//   bytes.sla  go_bytes_compare (string element compare
+//              / ordering), go_bytes_clone (string
+//              element copies)
+// Splice position: AFTER context, the last of the 22
+// files in IO-CONTRACT-170.md section B-S10 order
+// (errors, math, strconv, strings, fmt, sync, time,
+// sort, runtime, io, bytes, hash, crc32, fnv, base64,
+// hex, utf8, path, flag, bufio, log, context, slices).
+// slices depends only on sort (8th) and bytes (11th),
+// both earlier, so it goes last. No dependency on the
+// cmp package (also wave 1b, unwritten): comparison
+// logic here is local (i64/u8 operators, bytes.sla).
+
+@import "sa_std/vec.sa"
+
+// ---------- shared result type ----------
+
+// BinarySearch / BinarySearchFunc result: Go returns
+// (int, bool); SLA returns this struct (the GoBytesCut
+// precedent in bytes.sla).
+struct GoSlicesSearchResult {
+    index: i64,
+    found: bool,
+}
+
+// ---------- shared helpers ----------
+
+fn __go_slices_log2(n: i64) -> i64 {
+    let r = 0;
+    let x = n;
+    while x > 1 {
+        x = x / 2;
+        r = r + 1;
+    }
+    return r;
+}
+
+// Element comparison returning -1 / 0 / +1, Go
+// cmp.Compare on i64 / u8.
+fn __go_slices_cmp_i64(a: i64, b: i64) -> i64 {
+    if a < b { return -1; };
+    if a > b { return 1; };
+    return 0;
+}
+
+fn __go_slices_cmp_u8(a: u8, b: u8) -> i64 {
+    if a < b { return -1; };
+    if a > b { return 1; };
+    return 0;
+}
+
+// bool less for sort.sla's go_sort_vec, per element type.
+// _str is byte-wise lexicographic, Go's string < exactly
+// (the __go_less_bytes shape from sort.sla).
+fn __go_slices_less_i64(a: &i64, b: &i64) -> bool {
+    return *a < *b;
+}
+
+fn __go_slices_less_u8(a: &u8, b: &u8) -> bool {
+    return *a < *b;
+}
+
+fn __go_slices_less_str(a: &Vec<u8>, b: &Vec<u8>) -> bool {
+    let nx = len(a);
+    let ny = len(b);
+    let n = nx;
+    if ny < n { n = ny; };
+    let i = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        };
+        i = i + 1;
+    }
+    return nx < ny;
+}
+
+// ================= i64 =================
+
+// ---------- i64 private helpers ----------
+
+// Append all of src onto dst (the __go_b_append shape
+// from bytes.sla: dst is a shared buffer handle, so
+// pushing into it here mutates the caller's Vec).
+fn __go_slices_append_i64(dst: Vec<i64>, src: Vec<i64>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_slices_swap_i64(s: &Vec<i64>, i: i64, j: i64) -> void {
+    if i == j { return; };
+    let tmp = s[i];
+    s[i] = s[j];
+    s[j] = tmp;
+    return;
+}
+
+// cmp-threaded introsort helpers (SortFunc): the
+// sort.sla Vec-core shapes with cmp (i64-returning)
+// in place of less (bool). less(a, b) is cmp(a, b) < 0.
+fn __go_slices_insertion_cmp_i64(v: &Vec<i64>, lo: i64, hi: i64, cmp: fn(&i64, &i64) -> i64) -> void {
+    let i = lo + 1;
+    while i < hi {
+        let j = i;
+        while j > lo {
+            if cmp(&v[j], &v[j - 1]) < 0 {
+                __go_slices_swap_i64(v, j, j - 1);
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_slices_sift_down_cmp_i64(v: &Vec<i64>, lo: i64, hi: i64, first: i64, cmp: fn(&i64, &i64) -> i64) -> void {
+    let root = first;
+    while true {
+        let child = 2 * (root - lo) + 1 + lo;
+        if child >= hi {
+            return;
+        };
+        let c = child;
+        if child + 1 < hi {
+            if cmp(&v[child], &v[child + 1]) < 0 {
+                c = child + 1;
+            };
+        };
+        if cmp(&v[root], &v[c]) < 0 {
+            __go_slices_swap_i64(v, root, c);
+            root = c;
+        } else {
+            return;
+        }
+    }
+}
+
+fn __go_slices_heap_cmp_i64(v: &Vec<i64>, lo: i64, hi: i64, cmp: fn(&i64, &i64) -> i64) -> void {
+    let n = hi - lo;
+    let i = n / 2 - 1;
+    while i >= 0 {
+        __go_slices_sift_down_cmp_i64(v, lo, hi, lo + i, cmp);
+        i = i - 1;
+    }
+    let j = hi - 1;
+    while j > lo {
+        __go_slices_swap_i64(v, lo, j);
+        __go_slices_sift_down_cmp_i64(v, lo, j, lo, cmp);
+        j = j - 1;
+    }
+    return;
+}
+
+fn __go_slices_median3_cmp_i64(v: &Vec<i64>, m1: i64, m2: i64, m3: i64, cmp: fn(&i64, &i64) -> i64) -> void {
+    if cmp(&v[m2], &v[m1]) < 0 {
+        __go_slices_swap_i64(v, m2, m1);
+    };
+    if cmp(&v[m3], &v[m2]) < 0 {
+        __go_slices_swap_i64(v, m3, m2);
+    };
+    if cmp(&v[m2], &v[m1]) < 0 {
+        __go_slices_swap_i64(v, m2, m1);
+    };
+    return;
+}
+
+fn __go_slices_quick_cmp_i64(v: &Vec<i64>, lo: i64, hi: i64, depth: i64, cmp: fn(&i64, &i64) -> i64) -> void {
+    let n = hi - lo;
+    if n < 12 {
+        __go_slices_insertion_cmp_i64(v, lo, hi, cmp);
+        return;
+    };
+    if depth <= 0 {
+        __go_slices_heap_cmp_i64(v, lo, hi, cmp);
+        return;
+    };
+    let mid = lo + n / 2;
+    __go_slices_median3_cmp_i64(v, lo, mid, hi - 1, cmp);
+    __go_slices_swap_i64(v, mid, hi - 2);
+    let store = lo + 1;
+    let i = lo + 1;
+    while i < hi - 2 {
+        if cmp(&v[i], &v[hi - 2]) < 0 {
+            __go_slices_swap_i64(v, i, store);
+            store = store + 1;
+        };
+        i = i + 1;
+    }
+    __go_slices_swap_i64(v, store, hi - 2);
+    __go_slices_quick_cmp_i64(v, lo, store, depth - 1, cmp);
+    __go_slices_quick_cmp_i64(v, store + 1, hi, depth - 1, cmp);
+    return;
+}
+
+// cmp-threaded stable merge sort (SortStableFunc): the
+// go_sort_stable shapes from sort.sla, cmp in place of
+// less. Ties take from the left run: stability.
+fn __go_slices_merge_cmp_i64(v: &Vec<i64>, scratch: &Vec<i64>, lo: i64, mid: i64, hi: i64, cmp: fn(&i64, &i64) -> i64) -> void {
+    let i = lo;
+    let j = mid;
+    let k = lo;
+    while i < mid {
+        if j >= hi {
+            scratch[k] = v[i];
+            i = i + 1;
+            k = k + 1;
+        } else {
+            if cmp(&v[j], &v[i]) < 0 {
+                scratch[k] = v[j];
+                j = j + 1;
+                k = k + 1;
+            } else {
+                scratch[k] = v[i];
+                i = i + 1;
+                k = k + 1;
+            };
+        }
+    }
+    while j < hi {
+        scratch[k] = v[j];
+        j = j + 1;
+        k = k + 1;
+    }
+    let t = lo;
+    while t < hi {
+        v[t] = scratch[t];
+        t = t + 1;
+    }
+    return;
+}
+
+fn __go_slices_stable_rec_cmp_i64(v: &Vec<i64>, scratch: &Vec<i64>, lo: i64, hi: i64, cmp: fn(&i64, &i64) -> i64) -> void {
+    if hi - lo < 2 {
+        return;
+    };
+    let mid = lo + (hi - lo) / 2;
+    __go_slices_stable_rec_cmp_i64(v, scratch, lo, mid, cmp);
+    __go_slices_stable_rec_cmp_i64(v, scratch, mid, hi, cmp);
+    __go_slices_merge_cmp_i64(v, scratch, lo, mid, hi, cmp);
+    return;
+}
+
+// ---------- i64 public functions ----------
+
+// slices.Equal: same length and all elements equal.
+// Empty and nil slices are considered equal (nil is
+// unmodelled here; both are empty Vecs).
+fn go_slices_equal_i64(s1: Vec<i64>, s2: Vec<i64>) -> bool {
+    if len(s1) != len(s2) { return false; };
+    let i = 0;
+    while i < len(s1) {
+        if s1[i] != s2[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// slices.EqualFunc: element equality via eq.
+fn go_slices_equal_func_i64(s1: Vec<i64>, s2: Vec<i64>, eq: fn(&i64, &i64) -> bool) -> bool {
+    if len(s1) != len(s2) { return false; };
+    let i = 0;
+    while i < len(s1) {
+        if !eq(&s1[i], &s2[i]) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// slices.Compare: first non-matching pair decides; the
+// shorter slice is less if one is a prefix of the other.
+fn go_slices_compare_i64(s1: Vec<i64>, s2: Vec<i64>) -> i64 {
+    let i = 0;
+    while i < len(s1) {
+        if i >= len(s2) { return 1; };
+        let c = __go_slices_cmp_i64(s1[i], s2[i]);
+        if c != 0 { return c; };
+        i = i + 1;
+    }
+    if len(s1) < len(s2) { return -1; };
+    return 0;
+}
+
+// slices.CompareFunc: like Compare, with cmp.
+fn go_slices_compare_func_i64(s1: Vec<i64>, s2: Vec<i64>, cmp: fn(&i64, &i64) -> i64) -> i64 {
+    let i = 0;
+    while i < len(s1) {
+        if i >= len(s2) { return 1; };
+        let c = cmp(&s1[i], &s2[i]);
+        if c != 0 { return c; };
+        i = i + 1;
+    }
+    if len(s1) < len(s2) { return -1; };
+    return 0;
+}
+
+// slices.Index: first occurrence of v, or -1.
+fn go_slices_index_i64(s: Vec<i64>, v: i64) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        if v == s[i] { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// slices.IndexFunc: first index i with f(s[i]), or -1.
+fn go_slices_index_func_i64(s: Vec<i64>, f: fn(&i64) -> bool) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        if f(&s[i]) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// slices.Contains: v is present in s.
+fn go_slices_contains_i64(s: Vec<i64>, v: i64) -> bool {
+    return go_slices_index_i64(s, v) >= 0;
+}
+
+// slices.ContainsFunc: some element satisfies f.
+fn go_slices_contains_func_i64(s: Vec<i64>, f: fn(&i64) -> bool) -> bool {
+    return go_slices_index_func_i64(s, f) >= 0;
+}
+
+// slices.Insert: insert v at index i, returning the
+// modified slice. Panics if i > len(s) (77429). The
+// frontend packs the variadic v ...E into one Vec (seam
+// (c)); the result is a fresh Vec (seam (f)). Go's
+// overlap cases cannot arise here: v is only ever read,
+// never written, while the result is built.
+fn go_slices_insert_i64(s: Vec<i64>, i: i64, v: Vec<i64>) -> Vec<i64> {
+    if i < 0 { panic(77429); };
+    if i > len(s) { panic(77429); };
+    let m = len(v);
+    if m == 0 { return s; };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(s[k]);
+        k = k + 1;
+    }
+    __go_slices_append_i64(out, v);
+    let k2 = i;
+    while k2 < len(s) {
+        out.push(s[k2]);
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+// slices.Delete: remove s[i:j], returning the modified
+// slice. Panics if j > len(s) or i > j (77429). Fresh
+// Vec result (seam (f)); the tail is not zeroed in
+// place, it is simply absent from the result.
+fn go_slices_delete_i64(s: Vec<i64>, i: i64, j: i64) -> Vec<i64> {
+    if i < 0 { panic(77429); };
+    if j < i { panic(77429); };
+    if j > len(s) { panic(77429); };
+    if i == j { return s; };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(s[k]);
+        k = k + 1;
+    }
+    let k2 = j;
+    while k2 < len(s) {
+        out.push(s[k2]);
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+// slices.DeleteFunc: remove every element for which del
+// returns true, returning the modified slice.
+fn go_slices_delete_func_i64(s: Vec<i64>, del: fn(&i64) -> bool) -> Vec<i64> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        if !del(&s[i]) {
+            out.push(s[i]);
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// slices.Replace: replace s[i:j] with v, returning the
+// modified slice. Panics if j > len(s) or i > j
+// (77429). i == j is Insert; the fresh-Vec build below
+// covers every case, including v aliasing s (v is only
+// read; see Insert). The frontend packs v ...E into one
+// Vec (seam (c)).
+fn go_slices_replace_i64(s: Vec<i64>, i: i64, j: i64, v: Vec<i64>) -> Vec<i64> {
+    if i < 0 { panic(77429); };
+    if j < i { panic(77429); };
+    if j > len(s) { panic(77429); };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(s[k]);
+        k = k + 1;
+    }
+    __go_slices_append_i64(out, v);
+    let k2 = j;
+    while k2 < len(s) {
+        out.push(s[k2]);
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+// slices.Clone: a copy of the slice (fresh Vec).
+fn go_slices_clone_i64(s: Vec<i64>) -> Vec<i64> {
+    let out = Vec::new();
+    __go_slices_append_i64(out, s);
+    return out;
+}
+
+// slices.Compact: replace consecutive runs of equal
+// elements with a single copy.
+fn go_slices_compact_i64(s: Vec<i64>) -> Vec<i64> {
+    if len(s) < 2 { return s; };
+    let out = Vec::new();
+    out.push(s[0]);
+    let k = 1;
+    while k < len(s) {
+        if s[k] != s[k - 1] {
+            out.push(s[k]);
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+// slices.CompactFunc: like Compact, with eq.
+fn go_slices_compact_func_i64(s: Vec<i64>, eq: fn(&i64, &i64) -> bool) -> Vec<i64> {
+    if len(s) < 2 { return s; };
+    let out = Vec::new();
+    out.push(s[0]);
+    let k = 1;
+    while k < len(s) {
+        if !eq(&s[k], &s[k - 1]) {
+            out.push(s[k]);
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+// slices.Grow: capacity is not modelled in gostd, so
+// this only enforces Go's panic (n < 0) and returns s.
+fn go_slices_grow_i64(s: Vec<i64>, n: i64) -> Vec<i64> {
+    if n < 0 { panic(77429); };
+    return s;
+}
+
+// slices.Clip: capacity is not modelled in gostd, so
+// this returns s unchanged.
+fn go_slices_clip_i64(s: Vec<i64>) -> Vec<i64> {
+    return s;
+}
+
+// slices.Concat: concatenate the passed-in slices. The
+// frontend packs the variadic slices ...S into one
+// Vec<Vec<i64>> (seam (c)). An empty concatenation
+// returns an empty Vec (Go returns nil; nil is
+// unmodelled). Panics on length overflow (77429).
+fn go_slices_concat_i64(parts: Vec<Vec<i64>>) -> Vec<i64> {
+    let size = 0;
+    let p = 0;
+    while p < len(parts) {
+        let sz = len(parts[p]);
+        if sz > 9223372036854775807 - size { panic(77429); };
+        size = size + sz;
+        p = p + 1;
+    }
+    let out = Vec::new();
+    let q = 0;
+    while q < len(parts) {
+        __go_slices_append_i64(out, parts[q]);
+        q = q + 1;
+    }
+    return out;
+}
+
+// slices.Repeat: a new slice repeating x count times.
+// Panics if count is negative or len(x) * count
+// overflows (77429). Never nil in Go; here an empty Vec
+// (nil is unmodelled). NOTE: Repeat is in slices.go but
+// was not in the brief's function list; included as
+// oracle-covered (see manifest).
+fn go_slices_repeat_i64(x: Vec<i64>, count: i64) -> Vec<i64> {
+    if count < 0 { panic(77429); };
+    if count > 0 {
+        if len(x) > 0 {
+            if count > 9223372036854775807 / len(x) { panic(77429); };
+        };
+    };
+    let out = Vec::new();
+    let c = 0;
+    while c < count {
+        __go_slices_append_i64(out, x);
+        c = c + 1;
+    }
+    return out;
+}
+
+// slices.Reverse: reverse the elements in place (takes
+// &Vec, like sort.sla's go_sort_vec).
+fn go_slices_reverse_i64(s: &Vec<i64>) -> void {
+    let i = 0;
+    let j = len(s) - 1;
+    while i < j {
+        __go_slices_swap_i64(s, i, j);
+        i = i + 1;
+        j = j - 1;
+    }
+    return;
+}
+
+// slices.Sort: sort ascending, reusing sort.sla's
+// introsort (seam (g)).
+fn go_slices_sort_i64(s: &Vec<i64>) -> void {
+    go_sort_vec(s, __go_slices_less_i64);
+    return;
+}
+
+// slices.SortFunc: sort ascending as determined by cmp
+// (not guaranteed stable). cmp-threaded introsort
+// (seam (g)); cmp must be a strict weak ordering.
+fn go_slices_sort_func_i64(s: &Vec<i64>, cmp: fn(&i64, &i64) -> i64) -> void {
+    let n = len(s);
+    if n < 2 { return; };
+    __go_slices_quick_cmp_i64(s, 0, n, 2 * __go_slices_log2(n), cmp);
+    return;
+}
+
+// slices.SortStableFunc: sort ascending, keeping the
+// original order of equal elements. cmp-threaded merge
+// sort (seam (g)).
+fn go_slices_sort_stable_func_i64(s: &Vec<i64>, cmp: fn(&i64, &i64) -> i64) -> void {
+    let n = len(s);
+    if n < 2 { return; };
+    let scratch: Vec<i64> = Vec::new();
+    let i = 0;
+    while i < n {
+        scratch.push(s[i]);
+        i = i + 1;
+    }
+    __go_slices_stable_rec_cmp_i64(s, &scratch, 0, n, cmp);
+    return;
+}
+
+// slices.IsSorted: whether s is sorted ascending.
+fn go_slices_is_sorted_i64(s: Vec<i64>) -> bool {
+    let i = len(s) - 1;
+    while i > 0 {
+        if s[i] < s[i - 1] { return false; };
+        i = i - 1;
+    }
+    return true;
+}
+
+// slices.IsSortedFunc: whether s is sorted ascending
+// under cmp.
+fn go_slices_is_sorted_func_i64(s: Vec<i64>, cmp: fn(&i64, &i64) -> i64) -> bool {
+    let i = len(s) - 1;
+    while i > 0 {
+        if cmp(&s[i], &s[i - 1]) < 0 { return false; };
+        i = i - 1;
+    }
+    return true;
+}
+
+// slices.Min: the minimal value; panics if empty (77429).
+fn go_slices_min_i64(s: Vec<i64>) -> i64 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if s[i] < m { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+// slices.Max: the maximal value; panics if empty (77429).
+fn go_slices_max_i64(s: Vec<i64>) -> i64 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if s[i] > m { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+// slices.MinFunc: the minimal value under cmp; panics
+// if empty (77429). Returns the first minimal element.
+fn go_slices_min_func_i64(s: Vec<i64>, cmp: fn(&i64, &i64) -> i64) -> i64 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if cmp(&s[i], &m) < 0 { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+// slices.MaxFunc: the maximal value under cmp; panics
+// if empty (77429). Returns the first maximal element.
+fn go_slices_max_func_i64(s: Vec<i64>, cmp: fn(&i64, &i64) -> i64) -> i64 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if cmp(&s[i], &m) > 0 { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+// slices.BinarySearch: earliest position where target
+// is found, or where it would appear; found says
+// whether it is really there. s must be sorted.
+fn go_slices_binary_search_i64(s: Vec<i64>, target: i64) -> GoSlicesSearchResult {
+    let n = len(s);
+    let i = 0;
+    let j = n;
+    while i < j {
+        let h = i + (j - i) / 2;
+        if s[h] < target {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    let found = false;
+    if i < n {
+        if s[i] == target { found = true; };
+    };
+    return GoSlicesSearchResult { index: i, found: found };
+}
+
+// slices.BinarySearchFunc: like BinarySearch, with cmp.
+// E == T in this instantiation (seam (h)).
+fn go_slices_binary_search_func_i64(s: Vec<i64>, target: i64, cmp: fn(&i64, &i64) -> i64) -> GoSlicesSearchResult {
+    let n = len(s);
+    let i = 0;
+    let j = n;
+    while i < j {
+        let h = i + (j - i) / 2;
+        if cmp(&s[h], &target) < 0 {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    let found = false;
+    if i < n {
+        if cmp(&s[i], &target) == 0 { found = true; };
+    };
+    return GoSlicesSearchResult { index: i, found: found };
+}
+
+// slices.Chunk (iter.go): consecutive sub-slices of up
+// to n elements. EAGER here (seam (d)): returns
+// Vec<Vec<i64>> with all chunks collected; empty s
+// yields no chunks. Panics if n < 1 (77429).
+fn go_slices_chunk_i64(s: Vec<i64>, n: i64) -> Vec<Vec<i64>> {
+    if n < 1 { panic(77429); };
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        let end = n;
+        if len(s) - i < end { end = len(s) - i; };
+        let chunk = Vec::new();
+        let k = 0;
+        while k < end {
+            chunk.push(s[i + k]);
+            k = k + 1;
+        }
+        out.push(chunk);
+        i = i + n;
+    }
+    return out;
+}
+
+// ================= bytes ([]byte, element u8) =================
+// Same shapes as the i64 section, element type u8.
+// Comments here note only what differs; the i64 section
+// carries the full per-function notes.
+
+// ---------- bytes private helpers ----------
+
+fn __go_slices_append_bytes(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_slices_swap_bytes(s: &Vec<u8>, i: i64, j: i64) -> void {
+    if i == j { return; };
+    let tmp = s[i];
+    s[i] = s[j];
+    s[j] = tmp;
+    return;
+}
+
+fn __go_slices_insertion_cmp_bytes(v: &Vec<u8>, lo: i64, hi: i64, cmp: fn(&u8, &u8) -> i64) -> void {
+    let i = lo + 1;
+    while i < hi {
+        let j = i;
+        while j > lo {
+            if cmp(&v[j], &v[j - 1]) < 0 {
+                __go_slices_swap_bytes(v, j, j - 1);
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_slices_sift_down_cmp_bytes(v: &Vec<u8>, lo: i64, hi: i64, first: i64, cmp: fn(&u8, &u8) -> i64) -> void {
+    let root = first;
+    while true {
+        let child = 2 * (root - lo) + 1 + lo;
+        if child >= hi {
+            return;
+        };
+        let c = child;
+        if child + 1 < hi {
+            if cmp(&v[child], &v[child + 1]) < 0 {
+                c = child + 1;
+            };
+        };
+        if cmp(&v[root], &v[c]) < 0 {
+            __go_slices_swap_bytes(v, root, c);
+            root = c;
+        } else {
+            return;
+        }
+    }
+}
+
+fn __go_slices_heap_cmp_bytes(v: &Vec<u8>, lo: i64, hi: i64, cmp: fn(&u8, &u8) -> i64) -> void {
+    let n = hi - lo;
+    let i = n / 2 - 1;
+    while i >= 0 {
+        __go_slices_sift_down_cmp_bytes(v, lo, hi, lo + i, cmp);
+        i = i - 1;
+    }
+    let j = hi - 1;
+    while j > lo {
+        __go_slices_swap_bytes(v, lo, j);
+        __go_slices_sift_down_cmp_bytes(v, lo, j, lo, cmp);
+        j = j - 1;
+    }
+    return;
+}
+
+fn __go_slices_median3_cmp_bytes(v: &Vec<u8>, m1: i64, m2: i64, m3: i64, cmp: fn(&u8, &u8) -> i64) -> void {
+    if cmp(&v[m2], &v[m1]) < 0 {
+        __go_slices_swap_bytes(v, m2, m1);
+    };
+    if cmp(&v[m3], &v[m2]) < 0 {
+        __go_slices_swap_bytes(v, m3, m2);
+    };
+    if cmp(&v[m2], &v[m1]) < 0 {
+        __go_slices_swap_bytes(v, m2, m1);
+    };
+    return;
+}
+
+fn __go_slices_quick_cmp_bytes(v: &Vec<u8>, lo: i64, hi: i64, depth: i64, cmp: fn(&u8, &u8) -> i64) -> void {
+    let n = hi - lo;
+    if n < 12 {
+        __go_slices_insertion_cmp_bytes(v, lo, hi, cmp);
+        return;
+    };
+    if depth <= 0 {
+        __go_slices_heap_cmp_bytes(v, lo, hi, cmp);
+        return;
+    };
+    let mid = lo + n / 2;
+    __go_slices_median3_cmp_bytes(v, lo, mid, hi - 1, cmp);
+    __go_slices_swap_bytes(v, mid, hi - 2);
+    let store = lo + 1;
+    let i = lo + 1;
+    while i < hi - 2 {
+        if cmp(&v[i], &v[hi - 2]) < 0 {
+            __go_slices_swap_bytes(v, i, store);
+            store = store + 1;
+        };
+        i = i + 1;
+    }
+    __go_slices_swap_bytes(v, store, hi - 2);
+    __go_slices_quick_cmp_bytes(v, lo, store, depth - 1, cmp);
+    __go_slices_quick_cmp_bytes(v, store + 1, hi, depth - 1, cmp);
+    return;
+}
+
+fn __go_slices_merge_cmp_bytes(v: &Vec<u8>, scratch: &Vec<u8>, lo: i64, mid: i64, hi: i64, cmp: fn(&u8, &u8) -> i64) -> void {
+    let i = lo;
+    let j = mid;
+    let k = lo;
+    while i < mid {
+        if j >= hi {
+            scratch[k] = v[i];
+            i = i + 1;
+            k = k + 1;
+        } else {
+            if cmp(&v[j], &v[i]) < 0 {
+                scratch[k] = v[j];
+                j = j + 1;
+                k = k + 1;
+            } else {
+                scratch[k] = v[i];
+                i = i + 1;
+                k = k + 1;
+            };
+        }
+    }
+    while j < hi {
+        scratch[k] = v[j];
+        j = j + 1;
+        k = k + 1;
+    }
+    let t = lo;
+    while t < hi {
+        v[t] = scratch[t];
+        t = t + 1;
+    }
+    return;
+}
+
+fn __go_slices_stable_rec_cmp_bytes(v: &Vec<u8>, scratch: &Vec<u8>, lo: i64, hi: i64, cmp: fn(&u8, &u8) -> i64) -> void {
+    if hi - lo < 2 {
+        return;
+    };
+    let mid = lo + (hi - lo) / 2;
+    __go_slices_stable_rec_cmp_bytes(v, scratch, lo, mid, cmp);
+    __go_slices_stable_rec_cmp_bytes(v, scratch, mid, hi, cmp);
+    __go_slices_merge_cmp_bytes(v, scratch, lo, mid, hi, cmp);
+    return;
+}
+
+// ---------- bytes public functions ----------
+
+fn go_slices_equal_bytes(s1: Vec<u8>, s2: Vec<u8>) -> bool {
+    if len(s1) != len(s2) { return false; };
+    let i = 0;
+    while i < len(s1) {
+        if s1[i] != s2[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn go_slices_equal_func_bytes(s1: Vec<u8>, s2: Vec<u8>, eq: fn(&u8, &u8) -> bool) -> bool {
+    if len(s1) != len(s2) { return false; };
+    let i = 0;
+    while i < len(s1) {
+        if !eq(&s1[i], &s2[i]) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn go_slices_compare_bytes(s1: Vec<u8>, s2: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(s1) {
+        if i >= len(s2) { return 1; };
+        let c = __go_slices_cmp_u8(s1[i], s2[i]);
+        if c != 0 { return c; };
+        i = i + 1;
+    }
+    if len(s1) < len(s2) { return -1; };
+    return 0;
+}
+
+fn go_slices_compare_func_bytes(s1: Vec<u8>, s2: Vec<u8>, cmp: fn(&u8, &u8) -> i64) -> i64 {
+    let i = 0;
+    while i < len(s1) {
+        if i >= len(s2) { return 1; };
+        let c = cmp(&s1[i], &s2[i]);
+        if c != 0 { return c; };
+        i = i + 1;
+    }
+    if len(s1) < len(s2) { return -1; };
+    return 0;
+}
+
+fn go_slices_index_bytes(s: Vec<u8>, v: u8) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        if v == s[i] { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn go_slices_index_func_bytes(s: Vec<u8>, f: fn(&u8) -> bool) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        if f(&s[i]) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn go_slices_contains_bytes(s: Vec<u8>, v: u8) -> bool {
+    return go_slices_index_bytes(s, v) >= 0;
+}
+
+fn go_slices_contains_func_bytes(s: Vec<u8>, f: fn(&u8) -> bool) -> bool {
+    return go_slices_index_func_bytes(s, f) >= 0;
+}
+
+fn go_slices_insert_bytes(s: Vec<u8>, i: i64, v: Vec<u8>) -> Vec<u8> {
+    if i < 0 { panic(77429); };
+    if i > len(s) { panic(77429); };
+    let m = len(v);
+    if m == 0 { return s; };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(s[k]);
+        k = k + 1;
+    }
+    __go_slices_append_bytes(out, v);
+    let k2 = i;
+    while k2 < len(s) {
+        out.push(s[k2]);
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+fn go_slices_delete_bytes(s: Vec<u8>, i: i64, j: i64) -> Vec<u8> {
+    if i < 0 { panic(77429); };
+    if j < i { panic(77429); };
+    if j > len(s) { panic(77429); };
+    if i == j { return s; };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(s[k]);
+        k = k + 1;
+    }
+    let k2 = j;
+    while k2 < len(s) {
+        out.push(s[k2]);
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+fn go_slices_delete_func_bytes(s: Vec<u8>, del: fn(&u8) -> bool) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        if !del(&s[i]) {
+            out.push(s[i]);
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn go_slices_replace_bytes(s: Vec<u8>, i: i64, j: i64, v: Vec<u8>) -> Vec<u8> {
+    if i < 0 { panic(77429); };
+    if j < i { panic(77429); };
+    if j > len(s) { panic(77429); };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(s[k]);
+        k = k + 1;
+    }
+    __go_slices_append_bytes(out, v);
+    let k2 = j;
+    while k2 < len(s) {
+        out.push(s[k2]);
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+fn go_slices_clone_bytes(s: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_slices_append_bytes(out, s);
+    return out;
+}
+
+fn go_slices_compact_bytes(s: Vec<u8>) -> Vec<u8> {
+    if len(s) < 2 { return s; };
+    let out = Vec::new();
+    out.push(s[0]);
+    let k = 1;
+    while k < len(s) {
+        if s[k] != s[k - 1] {
+            out.push(s[k]);
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+fn go_slices_compact_func_bytes(s: Vec<u8>, eq: fn(&u8, &u8) -> bool) -> Vec<u8> {
+    if len(s) < 2 { return s; };
+    let out = Vec::new();
+    out.push(s[0]);
+    let k = 1;
+    while k < len(s) {
+        if !eq(&s[k], &s[k - 1]) {
+            out.push(s[k]);
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+fn go_slices_grow_bytes(s: Vec<u8>, n: i64) -> Vec<u8> {
+    if n < 0 { panic(77429); };
+    return s;
+}
+
+fn go_slices_clip_bytes(s: Vec<u8>) -> Vec<u8> {
+    return s;
+}
+
+fn go_slices_concat_bytes(parts: Vec<Vec<u8>>) -> Vec<u8> {
+    let size = 0;
+    let p = 0;
+    while p < len(parts) {
+        let sz = len(parts[p]);
+        if sz > 9223372036854775807 - size { panic(77429); };
+        size = size + sz;
+        p = p + 1;
+    }
+    let out = Vec::new();
+    let q = 0;
+    while q < len(parts) {
+        __go_slices_append_bytes(out, parts[q]);
+        q = q + 1;
+    }
+    return out;
+}
+
+fn go_slices_repeat_bytes(x: Vec<u8>, count: i64) -> Vec<u8> {
+    if count < 0 { panic(77429); };
+    if count > 0 {
+        if len(x) > 0 {
+            if count > 9223372036854775807 / len(x) { panic(77429); };
+        };
+    };
+    let out = Vec::new();
+    let c = 0;
+    while c < count {
+        __go_slices_append_bytes(out, x);
+        c = c + 1;
+    }
+    return out;
+}
+
+fn go_slices_reverse_bytes(s: &Vec<u8>) -> void {
+    let i = 0;
+    let j = len(s) - 1;
+    while i < j {
+        __go_slices_swap_bytes(s, i, j);
+        i = i + 1;
+        j = j - 1;
+    }
+    return;
+}
+
+fn go_slices_sort_bytes(s: &Vec<u8>) -> void {
+    go_sort_vec(s, __go_slices_less_u8);
+    return;
+}
+
+fn go_slices_sort_func_bytes(s: &Vec<u8>, cmp: fn(&u8, &u8) -> i64) -> void {
+    let n = len(s);
+    if n < 2 { return; };
+    __go_slices_quick_cmp_bytes(s, 0, n, 2 * __go_slices_log2(n), cmp);
+    return;
+}
+
+fn go_slices_sort_stable_func_bytes(s: &Vec<u8>, cmp: fn(&u8, &u8) -> i64) -> void {
+    let n = len(s);
+    if n < 2 { return; };
+    let scratch: Vec<u8> = Vec::new();
+    let i = 0;
+    while i < n {
+        scratch.push(s[i]);
+        i = i + 1;
+    }
+    __go_slices_stable_rec_cmp_bytes(s, &scratch, 0, n, cmp);
+    return;
+}
+
+fn go_slices_is_sorted_bytes(s: Vec<u8>) -> bool {
+    let i = len(s) - 1;
+    while i > 0 {
+        if s[i] < s[i - 1] { return false; };
+        i = i - 1;
+    }
+    return true;
+}
+
+fn go_slices_is_sorted_func_bytes(s: Vec<u8>, cmp: fn(&u8, &u8) -> i64) -> bool {
+    let i = len(s) - 1;
+    while i > 0 {
+        if cmp(&s[i], &s[i - 1]) < 0 { return false; };
+        i = i - 1;
+    }
+    return true;
+}
+
+fn go_slices_min_bytes(s: Vec<u8>) -> u8 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if s[i] < m { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+fn go_slices_max_bytes(s: Vec<u8>) -> u8 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if s[i] > m { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+fn go_slices_min_func_bytes(s: Vec<u8>, cmp: fn(&u8, &u8) -> i64) -> u8 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if cmp(&s[i], &m) < 0 { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+fn go_slices_max_func_bytes(s: Vec<u8>, cmp: fn(&u8, &u8) -> i64) -> u8 {
+    if len(s) < 1 { panic(77429); };
+    let m = s[0];
+    let i = 1;
+    while i < len(s) {
+        if cmp(&s[i], &m) > 0 { m = s[i]; };
+        i = i + 1;
+    }
+    return m;
+}
+
+fn go_slices_binary_search_bytes(s: Vec<u8>, target: u8) -> GoSlicesSearchResult {
+    let n = len(s);
+    let i = 0;
+    let j = n;
+    while i < j {
+        let h = i + (j - i) / 2;
+        if s[h] < target {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    let found = false;
+    if i < n {
+        if s[i] == target { found = true; };
+    };
+    return GoSlicesSearchResult { index: i, found: found };
+}
+
+fn go_slices_binary_search_func_bytes(s: Vec<u8>, target: u8, cmp: fn(&u8, &u8) -> i64) -> GoSlicesSearchResult {
+    let n = len(s);
+    let i = 0;
+    let j = n;
+    while i < j {
+        let h = i + (j - i) / 2;
+        if cmp(&s[h], &target) < 0 {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    let found = false;
+    if i < n {
+        if cmp(&s[i], &target) == 0 { found = true; };
+    };
+    return GoSlicesSearchResult { index: i, found: found };
+}
+
+fn go_slices_chunk_bytes(s: Vec<u8>, n: i64) -> Vec<Vec<u8>> {
+    if n < 1 { panic(77429); };
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        let end = n;
+        if len(s) - i < end { end = len(s) - i; };
+        let chunk = Vec::new();
+        let k = 0;
+        while k < end {
+            chunk.push(s[i + k]);
+            k = k + 1;
+        }
+        out.push(chunk);
+        i = i + n;
+    }
+    return out;
+}
+
+// ================= str ([]string, element Vec<u8>) =================
+// Same shapes as the i64 section, element type Vec<u8>.
+// Every element copy goes through go_bytes_clone (seam
+// (i)): a string element is NEVER pushed out of a live
+// slice, because Vec::push moves its argument. A deep
+// copy of a string element is unobservable (Go strings
+// are immutable). Element comparison / ordering goes
+// through bytes.sla's public go_bytes_compare.
+
+// ---------- str private helpers ----------
+
+fn __go_slices_append_str(dst: Vec<Vec<u8>>, src: Vec<Vec<u8>>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(go_bytes_clone(src[i]));
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_slices_swap_str(s: &Vec<Vec<u8>>, i: i64, j: i64) -> void {
+    if i == j { return; };
+    let tmp = s[i];
+    s[i] = s[j];
+    s[j] = tmp;
+    return;
+}
+
+fn __go_slices_insertion_cmp_str(v: &Vec<Vec<u8>>, lo: i64, hi: i64, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    let i = lo + 1;
+    while i < hi {
+        let j = i;
+        while j > lo {
+            if cmp(&v[j], &v[j - 1]) < 0 {
+                __go_slices_swap_str(v, j, j - 1);
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_slices_sift_down_cmp_str(v: &Vec<Vec<u8>>, lo: i64, hi: i64, first: i64, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    let root = first;
+    while true {
+        let child = 2 * (root - lo) + 1 + lo;
+        if child >= hi {
+            return;
+        };
+        let c = child;
+        if child + 1 < hi {
+            if cmp(&v[child], &v[child + 1]) < 0 {
+                c = child + 1;
+            };
+        };
+        if cmp(&v[root], &v[c]) < 0 {
+            __go_slices_swap_str(v, root, c);
+            root = c;
+        } else {
+            return;
+        }
+    }
+}
+
+fn __go_slices_heap_cmp_str(v: &Vec<Vec<u8>>, lo: i64, hi: i64, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    let n = hi - lo;
+    let i = n / 2 - 1;
+    while i >= 0 {
+        __go_slices_sift_down_cmp_str(v, lo, hi, lo + i, cmp);
+        i = i - 1;
+    }
+    let j = hi - 1;
+    while j > lo {
+        __go_slices_swap_str(v, lo, j);
+        __go_slices_sift_down_cmp_str(v, lo, j, lo, cmp);
+        j = j - 1;
+    }
+    return;
+}
+
+fn __go_slices_median3_cmp_str(v: &Vec<Vec<u8>>, m1: i64, m2: i64, m3: i64, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    if cmp(&v[m2], &v[m1]) < 0 {
+        __go_slices_swap_str(v, m2, m1);
+    };
+    if cmp(&v[m3], &v[m2]) < 0 {
+        __go_slices_swap_str(v, m3, m2);
+    };
+    if cmp(&v[m2], &v[m1]) < 0 {
+        __go_slices_swap_str(v, m2, m1);
+    };
+    return;
+}
+
+fn __go_slices_quick_cmp_str(v: &Vec<Vec<u8>>, lo: i64, hi: i64, depth: i64, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    let n = hi - lo;
+    if n < 12 {
+        __go_slices_insertion_cmp_str(v, lo, hi, cmp);
+        return;
+    };
+    if depth <= 0 {
+        __go_slices_heap_cmp_str(v, lo, hi, cmp);
+        return;
+    };
+    let mid = lo + n / 2;
+    __go_slices_median3_cmp_str(v, lo, mid, hi - 1, cmp);
+    __go_slices_swap_str(v, mid, hi - 2);
+    let store = lo + 1;
+    let i = lo + 1;
+    while i < hi - 2 {
+        if cmp(&v[i], &v[hi - 2]) < 0 {
+            __go_slices_swap_str(v, i, store);
+            store = store + 1;
+        };
+        i = i + 1;
+    }
+    __go_slices_swap_str(v, store, hi - 2);
+    __go_slices_quick_cmp_str(v, lo, store, depth - 1, cmp);
+    __go_slices_quick_cmp_str(v, store + 1, hi, depth - 1, cmp);
+    return;
+}
+
+fn __go_slices_merge_cmp_str(v: &Vec<Vec<u8>>, scratch: &Vec<Vec<u8>>, lo: i64, mid: i64, hi: i64, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    let i = lo;
+    let j = mid;
+    let k = lo;
+    while i < mid {
+        if j >= hi {
+            scratch[k] = v[i];
+            i = i + 1;
+            k = k + 1;
+        } else {
+            if cmp(&v[j], &v[i]) < 0 {
+                scratch[k] = v[j];
+                j = j + 1;
+                k = k + 1;
+            } else {
+                scratch[k] = v[i];
+                i = i + 1;
+                k = k + 1;
+            };
+        }
+    }
+    while j < hi {
+        scratch[k] = v[j];
+        j = j + 1;
+        k = k + 1;
+    }
+    let t = lo;
+    while t < hi {
+        v[t] = scratch[t];
+        t = t + 1;
+    }
+    return;
+}
+
+fn __go_slices_stable_rec_cmp_str(v: &Vec<Vec<u8>>, scratch: &Vec<Vec<u8>>, lo: i64, hi: i64, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    if hi - lo < 2 {
+        return;
+    };
+    let mid = lo + (hi - lo) / 2;
+    __go_slices_stable_rec_cmp_str(v, scratch, lo, mid, cmp);
+    __go_slices_stable_rec_cmp_str(v, scratch, mid, hi, cmp);
+    __go_slices_merge_cmp_str(v, scratch, lo, mid, hi, cmp);
+    return;
+}
+
+// ---------- str public functions ----------
+
+fn go_slices_equal_str(s1: Vec<Vec<u8>>, s2: Vec<Vec<u8>>) -> bool {
+    if len(s1) != len(s2) { return false; };
+    let i = 0;
+    while i < len(s1) {
+        if go_bytes_compare(s1[i], s2[i]) != 0 { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn go_slices_equal_func_str(s1: Vec<Vec<u8>>, s2: Vec<Vec<u8>>, eq: fn(&Vec<u8>, &Vec<u8>) -> bool) -> bool {
+    if len(s1) != len(s2) { return false; };
+    let i = 0;
+    while i < len(s1) {
+        if !eq(&s1[i], &s2[i]) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn go_slices_compare_str(s1: Vec<Vec<u8>>, s2: Vec<Vec<u8>>) -> i64 {
+    let i = 0;
+    while i < len(s1) {
+        if i >= len(s2) { return 1; };
+        let c = go_bytes_compare(s1[i], s2[i]);
+        if c != 0 { return c; };
+        i = i + 1;
+    }
+    if len(s1) < len(s2) { return -1; };
+    return 0;
+}
+
+fn go_slices_compare_func_str(s1: Vec<Vec<u8>>, s2: Vec<Vec<u8>>, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> i64 {
+    let i = 0;
+    while i < len(s1) {
+        if i >= len(s2) { return 1; };
+        let c = cmp(&s1[i], &s2[i]);
+        if c != 0 { return c; };
+        i = i + 1;
+    }
+    if len(s1) < len(s2) { return -1; };
+    return 0;
+}
+
+fn go_slices_index_str(s: Vec<Vec<u8>>, v: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        if go_bytes_compare(s[i], v) == 0 { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn go_slices_index_func_str(s: Vec<Vec<u8>>, f: fn(&Vec<u8>) -> bool) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        if f(&s[i]) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn go_slices_contains_str(s: Vec<Vec<u8>>, v: Vec<u8>) -> bool {
+    return go_slices_index_str(s, v) >= 0;
+}
+
+fn go_slices_contains_func_str(s: Vec<Vec<u8>>, f: fn(&Vec<u8>) -> bool) -> bool {
+    return go_slices_index_func_str(s, f) >= 0;
+}
+
+fn go_slices_insert_str(s: Vec<Vec<u8>>, i: i64, v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    if i < 0 { panic(77429); };
+    if i > len(s) { panic(77429); };
+    let m = len(v);
+    if m == 0 { return s; };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(go_bytes_clone(s[k]));
+        k = k + 1;
+    }
+    __go_slices_append_str(out, v);
+    let k2 = i;
+    while k2 < len(s) {
+        out.push(go_bytes_clone(s[k2]));
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+fn go_slices_delete_str(s: Vec<Vec<u8>>, i: i64, j: i64) -> Vec<Vec<u8>> {
+    if i < 0 { panic(77429); };
+    if j < i { panic(77429); };
+    if j > len(s) { panic(77429); };
+    if i == j { return s; };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(go_bytes_clone(s[k]));
+        k = k + 1;
+    }
+    let k2 = j;
+    while k2 < len(s) {
+        out.push(go_bytes_clone(s[k2]));
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+fn go_slices_delete_func_str(s: Vec<Vec<u8>>, del: fn(&Vec<u8>) -> bool) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        if !del(&s[i]) {
+            out.push(go_bytes_clone(s[i]));
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+fn go_slices_replace_str(s: Vec<Vec<u8>>, i: i64, j: i64, v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    if i < 0 { panic(77429); };
+    if j < i { panic(77429); };
+    if j > len(s) { panic(77429); };
+    let out = Vec::new();
+    let k = 0;
+    while k < i {
+        out.push(go_bytes_clone(s[k]));
+        k = k + 1;
+    }
+    __go_slices_append_str(out, v);
+    let k2 = j;
+    while k2 < len(s) {
+        out.push(go_bytes_clone(s[k2]));
+        k2 = k2 + 1;
+    }
+    return out;
+}
+
+fn go_slices_clone_str(s: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    __go_slices_append_str(out, s);
+    return out;
+}
+
+fn go_slices_compact_str(s: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    if len(s) < 2 { return s; };
+    let out = Vec::new();
+    out.push(go_bytes_clone(s[0]));
+    let k = 1;
+    while k < len(s) {
+        if go_bytes_compare(s[k], s[k - 1]) != 0 {
+            out.push(go_bytes_clone(s[k]));
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+fn go_slices_compact_func_str(s: Vec<Vec<u8>>, eq: fn(&Vec<u8>, &Vec<u8>) -> bool) -> Vec<Vec<u8>> {
+    if len(s) < 2 { return s; };
+    let out = Vec::new();
+    out.push(go_bytes_clone(s[0]));
+    let k = 1;
+    while k < len(s) {
+        if !eq(&s[k], &s[k - 1]) {
+            out.push(go_bytes_clone(s[k]));
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+fn go_slices_grow_str(s: Vec<Vec<u8>>, n: i64) -> Vec<Vec<u8>> {
+    if n < 0 { panic(77429); };
+    return s;
+}
+
+fn go_slices_clip_str(s: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    return s;
+}
+
+fn go_slices_concat_str(parts: Vec<Vec<Vec<u8>>>) -> Vec<Vec<u8>> {
+    let size = 0;
+    let p = 0;
+    while p < len(parts) {
+        let sz = len(parts[p]);
+        if sz > 9223372036854775807 - size { panic(77429); };
+        size = size + sz;
+        p = p + 1;
+    }
+    let out = Vec::new();
+    let q = 0;
+    while q < len(parts) {
+        __go_slices_append_str(out, parts[q]);
+        q = q + 1;
+    }
+    return out;
+}
+
+fn go_slices_repeat_str(x: Vec<Vec<u8>>, count: i64) -> Vec<Vec<u8>> {
+    if count < 0 { panic(77429); };
+    if count > 0 {
+        if len(x) > 0 {
+            if count > 9223372036854775807 / len(x) { panic(77429); };
+        };
+    };
+    let out = Vec::new();
+    let c = 0;
+    while c < count {
+        __go_slices_append_str(out, x);
+        c = c + 1;
+    }
+    return out;
+}
+
+fn go_slices_reverse_str(s: &Vec<Vec<u8>>) -> void {
+    let i = 0;
+    let j = len(s) - 1;
+    while i < j {
+        __go_slices_swap_str(s, i, j);
+        i = i + 1;
+        j = j - 1;
+    }
+    return;
+}
+
+fn go_slices_sort_str(s: &Vec<Vec<u8>>) -> void {
+    go_sort_vec(s, __go_slices_less_str);
+    return;
+}
+
+fn go_slices_sort_func_str(s: &Vec<Vec<u8>>, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    let n = len(s);
+    if n < 2 { return; };
+    __go_slices_quick_cmp_str(s, 0, n, 2 * __go_slices_log2(n), cmp);
+    return;
+}
+
+// The scratch is built from CLONES, not from push(s[i]):
+// push moves its argument, and the merge below reads s[i]
+// afterwards, so pushing s[i] into the scratch would
+// move elements out of s before the merge reads them
+// (the unproven push-then-read shape; see header seam
+// (i)). Clones keep s intact; the merge then reads each
+// slot once and writes it back.
+fn go_slices_sort_stable_func_str(s: &Vec<Vec<u8>>, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> void {
+    let n = len(s);
+    if n < 2 { return; };
+    let scratch: Vec<Vec<u8>> = Vec::new();
+    let i = 0;
+    while i < n {
+        scratch.push(go_bytes_clone(s[i]));
+        i = i + 1;
+    }
+    __go_slices_stable_rec_cmp_str(s, &scratch, 0, n, cmp);
+    return;
+}
+
+fn go_slices_is_sorted_str(s: Vec<Vec<u8>>) -> bool {
+    let i = len(s) - 1;
+    while i > 0 {
+        if go_bytes_compare(s[i], s[i - 1]) < 0 { return false; };
+        i = i - 1;
+    }
+    return true;
+}
+
+fn go_slices_is_sorted_func_str(s: Vec<Vec<u8>>, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> bool {
+    let i = len(s) - 1;
+    while i > 0 {
+        if cmp(&s[i], &s[i - 1]) < 0 { return false; };
+        i = i - 1;
+    }
+    return true;
+}
+
+// Min/Max track the best INDEX and return a clone of the
+// element: returning s[bi] directly would move the
+// string out of the caller's slice (Vec::push moves;
+// a return of an indexed Vec element is the same move
+// shape). go_bytes_clone takes the element as a fn
+// argument, which does not consume it.
+fn go_slices_min_str(s: Vec<Vec<u8>>) -> Vec<u8> {
+    if len(s) < 1 { panic(77429); };
+    let bi = 0;
+    let i = 1;
+    while i < len(s) {
+        if go_bytes_compare(s[i], s[bi]) < 0 { bi = i; };
+        i = i + 1;
+    }
+    return go_bytes_clone(s[bi]);
+}
+
+fn go_slices_max_str(s: Vec<Vec<u8>>) -> Vec<u8> {
+    if len(s) < 1 { panic(77429); };
+    let bi = 0;
+    let i = 1;
+    while i < len(s) {
+        if go_bytes_compare(s[i], s[bi]) > 0 { bi = i; };
+        i = i + 1;
+    }
+    return go_bytes_clone(s[bi]);
+}
+
+fn go_slices_min_func_str(s: Vec<Vec<u8>>, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> Vec<u8> {
+    if len(s) < 1 { panic(77429); };
+    let bi = 0;
+    let i = 1;
+    while i < len(s) {
+        if cmp(&s[i], &s[bi]) < 0 { bi = i; };
+        i = i + 1;
+    }
+    return go_bytes_clone(s[bi]);
+}
+
+fn go_slices_max_func_str(s: Vec<Vec<u8>>, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> Vec<u8> {
+    if len(s) < 1 { panic(77429); };
+    let bi = 0;
+    let i = 1;
+    while i < len(s) {
+        if cmp(&s[i], &s[bi]) > 0 { bi = i; };
+        i = i + 1;
+    }
+    return go_bytes_clone(s[bi]);
+}
+
+fn go_slices_binary_search_str(s: Vec<Vec<u8>>, target: Vec<u8>) -> GoSlicesSearchResult {
+    let n = len(s);
+    let i = 0;
+    let j = n;
+    while i < j {
+        let h = i + (j - i) / 2;
+        if go_bytes_compare(s[h], target) < 0 {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    let found = false;
+    if i < n {
+        if go_bytes_compare(s[i], target) == 0 { found = true; };
+    };
+    return GoSlicesSearchResult { index: i, found: found };
+}
+
+fn go_slices_binary_search_func_str(s: Vec<Vec<u8>>, target: Vec<u8>, cmp: fn(&Vec<u8>, &Vec<u8>) -> i64) -> GoSlicesSearchResult {
+    let n = len(s);
+    let i = 0;
+    let j = n;
+    while i < j {
+        let h = i + (j - i) / 2;
+        if cmp(&s[h], &target) < 0 {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    let found = false;
+    if i < n {
+        if cmp(&s[i], &target) == 0 { found = true; };
+    };
+    return GoSlicesSearchResult { index: i, found: found };
+}
+
+fn go_slices_chunk_str(s: Vec<Vec<u8>>, n: i64) -> Vec<Vec<Vec<u8>>> {
+    if n < 1 { panic(77429); };
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        let end = n;
+        if len(s) - i < end { end = len(s) - i; };
+        let chunk = Vec::new();
+        let k = 0;
+        while k < end {
+            chunk.push(go_bytes_clone(s[i + k]));
+            k = k + 1;
+        }
+        out.push(chunk);
+        i = i + n;
+    }
+    return out;
+}

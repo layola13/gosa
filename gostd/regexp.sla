@@ -1,0 +1,1506 @@
+// gostd regexp: the SLA-side model of Go's regexp package,
+// wave 1b MINIMAL SUBSET ONLY (CENSUS-170.md rev1 section
+// 7.2.1). Oracle: Go 1.27.2 stdlib src/regexp/regexp.go
+// (1350 lines), src/regexp/syntax/syntax_regexp.go,
+// syntax_parse.go, syntax_compile.go, syntax_prog.go,
+// syntax_simplify.go, syntax_doc.go, exec.go, onepass.go,
+// backtrack.go -- read 2026-11-27. Census scope for this
+// file: Compile + Match/MatchString + FindString/
+// FindAllString + ReplaceAllString, patterns limited to
+// literals and basic metacharacters (. * + ? [...] ^ $ |).
+//
+// Organisation follows the psa_std / gostd precedent: one
+// .sla file per Go package, public entry points
+// go_<pkg>_<name>, private helpers __go_<pkg>_<name>,
+// panic codes listed up front, loud refusals instead of
+// silent approximations. Strings are Vec<u8> everywhere.
+// Splice position: regexp sits AFTER context, i.e. last
+// in the library order (errors -> math -> strconv ->
+// strings -> fmt -> sync -> time -> sort -> runtime ->
+// io -> bytes -> hash -> crc32 -> fnv -> base64 -> hex
+// -> utf8 -> path -> flag -> bufio -> log -> context ->
+// regexp). It depends only on errors.sla (the GosError
+// shape); it uses no strings/bytes/utf8 call, because
+// the parser and matcher work byte-by-byte in this file.
+// It goes last anyway so the verified 21-file splice
+// order is not disturbed by inserting a new wave-1b
+// package in the middle.
+//
+// THE COMPILED PROGRAM. Go compiles to a syntax.Prog of
+// Inst values and runs an NFA simulation (exec.go) or a
+// one-pass program; this file does NEITHER. The compiled
+// form here is a small flat instruction list (GoRegexpInst)
+// over byte values, interpreted by a recursive
+// backtracking matcher (__go_regexp_match_here). That is
+// the brief's design: literal + char class + . * + ?
+// ^ $ alternation, leftmost-first (greedy-first, the
+// same match choice Go documents for Compile), no
+// one-pass engine, no NFA thread queues. The instruction
+// list is the compiled program: Compile parses once,
+// every later match reuses the same prog.
+//
+// VALUE REPRESENTATION (gostd contract, io.sla header):
+//   Go string            -> Vec<u8>
+//   Go []byte            -> Vec<u8>
+//   Go error             -> GosError heap ptr (errors.sla)
+//   Go int64             -> i64
+//   Go (T, bool) found   -> (Vec<u8>, bool) tuple, or the
+//                           GoRegexpMatch struct for index
+//                           results (found/start/end)
+//   Go *Regexp           -> GoRegexp value (expr + prog +
+//                           classes); no heap pointer is
+//                           needed because a compiled
+//                           regexp is immutable after
+//                           Compile and SLA values copy
+//                           by handle.
+//
+// Cross-file dependencies (all in earlier splice files):
+//   errors.sla  go_errors_nil / go_errors_new_with_id
+//               (Compile's syntax error, target 900038)
+// No other cross-file call is made.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77427  pattern uses OUT-OF-SCOPE syntax: groups
+//          ( ... ), named groups (?P<...>), {n,m}
+//          repetition counts, lazy quantifiers (*? +?
+//          ??), Perl classes (\d \w \s \b \A \z ...),
+//          \x \u \p escapes, octal escapes, backrefs,
+//          POSIX classes ([[:alpha:]]), (?flags).
+//          These are VALID Go but second wave; the
+//          parser panics LOUDLY instead of compiling
+//          them wrong or silently dropping them.
+//          NOTE: this panic fires inside Compile too,
+//          not only MustCompile -- see divergence (e).
+//   77428  MustCompile on an invalid pattern (Go panics
+//          with the error text; SLA panic() takes only
+//          a code, so the error is returned by Compile
+//          and MustCompile panics 77428 on it).
+// No other code in this file panics. (77401 errors,
+// 77402-77403 io/bufio, 77404 bytes, 77406 log,
+// 77407 log/base64, 77410-77413 sync, 77414 base64/hex,
+// 77415 bufio, 77416/77417 strings, 77418 context,
+// 77420/77421 + 77423 time, 77422 log, 77424 log,
+// 77430-77439 sort reserved, 77440-77442 runtime,
+// 77446/77447 fmt, 77451/77452 math are all other
+// files' -- verified by grep 2026-11-27, no collision.)
+//
+// Target ids (errors.sla reserves 900000-999999):
+//   900038 go_regexp_syntax_error sentinel: every
+//          Compile error carries this id, so
+//          errors.Is(err, go_regexp_err_syntax())
+//          matches it. The sentinel's own message is
+//          "regexp/syntax: syntax error"; a Compile
+//          error's message is the full Go-format text
+//          "error parsing regexp: <code>: `<expr>`".
+//   900039 RESERVED for a future regexp error sentinel
+//          -- NOT claimed by this file (nothing in the
+//          minimal subset needs a second sentinel).
+//
+// THE SEAMS -- integration checks. None is decided
+// silently inside this file.
+//
+// (a) BYTE-ORIENTED MATCHING. Go matches UTF-8 runes
+//     (syntax.Regexp is rune-based; . is one rune, a
+//     literal is a rune, a class is a rune range). This
+//     file matches BYTES: a literal is one byte, . is
+//     one byte except '\n', a class range is a byte
+//     range 0-255. For ASCII text the results are
+//     identical to Go. For multi-byte UTF-8, . consumes
+//     one byte (not one rune) and a literal non-ASCII
+//     byte matches byte-wise, so e.g. pattern "é"
+//     matches the two UTF-8 bytes of é in order, but
+//     "." matches only the first byte of é. Fixing
+//     this needs rune decoding at match time (utf8.sla
+//     go_utf8_decode_rune) -- a second-wave change to
+//     the matcher, not to the program form.
+// (b) NO SUBMATCHES. The minimal subset has no groups,
+//     so NumSubexp is 0 and there are no FindSubmatch /
+//     Expand $1 forms: in ReplaceAllString, $0 expands
+//     to the whole match, $$ to a literal $, and any
+//     other $name / ${name} expands to EMPTY (Go would
+//     look the name up in the subexpression names;
+//     there are none to look up). Submatch entry
+//     points are NOT in this file; they arrive with
+//     groups in wave 2 (regexp/syntax is the separate
+//     later package, CENSUS-170 section 7.2.2).
+// (c) NO READER / LONGEST / POSIX. MatchReader,
+//     FindReaderIndex, CompilePOSIX, Longest,
+//     Split, Expand (public), SubexpNames and the
+//     All* iterators are not in this file: readers
+//     need an io.RuneReader surface, POSIX/longest
+//     need match-semantics the backtracker does not
+//     implement, and Go 1.27's All* return iter.Seq
+//     (no SLA spelling yet). The frontend must refuse
+//     them (loud refusal at the call site), not map
+//     them onto the functions here.
+// (d) FUEL GUARD. The matcher recurses one frame per
+//     instruction step. A pattern that can loop on an
+//     empty match (e.g. `^*`, legal in Go -- see the
+//     note on repeat() below) would recurse forever
+//     without a bound, so every search gets a fuel
+//     budget of (len(text)+1)*(len(prog)+2)+16 steps;
+//     a search that exhausts fuel fails that start
+//     position and backtracks. A correct match never
+//     needs more fuel than that budget (each step
+//     either consumes a byte or moves to a new
+//     instruction at the same position, and there are
+//     only len(prog) instructions per position). The
+//     recursion DEPTH is a debug-phase check: the
+//     corpus recurses (errors.sla, sort.sla, fmt.sla)
+//     but never thousands of frames deep, and a long
+//     input under `a*` recurses ~3 frames per byte.
+// (e) OUT-OF-SCOPE PANICS INSIDE COMPILE. Go's Compile
+//     returns an error for every bad pattern and
+//     SUCCEEDS on groups, {n,m}, \d etc. This file
+//     panics 77427 on out-of-scope-but-valid Go
+//     syntax instead of returning an error, because
+//     the brief assigns 77427 as the loud refusal for
+//     exactly that case and there is no compiled form
+//     that could represent it. That means Compile
+//     panics where Go would return (*Regexp, nil) --
+//     a deliberate wave-1b divergence, recorded here
+//     so the debug phase can change it (return a
+//     900038 error from Compile instead) without
+//     rediscovering the reason.
+//
+// DIVERGENCES (all deliberate, all noted here):
+//   - ^ and $ are LINE anchors, as in Go's default
+//     (syntax_parse.go: ^ is OpBeginLine, $ is
+//     OpEndLine unless (?m) handling says otherwise):
+//     ^ matches at position 0 and after '\n'; $
+//     matches at end of text and before '\n'. NOT
+//     text-only anchors.
+//   - . matches any byte except '\n' (Go's
+//     OpAnyCharNotNL, the default without (?s)).
+//   - Matching is byte-oriented, not rune-oriented
+//     (seam (a)).
+//   - `^*`, `^+`, `$*` etc. are ACCEPTED, as in Go:
+//     syntax_parse.go repeat() rejects only
+//     pseudo-ops and stacked repeats, and ^/$ are
+//     ordinary ops, so repetition of an empty-width
+//     assertion parses. The fuel guard (seam (d))
+//     keeps such loops terminating.
+//   - A `{` that does not start a repeat count
+//     ({digit or {,) is a LITERAL '{' (Go prints the
+//     same shape back); `{n}`, `{n,}`, `{n,m}` panic
+//     77427 (repeat counts are second wave). Whether
+//     Go accepts or rejects a malformed `{` such as
+//     `{abc}` was not verified against the oracle --
+//     this file treats it as literal; the debug phase
+//     should confirm against syntax_parse.go.
+//   - FindString / Find return ("", false) /
+//     (empty, false) for no match, so the caller can
+//     tell "no match" from "empty match" -- Go uses
+//     "" for both and Find returns nil for no match.
+//   - ReplaceAllString advances one BYTE past an
+//     empty match; Go advances one RUNE. Identical
+//     for ASCII; see seam (a) otherwise.
+//   - Panic values are codes, not strings (77427 /
+//     77428); the offending pattern is not carried in
+//     the panic (it is in the Compile error's message).
+//   - No regexp/syntax package in this file: the
+//     parser here is a small recursive-descent parser
+//     for the minimal subset only, NOT the oracle's
+//     syntax.Parse. regexp/syntax is a separate later
+//     package (CENSUS-170 section 7.2.2, go_regexp_
+//     syntax_*) and must not be assumed to share this
+//     file's instruction list.
+//
+// LOUD REFUSALS (every gap in this file panics with a
+// claimed code, or returns a 900038 error; nothing is
+// a silent stub):
+//   77427  out-of-scope syntax (see above)
+//   77428  MustCompile on an invalid pattern
+//   error  invalid pattern inside the minimal subset
+//          (unclosed [, bad range, bad escape, trailing
+//          backslash, * + ? with no argument, stacked
+//          repeats) -- returned as a GosError with
+//          target id 900038, Go-format message.
+// What is NOT in this file (out of the census scope):
+// regexp/syntax (separate package), groups/submatches,
+// CompilePOSIX/Longest, reader methods, Split, public
+// Expand, All* iterators (seam (c)).
+//
+// Nothing in this file has been compiled or tested
+// (write-first batch; the debug phase is separate).
+
+@import "sa_std/vec.sa"
+
+// ---------- instruction kinds ----------
+
+const GO_REGEXP_INST_MATCH: i64 = 0;
+const GO_REGEXP_INST_LIT: i64 = 1;
+const GO_REGEXP_INST_ANY: i64 = 2;
+const GO_REGEXP_INST_CLASS: i64 = 3;
+const GO_REGEXP_INST_BOL: i64 = 4;
+const GO_REGEXP_INST_EOL: i64 = 5;
+const GO_REGEXP_INST_SPLIT: i64 = 6;
+const GO_REGEXP_INST_JMP: i64 = 7;
+
+// ---------- syntax error codes (internal) ----------
+//
+// These select the Go syntax.ErrorCode text pushed by
+// __go_regexp_push_code_text; they are not panic codes
+// and never leave this file.
+
+const GO_REGEXP_ERR_MISSING_BRACKET: i64 = 1;
+const GO_REGEXP_ERR_INVALID_RANGE: i64 = 2;
+const GO_REGEXP_ERR_INVALID_ESCAPE: i64 = 3;
+const GO_REGEXP_ERR_TRAILING_BACKSLASH: i64 = 4;
+const GO_REGEXP_ERR_MISSING_REPEAT_ARG: i64 = 5;
+const GO_REGEXP_ERR_INVALID_REPEAT_OP: i64 = 6;
+const GO_REGEXP_ERR_INTERNAL: i64 = 7;
+
+// ---------- target id ----------
+
+const GO_REGEXP_ID_SYNTAX_ERROR: i64 = 900038;
+
+// ---------- structs ----------
+
+// One compiled instruction. kind is a GO_REGEXP_INST_*
+// constant; a/b are instruction arguments: LIT holds
+// the byte in a; CLASS holds the class-table index in
+// a; SPLIT holds the two target pcs in a (preferred)
+// and b; JMP holds its target pc in a; BOL/EOL/ANY/
+// MATCH use neither.
+struct GoRegexpInst {
+    kind: i64,
+    a: i64,
+    b: i64,
+}
+
+// One character class: ranges holds lo,hi pairs (byte
+// values 0-255); negated is a [^...] class. Go's
+// classes are rune ranges; this file's are byte ranges
+// (seam (a)).
+struct GoRegexpClass {
+    negated: bool,
+    ranges: Vec<i64>,
+}
+
+// Go's *Regexp, minimal-subset shape: the source text
+// plus the compiled instruction list plus the class
+// table. No subexpression names, no prefix, no
+// onepass program -- none of those exist without
+// groups (wave 2).
+struct GoRegexp {
+    expr: Vec<u8>,
+    prog: Vec<GoRegexpInst>,
+    classes: Vec<GoRegexpClass>,
+}
+
+// Go's []int match location, as a struct because SLA
+// has no nil slice: found false means "no match"
+// (Go returns nil); start/end are byte indexes, end
+// exclusive. An empty match has start == end.
+struct GoRegexpMatch {
+    found: bool,
+    start: i64,
+    end: i64,
+}
+
+// Parser state, carried by reference through the
+// recursive-descent parser. err is nil until the first
+// failure; later failures are ignored (the first error
+// is the one Go reports).
+struct GoRegexpParser {
+    pat: Vec<u8>,
+    pos: i64,
+    prog: Vec<GoRegexpInst>,
+    classes: Vec<GoRegexpClass>,
+    err: ptr,
+}
+
+// ---------- byte helpers ----------
+
+fn __go_regexp_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+// s[lo:hi], fresh Vec. Caller guarantees 0 <= lo <=
+// hi <= len(s).
+fn __go_regexp_slice(s: Vec<u8>, lo: i64, hi: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(s[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Append s[lo:hi] to dst.
+fn __go_regexp_append_range(dst: Vec<u8>, s: Vec<u8>, lo: i64, hi: i64) -> void {
+    let i = lo;
+    while i < hi {
+        dst.push(s[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+// Push the Go syntax.ErrorCode text for an internal
+// error code (GO_REGEXP_ERR_*). Byte-built literals:
+// SLA string literals are not Vec<u8> values (fmt.sla
+// builds "true"/"false" the same way).
+fn __go_regexp_push_code_text(dst: Vec<u8>, code: i64) -> void {
+    if code == GO_REGEXP_ERR_MISSING_BRACKET {
+        // "missing closing ]"
+        dst.push(109u8); dst.push(105u8); dst.push(115u8); dst.push(115u8);
+        dst.push(105u8); dst.push(110u8); dst.push(103u8); dst.push(32u8);
+        dst.push(99u8); dst.push(108u8); dst.push(111u8); dst.push(115u8);
+        dst.push(105u8); dst.push(110u8); dst.push(103u8); dst.push(32u8);
+        dst.push(93u8);
+        return;
+    };
+    if code == GO_REGEXP_ERR_INVALID_RANGE {
+        // "invalid character class range"
+        dst.push(105u8); dst.push(110u8); dst.push(118u8); dst.push(97u8);
+        dst.push(108u8); dst.push(105u8); dst.push(100u8); dst.push(32u8);
+        dst.push(99u8); dst.push(104u8); dst.push(97u8); dst.push(114u8);
+        dst.push(97u8); dst.push(99u8); dst.push(116u8); dst.push(101u8);
+        dst.push(114u8); dst.push(32u8); dst.push(99u8); dst.push(108u8);
+        dst.push(97u8); dst.push(115u8); dst.push(115u8); dst.push(32u8);
+        dst.push(114u8); dst.push(97u8); dst.push(110u8); dst.push(103u8);
+        dst.push(101u8);
+        return;
+    };
+    if code == GO_REGEXP_ERR_INVALID_ESCAPE {
+        // "invalid escape sequence"
+        dst.push(105u8); dst.push(110u8); dst.push(118u8); dst.push(97u8);
+        dst.push(108u8); dst.push(105u8); dst.push(100u8); dst.push(32u8);
+        dst.push(101u8); dst.push(115u8); dst.push(99u8); dst.push(97u8);
+        dst.push(112u8); dst.push(101u8); dst.push(32u8); dst.push(115u8);
+        dst.push(101u8); dst.push(113u8); dst.push(117u8); dst.push(101u8);
+        dst.push(110u8); dst.push(99u8); dst.push(101u8);
+        return;
+    };
+    if code == GO_REGEXP_ERR_TRAILING_BACKSLASH {
+        // "trailing backslash at end of expression"
+        dst.push(116u8); dst.push(114u8); dst.push(97u8); dst.push(105u8);
+        dst.push(108u8); dst.push(105u8); dst.push(110u8); dst.push(103u8);
+        dst.push(32u8); dst.push(98u8); dst.push(97u8); dst.push(99u8);
+        dst.push(107u8); dst.push(115u8); dst.push(108u8); dst.push(97u8);
+        dst.push(115u8); dst.push(104u8); dst.push(32u8); dst.push(97u8);
+        dst.push(116u8); dst.push(32u8); dst.push(101u8); dst.push(110u8);
+        dst.push(100u8); dst.push(32u8); dst.push(111u8); dst.push(102u8);
+        dst.push(32u8); dst.push(101u8); dst.push(120u8); dst.push(112u8);
+        dst.push(114u8); dst.push(101u8); dst.push(115u8); dst.push(115u8);
+        dst.push(105u8); dst.push(111u8); dst.push(110u8);
+        return;
+    };
+    if code == GO_REGEXP_ERR_MISSING_REPEAT_ARG {
+        // "missing argument to repetition operator"
+        dst.push(109u8); dst.push(105u8); dst.push(115u8); dst.push(115u8);
+        dst.push(105u8); dst.push(110u8); dst.push(103u8); dst.push(32u8);
+        dst.push(97u8); dst.push(114u8); dst.push(103u8); dst.push(117u8);
+        dst.push(109u8); dst.push(101u8); dst.push(110u8); dst.push(116u8);
+        dst.push(32u8); dst.push(116u8); dst.push(111u8); dst.push(32u8);
+        dst.push(114u8); dst.push(101u8); dst.push(112u8); dst.push(101u8);
+        dst.push(116u8); dst.push(105u8); dst.push(116u8); dst.push(105u8);
+        dst.push(111u8); dst.push(110u8); dst.push(32u8); dst.push(111u8);
+        dst.push(112u8); dst.push(101u8); dst.push(114u8); dst.push(97u8);
+        dst.push(116u8); dst.push(111u8); dst.push(114u8);
+        return;
+    };
+    if code == GO_REGEXP_ERR_INVALID_REPEAT_OP {
+        // "invalid nested repetition operator"
+        dst.push(105u8); dst.push(110u8); dst.push(118u8); dst.push(97u8);
+        dst.push(108u8); dst.push(105u8); dst.push(100u8); dst.push(32u8);
+        dst.push(110u8); dst.push(101u8); dst.push(115u8); dst.push(116u8);
+        dst.push(101u8); dst.push(100u8); dst.push(32u8); dst.push(114u8);
+        dst.push(101u8); dst.push(112u8); dst.push(101u8); dst.push(116u8);
+        dst.push(105u8); dst.push(116u8); dst.push(105u8); dst.push(111u8);
+        dst.push(110u8); dst.push(32u8); dst.push(111u8); dst.push(112u8);
+        dst.push(101u8); dst.push(114u8); dst.push(97u8); dst.push(116u8);
+        dst.push(111u8); dst.push(114u8);
+        return;
+    };
+    // GO_REGEXP_ERR_INTERNAL (and any unknown code):
+    // "regexp/syntax: internal error"
+    dst.push(114u8); dst.push(101u8); dst.push(103u8); dst.push(101u8);
+    dst.push(120u8); dst.push(112u8); dst.push(47u8); dst.push(115u8);
+    dst.push(121u8); dst.push(110u8); dst.push(116u8); dst.push(97u8);
+    dst.push(120u8); dst.push(58u8); dst.push(32u8); dst.push(105u8);
+    dst.push(110u8); dst.push(116u8); dst.push(101u8); dst.push(114u8);
+    dst.push(110u8); dst.push(97u8); dst.push(108u8); dst.push(32u8);
+    dst.push(101u8); dst.push(114u8); dst.push(114u8); dst.push(111u8);
+    dst.push(114u8);
+    return;
+}
+
+// Record the first parse failure: build Go's
+// syntax.Error string, "error parsing regexp:
+// <code>: `<expr>`", and box it with target id
+// 900038. Later failures are ignored.
+fn __go_regexp_fail(p: &GoRegexpParser, code: i64) -> void {
+    if p.err != go_errors_nil() {
+        return;
+    };
+    let msg = Vec::new();
+    // "error parsing regexp: "
+    msg.push(101u8); msg.push(114u8); msg.push(114u8); msg.push(111u8);
+    msg.push(114u8); msg.push(32u8); msg.push(112u8); msg.push(97u8);
+    msg.push(114u8); msg.push(115u8); msg.push(105u8); msg.push(110u8);
+    msg.push(103u8); msg.push(32u8); msg.push(114u8); msg.push(101u8);
+    msg.push(103u8); msg.push(101u8); msg.push(120u8); msg.push(112u8);
+    msg.push(58u8); msg.push(32u8);
+    __go_regexp_push_code_text(msg, code);
+    // ": `"
+    msg.push(58u8); msg.push(32u8); msg.push(96u8);
+    __go_regexp_append(msg, p.pat);
+    msg.push(96u8);
+    p.err = go_errors_new_with_id(msg, GO_REGEXP_ID_SYNTAX_ERROR);
+    return;
+}
+
+// ---------- parser emission ----------
+
+// Append an instruction; return its pc.
+fn __go_regexp_emit(p: &GoRegexpParser, kind: i64, a: i64, b: i64) -> i64 {
+    let pc = len(p.prog);
+    p.prog.push(GoRegexpInst { kind: kind, a: a, b: b });
+    return pc;
+}
+
+// Rewrite the instruction at pc (the placeholder
+// patching the parser uses for SPLIT/JMP targets,
+// which are only known after the branch is parsed).
+fn __go_regexp_patch(p: &GoRegexpParser, pc: i64, kind: i64, a: i64, b: i64) -> void {
+    p.prog[pc] = GoRegexpInst { kind: kind, a: a, b: b };
+    return;
+}
+
+// Next pattern byte as i64, or -1 at end of pattern.
+fn __go_regexp_peek(p: &GoRegexpParser) -> i64 {
+    if p.pos >= len(p.pat) {
+        return -1;
+    };
+    return p.pat[p.pos] as i64;
+}
+
+// Pattern byte off positions ahead, or -1 past the end.
+fn __go_regexp_peek_at(p: &GoRegexpParser, off: i64) -> i64 {
+    if p.pos + off >= len(p.pat) {
+        return -1;
+    };
+    return p.pat[p.pos + off] as i64;
+}
+
+// Is c a $name character (letter, digit, underscore)?
+// Used by $ expansion name parsing only.
+fn __go_regexp_is_name_char(c: u8) -> bool {
+    if c >= 48 {
+        if c <= 57 {
+            return true;
+        };
+    };
+    if c >= 65 {
+        if c <= 90 {
+            return true;
+        };
+    };
+    if c >= 97 {
+        if c <= 122 {
+            return true;
+        };
+    };
+    if c == 95u8 {
+        return true;
+    };
+    return false;
+}
+
+// Parse one escape sequence. Caller guarantees
+// pat[pos] == '\\'. Consumes the backslash and the
+// escaped byte and returns its value. Supported:
+// \n \t \r \a \f \v and an escaped literal byte
+// (\\ \. \* \+ \? \[ \] \^ \$ \| \- \/ \{ \} \( \)).
+// Anything else is either out of scope (77427: Perl
+// classes \d \w \s \b \A \z, \x \u \p \P, octal
+// \0-\9, \Q \E \c) or an invalid escape (returned
+// error, code 3).
+fn __go_regexp_escape(p: &GoRegexpParser) -> (i64, bool) {
+    p.pos = p.pos + 1;
+    if p.pos >= len(p.pat) {
+        __go_regexp_fail(p, GO_REGEXP_ERR_TRAILING_BACKSLASH);
+        return (0, false);
+    };
+    let c = p.pat[p.pos];
+    p.pos = p.pos + 1;
+    if c == 110u8 {
+        return (10, true);
+    };
+    if c == 116u8 {
+        return (9, true);
+    };
+    if c == 114u8 {
+        return (13, true);
+    };
+    if c == 97u8 {
+        return (7, true);
+    };
+    if c == 102u8 {
+        return (12, true);
+    };
+    if c == 118u8 {
+        return (11, true);
+    };
+    if c == 92u8 {
+        return (92, true);
+    };
+    if c == 46u8 {
+        return (46, true);
+    };
+    if c == 42u8 {
+        return (42, true);
+    };
+    if c == 43u8 {
+        return (43, true);
+    };
+    if c == 63u8 {
+        return (63, true);
+    };
+    if c == 91u8 {
+        return (91, true);
+    };
+    if c == 93u8 {
+        return (93, true);
+    };
+    if c == 94u8 {
+        return (94, true);
+    };
+    if c == 36u8 {
+        return (36, true);
+    };
+    if c == 124u8 {
+        return (124, true);
+    };
+    if c == 45u8 {
+        return (45, true);
+    };
+    if c == 47u8 {
+        return (47, true);
+    };
+    if c == 123u8 {
+        return (123, true);
+    };
+    if c == 125u8 {
+        return (125, true);
+    };
+    if c == 40u8 {
+        return (40, true);
+    };
+    if c == 41u8 {
+        return (41, true);
+    };
+    if c == 100u8 {
+        panic(77427);
+    };
+    if c == 68u8 {
+        panic(77427);
+    };
+    if c == 119u8 {
+        panic(77427);
+    };
+    if c == 87u8 {
+        panic(77427);
+    };
+    if c == 115u8 {
+        panic(77427);
+    };
+    if c == 83u8 {
+        panic(77427);
+    };
+    if c == 98u8 {
+        panic(77427);
+    };
+    if c == 66u8 {
+        panic(77427);
+    };
+    if c == 65u8 {
+        panic(77427);
+    };
+    if c == 122u8 {
+        panic(77427);
+    };
+    if c == 120u8 {
+        panic(77427);
+    };
+    if c == 117u8 {
+        panic(77427);
+    };
+    if c == 85u8 {
+        panic(77427);
+    };
+    if c == 112u8 {
+        panic(77427);
+    };
+    if c == 80u8 {
+        panic(77427);
+    };
+    if c == 99u8 {
+        panic(77427);
+    };
+    if c == 81u8 {
+        panic(77427);
+    };
+    if c == 69u8 {
+        panic(77427);
+    };
+    if c >= 48u8 {
+        if c <= 57u8 {
+            panic(77427);
+        };
+    };
+    __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_ESCAPE);
+    return (0, false);
+}
+
+// Parse one class element: an escape (via
+// __go_regexp_escape) or a single raw byte. Returns
+// (byte value, ok); on failure p.err is set.
+fn __go_regexp_parse_class_char(p: &GoRegexpParser) -> (i64, bool) {
+    if p.pos >= len(p.pat) {
+        __go_regexp_fail(p, GO_REGEXP_ERR_MISSING_BRACKET);
+        return (0, false);
+    };
+    if p.pat[p.pos] == 92u8 {
+        return __go_regexp_escape(p);
+    };
+    let c = p.pat[p.pos] as i64;
+    p.pos = p.pos + 1;
+    return (c, true);
+}
+
+// Parse a character class. Caller guarantees
+// pat[pos] == '['. Consumes through the closing ']'
+// and returns the new class-table index, or -1 with
+// p.err set. Go's rules: ']' as the first element is
+// a literal; '-' between two elements is a range
+// (a trailing '-' is literal); '[[:...:]]' POSIX
+// classes panic 77427.
+fn __go_regexp_parse_class(p: &GoRegexpParser) -> i64 {
+    p.pos = p.pos + 1;
+    let negated = false;
+    if __go_regexp_peek(p) == 94 {
+        negated = true;
+        p.pos = p.pos + 1;
+    };
+    let ranges = Vec::new();
+    let first = true;
+    let closed = false;
+    while p.pos < len(p.pat) && !closed {
+        if p.err != go_errors_nil() {
+            return -1;
+        };
+        if p.pat[p.pos] == 93u8 {
+            if !first {
+                p.pos = p.pos + 1;
+                closed = true;
+            } else {
+                let (lo, ok) = __go_regexp_parse_class_char(p);
+                if !ok {
+                    return -1;
+                };
+                first = false;
+                ranges.push(lo);
+                ranges.push(lo);
+            };
+        } else {
+            if p.pat[p.pos] == 91u8 {
+                if __go_regexp_peek_at(p, 1) == 58 {
+                    panic(77427);
+                };
+            };
+            let (lo, ok) = __go_regexp_parse_class_char(p);
+            if !ok {
+                return -1;
+            };
+            first = false;
+            if __go_regexp_peek(p) == 45 {
+                if __go_regexp_peek_at(p, 1) != 93 {
+                    if __go_regexp_peek_at(p, 1) != -1 {
+                        p.pos = p.pos + 1;
+                        let (hi, ok2) = __go_regexp_parse_class_char(p);
+                        if !ok2 {
+                            return -1;
+                        };
+                        if hi < lo {
+                            __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_RANGE);
+                            return -1;
+                        };
+                        ranges.push(lo);
+                        ranges.push(hi);
+                    } else {
+                        ranges.push(lo);
+                        ranges.push(lo);
+                    };
+                } else {
+                    ranges.push(lo);
+                    ranges.push(lo);
+                };
+            } else {
+                ranges.push(lo);
+                ranges.push(lo);
+            };
+        };
+    }
+    if p.err != go_errors_nil() {
+        return -1;
+    };
+    if !closed {
+        __go_regexp_fail(p, GO_REGEXP_ERR_MISSING_BRACKET);
+        return -1;
+    };
+    let idx = len(p.classes);
+    p.classes.push(GoRegexpClass { negated: negated, ranges: ranges });
+    return idx;
+}
+
+// ---------- recursive-descent parser ----------
+//
+// Precedence: alternation (|) weakest, then
+// concatenation, then quantified atoms. Every atom is
+// preceded by a placeholder SPLIT in parse_concat:
+// with no quantifier it is patched to a JMP over
+// itself; with * + ? it becomes the loop/option
+// split. That avoids inserting instructions in front
+// of an already-parsed atom (the program list only
+// ever grows at the end). Alternation uses the same
+// placeholder trick in parse_alt.
+
+// Parse one atom and emit its instructions. Caller
+// guarantees pos < len(pat). A leading * + ? with no
+// preceding atom is an error (code 5); '(' and ')'
+// panic 77427 (groups are second wave); a '{' that
+// opens a repeat count ({digit or {,) panics 77427
+// while a bare '{' is a literal.
+fn __go_regexp_parse_atom(p: &GoRegexpParser) -> void {
+    let c = p.pat[p.pos];
+    if c == 94u8 {
+        p.pos = p.pos + 1;
+        __go_regexp_emit(p, GO_REGEXP_INST_BOL, 0, 0);
+        return;
+    };
+    if c == 36u8 {
+        p.pos = p.pos + 1;
+        __go_regexp_emit(p, GO_REGEXP_INST_EOL, 0, 0);
+        return;
+    };
+    if c == 46u8 {
+        p.pos = p.pos + 1;
+        __go_regexp_emit(p, GO_REGEXP_INST_ANY, 0, 0);
+        return;
+    };
+    if c == 91u8 {
+        let idx = __go_regexp_parse_class(p);
+        if p.err != go_errors_nil() {
+            return;
+        };
+        __go_regexp_emit(p, GO_REGEXP_INST_CLASS, idx, 0);
+        return;
+    };
+    if c == 92u8 {
+        let (v, ok) = __go_regexp_escape(p);
+        if !ok {
+            return;
+        };
+        __go_regexp_emit(p, GO_REGEXP_INST_LIT, v, 0);
+        return;
+    };
+    if c == 40u8 {
+        panic(77427);
+    };
+    if c == 41u8 {
+        panic(77427);
+    };
+    if c == 42u8 {
+        __go_regexp_fail(p, GO_REGEXP_ERR_MISSING_REPEAT_ARG);
+        return;
+    };
+    if c == 43u8 {
+        __go_regexp_fail(p, GO_REGEXP_ERR_MISSING_REPEAT_ARG);
+        return;
+    };
+    if c == 63u8 {
+        __go_regexp_fail(p, GO_REGEXP_ERR_MISSING_REPEAT_ARG);
+        return;
+    };
+    if c == 123u8 {
+        let nxt = __go_regexp_peek_at(p, 1);
+        if nxt == 44 {
+            panic(77427);
+        };
+        if nxt >= 48 {
+            if nxt <= 57 {
+                panic(77427);
+            };
+        };
+        p.pos = p.pos + 1;
+        __go_regexp_emit(p, GO_REGEXP_INST_LIT, 123, 0);
+        return;
+    };
+    p.pos = p.pos + 1;
+    __go_regexp_emit(p, GO_REGEXP_INST_LIT, c as i64, 0);
+    return;
+}
+
+// Parse a concatenation: a run of quantified atoms,
+// stopping at '|' or end of pattern. A lazy marker
+// ('?' right after * + ?) panics 77427; a second
+// quantifier right after one fails with code 6 (Go's
+// ErrInvalidRepeatOp, "a** is a syntax error").
+fn __go_regexp_parse_concat(p: &GoRegexpParser) -> void {
+    while p.pos < len(p.pat) {
+        if p.err != go_errors_nil() {
+            return;
+        };
+        if p.pat[p.pos] == 124u8 {
+            return;
+        };
+        let s = __go_regexp_emit(p, GO_REGEXP_INST_SPLIT, 0, 0);
+        let atom_start = s + 1;
+        __go_regexp_parse_atom(p);
+        if p.err != go_errors_nil() {
+            return;
+        };
+        let q = __go_regexp_peek(p);
+        if q == 42 {
+            p.pos = p.pos + 1;
+            if __go_regexp_peek(p) == 63 {
+                p.pos = p.pos + 1;
+                panic(77427);
+            };
+            if __go_regexp_peek(p) == 42 {
+                __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                return;
+            };
+            if __go_regexp_peek(p) == 43 {
+                __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                return;
+            };
+            if __go_regexp_peek(p) == 63 {
+                __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                return;
+            };
+            __go_regexp_emit(p, GO_REGEXP_INST_JMP, s, 0);
+            __go_regexp_patch(p, s, GO_REGEXP_INST_SPLIT, atom_start, len(p.prog));
+        } else {
+            if q == 43 {
+                p.pos = p.pos + 1;
+                if __go_regexp_peek(p) == 63 {
+                    p.pos = p.pos + 1;
+                    panic(77427);
+                };
+                if __go_regexp_peek(p) == 42 {
+                    __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                    return;
+                };
+                if __go_regexp_peek(p) == 43 {
+                    __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                    return;
+                };
+                if __go_regexp_peek(p) == 63 {
+                    __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                    return;
+                };
+                __go_regexp_patch(p, s, GO_REGEXP_INST_JMP, atom_start, 0);
+                let e = len(p.prog);
+                let _e = __go_regexp_emit(p, GO_REGEXP_INST_SPLIT, atom_start, e + 1);
+            } else {
+                if q == 63 {
+                    p.pos = p.pos + 1;
+                    if __go_regexp_peek(p) == 63 {
+                        p.pos = p.pos + 1;
+                        panic(77427);
+                    };
+                    if __go_regexp_peek(p) == 42 {
+                        __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                        return;
+                    };
+                    if __go_regexp_peek(p) == 43 {
+                        __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                        return;
+                    };
+                    if __go_regexp_peek(p) == 63 {
+                        __go_regexp_fail(p, GO_REGEXP_ERR_INVALID_REPEAT_OP);
+                        return;
+                    };
+                    __go_regexp_patch(p, s, GO_REGEXP_INST_SPLIT, atom_start, len(p.prog));
+                } else {
+                    __go_regexp_patch(p, s, GO_REGEXP_INST_JMP, atom_start, 0);
+                };
+            };
+        };
+    }
+    return;
+}
+
+// Parse an alternation: one concatenation, then while
+// a '|' follows, another alternation. Right-leaning
+// recursion, so a|b|c compiles to nested splits with
+// the leftmost branch preferred (Go's leftmost-first
+// choice for alternation). Empty branches match the
+// empty string, as in Go.
+fn __go_regexp_parse_alt(p: &GoRegexpParser) -> void {
+    let s = __go_regexp_emit(p, GO_REGEXP_INST_SPLIT, 0, 0);
+    __go_regexp_parse_concat(p);
+    if p.err != go_errors_nil() {
+        return;
+    };
+    if __go_regexp_peek(p) != 124 {
+        __go_regexp_patch(p, s, GO_REGEXP_INST_JMP, s + 1, 0);
+        return;
+    };
+    p.pos = p.pos + 1;
+    let j = __go_regexp_emit(p, GO_REGEXP_INST_JMP, 0, 0);
+    __go_regexp_patch(p, s, GO_REGEXP_INST_SPLIT, s + 1, len(p.prog));
+    __go_regexp_parse_alt(p);
+    if p.err != go_errors_nil() {
+        return;
+    };
+    __go_regexp_patch(p, j, GO_REGEXP_INST_JMP, len(p.prog), 0);
+    return;
+}
+
+// ---------- matcher ----------
+
+// Does byte b match class cls?
+fn __go_regexp_class_match(cls: &GoRegexpClass, b: i64) -> bool {
+    let hit = false;
+    let i = 0;
+    while i + 1 < len(cls.ranges) {
+        if b >= cls.ranges[i] {
+            if b <= cls.ranges[i + 1] {
+                hit = true;
+            };
+        };
+        i = i + 2;
+    }
+    if cls.negated {
+        return !hit;
+    };
+    return hit;
+}
+
+// Backtracking match of prog[pc..] against text[pos..].
+// Returns the end position of the match, or -1. SPLIT
+// tries its preferred arm first (greedy / leftmost-
+// first, Go's Compile semantics). fuel bounds the
+// total steps (seam (d)): each recursive call spends
+// one unit, so empty-width loops terminate by failing
+// the current start position and backtracking.
+// NOTE: && is eager in this dialect (task 156 defect
+// (xviii)), so bounds are checked with nested ifs,
+// never with a && guarding an index.
+fn __go_regexp_match_here(re: &GoRegexp, text: Vec<u8>, pc: i64, pos: i64, fuel: i64) -> i64 {
+    if fuel <= 0 {
+        return -1;
+    };
+    if pc < 0 {
+        return -1;
+    };
+    if pc >= len(re.prog) {
+        return -1;
+    };
+    let inst = re.prog[pc];
+    if inst.kind == GO_REGEXP_INST_MATCH {
+        return pos;
+    };
+    if inst.kind == GO_REGEXP_INST_LIT {
+        if pos < len(text) {
+            if (text[pos] as i64) == inst.a {
+                return __go_regexp_match_here(re, text, pc + 1, pos + 1, fuel - 1);
+            };
+        };
+        return -1;
+    };
+    if inst.kind == GO_REGEXP_INST_ANY {
+        if pos < len(text) {
+            if text[pos] != 10u8 {
+                return __go_regexp_match_here(re, text, pc + 1, pos + 1, fuel - 1);
+            };
+        };
+        return -1;
+    };
+    if inst.kind == GO_REGEXP_INST_CLASS {
+        if pos < len(text) {
+            let cls = re.classes[inst.a];
+            if __go_regexp_class_match(&cls, text[pos] as i64) {
+                return __go_regexp_match_here(re, text, pc + 1, pos + 1, fuel - 1);
+            };
+        };
+        return -1;
+    };
+    if inst.kind == GO_REGEXP_INST_BOL {
+        if pos == 0 {
+            return __go_regexp_match_here(re, text, pc + 1, pos, fuel - 1);
+        };
+        if text[pos - 1] == 10u8 {
+            return __go_regexp_match_here(re, text, pc + 1, pos, fuel - 1);
+        };
+        return -1;
+    };
+    if inst.kind == GO_REGEXP_INST_EOL {
+        if pos == len(text) {
+            return __go_regexp_match_here(re, text, pc + 1, pos, fuel - 1);
+        };
+        if pos < len(text) {
+            if text[pos] == 10u8 {
+                return __go_regexp_match_here(re, text, pc + 1, pos, fuel - 1);
+            };
+        };
+        return -1;
+    };
+    if inst.kind == GO_REGEXP_INST_SPLIT {
+        let r = __go_regexp_match_here(re, text, inst.a, pos, fuel - 1);
+        if r >= 0 {
+            return r;
+        };
+        return __go_regexp_match_here(re, text, inst.b, pos, fuel - 1);
+    };
+    if inst.kind == GO_REGEXP_INST_JMP {
+        return __go_regexp_match_here(re, text, inst.a, pos, fuel - 1);
+    };
+    return -1;
+}
+
+// Leftmost match of re in text at or after start
+// (Go's find, unanchored: try every start position
+// in order, first success wins).
+fn __go_regexp_find_from(re: &GoRegexp, text: Vec<u8>, start: i64) -> GoRegexpMatch {
+    let n = len(text);
+    let pos = start;
+    while pos <= n {
+        let fuel = (n + 1) * (len(re.prog) + 2) + 16;
+        let end = __go_regexp_match_here(re, text, 0, pos, fuel);
+        if end >= 0 {
+            return GoRegexpMatch { found: true, start: pos, end: end };
+        };
+        pos = pos + 1;
+    }
+    return GoRegexpMatch { found: false, start: -1, end: -1 };
+}
+
+// Expand a ReplaceAllString template: $$ is a literal
+// $, $0 is the whole match, $name / ${name} expand to
+// EMPTY in wave 1b (no subexpressions exist to name --
+// seam (b)). A $ not followed by a valid name, and a
+// ${ without a closing brace, are copied literally as
+// $ (Go's expand treats a malformed $ as raw text).
+// ms/me are the match bounds in src.
+fn __go_regexp_expand(dst: Vec<u8>, template: Vec<u8>, src: Vec<u8>, ms: i64, me: i64) -> void {
+    let i = 0;
+    let n = len(template);
+    while i < n {
+        if template[i] == 36u8 {
+            if i + 1 >= n {
+                dst.push(36u8);
+                i = i + 1;
+            } else {
+                if template[i + 1] == 36u8 {
+                    dst.push(36u8);
+                    i = i + 2;
+                } else {
+                    let braced = false;
+                    let j = i + 1;
+                    if template[j] == 123u8 {
+                        braced = true;
+                        j = j + 1;
+                    };
+                    let name_start = j;
+                    let done = false;
+                    while j < n && !done {
+                        if __go_regexp_is_name_char(template[j]) {
+                            j = j + 1;
+                        } else {
+                            done = true;
+                        };
+                    }
+                    if j == name_start {
+                        dst.push(36u8);
+                        i = i + 1;
+                    } else {
+                        if braced {
+                            if j >= n {
+                                dst.push(36u8);
+                                i = i + 1;
+                            } else {
+                                if template[j] != 125u8 {
+                                    dst.push(36u8);
+                                    i = i + 1;
+                                } else {
+                                    if j - name_start == 1 {
+                                        if template[name_start] == 48u8 {
+                                            __go_regexp_append_range(dst, src, ms, me);
+                                        };
+                                    };
+                                    i = j + 1;
+                                };
+                            };
+                        } else {
+                            if j - name_start == 1 {
+                                if template[name_start] == 48u8 {
+                                    __go_regexp_append_range(dst, src, ms, me);
+                                };
+                            };
+                            i = j;
+                        };
+                    };
+                };
+            };
+        } else {
+            dst.push(template[i]);
+            i = i + 1;
+        };
+    }
+    return;
+}
+
+// Go's replaceAll loop, shared by the four ReplaceAll
+// entry points (string/bytes x $ /literal). Copies
+// the unmatched text, then the replacement (expanded
+// unless literal), skipping the replacement for an
+// empty match that directly abuts the previous match
+// (Go's rule). Advances at least one byte per match.
+fn __go_regexp_replace_all(re: &GoRegexp, src: Vec<u8>, repl: Vec<u8>, literal: bool) -> Vec<u8> {
+    let out = Vec::new();
+    let end_pos = len(src);
+    let last_end = 0;
+    let search = 0;
+    while search <= end_pos {
+        let m = __go_regexp_find_from(re, src, search);
+        if !m.found {
+            search = end_pos + 1;
+        } else {
+            __go_regexp_append_range(out, src, last_end, m.start);
+            if m.end > last_end {
+                if literal {
+                    __go_regexp_append(out, repl);
+                } else {
+                    __go_regexp_expand(out, repl, src, m.start, m.end);
+                };
+            } else {
+                if m.start == 0 {
+                    if literal {
+                        __go_regexp_append(out, repl);
+                    } else {
+                        __go_regexp_expand(out, repl, src, m.start, m.end);
+                    };
+                };
+            };
+            last_end = m.end;
+            if search + 1 > m.end {
+                search = search + 1;
+            } else {
+                search = m.end;
+            };
+        };
+    }
+    __go_regexp_append_range(out, src, last_end, end_pos);
+    return out;
+}
+
+// Go's matches() loop, shared by the FindAll entry
+// points: successive non-overlapping matches from
+// left to right; an empty match abutting the previous
+// match is ignored (but still advances one byte); n
+// >= 0 caps the count, n < 0 means all; n == 0 means
+// none.
+fn __go_regexp_find_all_index(re: &GoRegexp, text: Vec<u8>, n: i64) -> Vec<GoRegexpMatch> {
+    let out = Vec::new();
+    if n == 0 {
+        return out;
+    };
+    let end = len(text);
+    let pos = 0;
+    let prev_end = -1;
+    let count = 0;
+    while pos <= end {
+        if n >= 0 {
+            if count >= n {
+                return out;
+            };
+        };
+        let m = __go_regexp_find_from(re, text, pos);
+        if !m.found {
+            return out;
+        };
+        if m.end == pos {
+            let accept = m.start != prev_end;
+            prev_end = m.end;
+            if accept {
+                out.push(m);
+                count = count + 1;
+            };
+            if pos >= end {
+                return out;
+            };
+            pos = pos + 1;
+        } else {
+            prev_end = m.end;
+            out.push(m);
+            count = count + 1;
+            pos = m.end;
+        };
+    }
+    return out;
+}
+
+// ---------- public API ----------
+
+// regexp.Compile: parse the pattern into a GoRegexp.
+// On an invalid pattern inside the minimal subset,
+// returns an empty GoRegexp and a GosError with
+// target id 900038 (Go's syntax.Error, Go-format
+// message). On out-of-scope syntax the parser panics
+// 77427 instead (see the header, divergence (e)).
+fn go_regexp_compile(pattern: Vec<u8>) -> (GoRegexp, ptr) {
+    let p = GoRegexpParser {
+        pat: pattern,
+        pos: 0,
+        prog: Vec::new(),
+        classes: Vec::new(),
+        err: go_errors_nil(),
+    };
+    __go_regexp_parse_alt(&p);
+    if p.err != go_errors_nil() {
+        return (GoRegexp { expr: Vec::new(), prog: Vec::new(), classes: Vec::new() }, p.err);
+    };
+    __go_regexp_emit(&p, GO_REGEXP_INST_MATCH, 0, 0);
+    let re = GoRegexp { expr: p.pat, prog: p.prog, classes: p.classes };
+    return (re, go_errors_nil());
+}
+
+// regexp.MustCompile: like Compile but panics 77428
+// if the pattern is invalid. (Out-of-scope syntax
+// panics 77427 from inside the parser, as in Compile.)
+fn go_regexp_must_compile(pattern: Vec<u8>) -> GoRegexp {
+    let (re, err) = go_regexp_compile(pattern);
+    if err != go_errors_nil() {
+        panic(77428);
+    };
+    return re;
+}
+
+// The syntax-error sentinel for errors.Is: a fresh
+// GosError with target id 900038. A Compile error
+// matches it by id (go_errors_is), not by pointer.
+fn go_regexp_err_syntax() -> ptr {
+    let m = Vec::new();
+    // "regexp/syntax: syntax error"
+    m.push(114u8); m.push(101u8); m.push(103u8); m.push(101u8);
+    m.push(120u8); m.push(112u8); m.push(47u8); m.push(115u8);
+    m.push(121u8); m.push(110u8); m.push(116u8); m.push(97u8);
+    m.push(120u8); m.push(58u8); m.push(32u8); m.push(115u8);
+    m.push(121u8); m.push(110u8); m.push(116u8); m.push(97u8);
+    m.push(120u8); m.push(32u8); m.push(101u8); m.push(114u8);
+    m.push(114u8); m.push(111u8); m.push(114u8);
+    return go_errors_new_with_id(m, GO_REGEXP_ID_SYNTAX_ERROR);
+}
+
+// regexp.QuoteMeta: escape every metacharacter so
+// the result matches the literal text. Meta set is
+// Go's: \ . + * ? ( ) | [ ] { } ^ $
+fn go_regexp_quote_meta(s: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        let c = s[i];
+        if c == 92u8 {
+            out.push(92u8);
+        };
+        if c == 46u8 {
+            out.push(92u8);
+        };
+        if c == 43u8 {
+            out.push(92u8);
+        };
+        if c == 42u8 {
+            out.push(92u8);
+        };
+        if c == 63u8 {
+            out.push(92u8);
+        };
+        if c == 40u8 {
+            out.push(92u8);
+        };
+        if c == 41u8 {
+            out.push(92u8);
+        };
+        if c == 124u8 {
+            out.push(92u8);
+        };
+        if c == 91u8 {
+            out.push(92u8);
+        };
+        if c == 93u8 {
+            out.push(92u8);
+        };
+        if c == 123u8 {
+            out.push(92u8);
+        };
+        if c == 125u8 {
+            out.push(92u8);
+        };
+        if c == 94u8 {
+            out.push(92u8);
+        };
+        if c == 36u8 {
+            out.push(92u8);
+        };
+        out.push(c);
+        i = i + 1;
+    }
+    return out;
+}
+
+// (*Regexp).String: the source text used to compile
+// the regular expression.
+fn go_regexp_string(re: &GoRegexp) -> Vec<u8> {
+    return re.expr;
+}
+
+// (*Regexp).NumSubexp: the number of parenthesized
+// subexpressions. Always 0 in wave 1b: there are no
+// groups in the minimal subset.
+fn go_regexp_num_subexp(re: &GoRegexp) -> i64 {
+    let _r = re;
+    return 0;
+}
+
+// (*Regexp).MatchString: does s contain any match?
+fn go_regexp_match_string(re: &GoRegexp, s: Vec<u8>) -> bool {
+    let m = __go_regexp_find_from(re, s, 0);
+    return m.found;
+}
+
+// (*Regexp).Match: does b contain any match?
+fn go_regexp_match(re: &GoRegexp, b: Vec<u8>) -> bool {
+    let m = __go_regexp_find_from(re, b, 0);
+    return m.found;
+}
+
+// regexp.MatchString(pattern, s): compile, then match.
+// Returns (matched, err); err is non-nil (target
+// 900038) for an invalid pattern.
+fn go_regexp_match_string_pattern(pattern: Vec<u8>, s: Vec<u8>) -> (bool, ptr) {
+    let (re, err) = go_regexp_compile(pattern);
+    if err != go_errors_nil() {
+        return (false, err);
+    };
+    return (go_regexp_match_string(&re, s), go_errors_nil());
+}
+
+// regexp.Match(pattern, b): compile, then match.
+fn go_regexp_match_pattern(pattern: Vec<u8>, b: Vec<u8>) -> (bool, ptr) {
+    let (re, err) = go_regexp_compile(pattern);
+    if err != go_errors_nil() {
+        return (false, err);
+    };
+    return (go_regexp_match(&re, b), go_errors_nil());
+}
+
+// (*Regexp).FindString: the text of the leftmost
+// match. (match, found): found false means no match;
+// Go returns "" for both no match and an empty match,
+// so the flag is what tells them apart here.
+fn go_regexp_find_string(re: &GoRegexp, s: Vec<u8>) -> (Vec<u8>, bool) {
+    let m = __go_regexp_find_from(re, s, 0);
+    if !m.found {
+        return (Vec::new(), false);
+    };
+    return (__go_regexp_slice(s, m.start, m.end), true);
+}
+
+// (*Regexp).Find: the bytes of the leftmost match.
+fn go_regexp_find(re: &GoRegexp, b: Vec<u8>) -> (Vec<u8>, bool) {
+    let m = __go_regexp_find_from(re, b, 0);
+    if !m.found {
+        return (Vec::new(), false);
+    };
+    return (__go_regexp_slice(b, m.start, m.end), true);
+}
+
+// (*Regexp).FindStringIndex: the location of the
+// leftmost match. found false means no match.
+fn go_regexp_find_string_index(re: &GoRegexp, s: Vec<u8>) -> GoRegexpMatch {
+    return __go_regexp_find_from(re, s, 0);
+}
+
+// (*Regexp).FindIndex: the location of the leftmost
+// match in a byte slice.
+fn go_regexp_find_index(re: &GoRegexp, b: Vec<u8>) -> GoRegexpMatch {
+    return __go_regexp_find_from(re, b, 0);
+}
+
+// (*Regexp).FindAllString: all matches, at most n
+// (n < 0: all; n == 0: none).
+fn go_regexp_find_all_string(re: &GoRegexp, s: Vec<u8>, n: i64) -> Vec<Vec<u8>> {
+    let matches = __go_regexp_find_all_index(re, s, n);
+    let out = Vec::new();
+    let i = 0;
+    while i < len(matches) {
+        let m = matches[i];
+        out.push(__go_regexp_slice(s, m.start, m.end));
+        i = i + 1;
+    }
+    return out;
+}
+
+// (*Regexp).FindAll: all matches in a byte slice.
+fn go_regexp_find_all(re: &GoRegexp, b: Vec<u8>, n: i64) -> Vec<Vec<u8>> {
+    let matches = __go_regexp_find_all_index(re, b, n);
+    let out = Vec::new();
+    let i = 0;
+    while i < len(matches) {
+        let m = matches[i];
+        out.push(__go_regexp_slice(b, m.start, m.end));
+        i = i + 1;
+    }
+    return out;
+}
+
+// (*Regexp).FindAllStringIndex: the locations of all
+// matches.
+fn go_regexp_find_all_string_index(re: &GoRegexp, s: Vec<u8>, n: i64) -> Vec<GoRegexpMatch> {
+    return __go_regexp_find_all_index(re, s, n);
+}
+
+// (*Regexp).FindAllIndex: the locations of all
+// matches in a byte slice.
+fn go_regexp_find_all_index(re: &GoRegexp, b: Vec<u8>, n: i64) -> Vec<GoRegexpMatch> {
+    return __go_regexp_find_all_index(re, b, n);
+}
+
+// (*Regexp).ReplaceAllString: copy src, replacing
+// matches with repl; $ in repl expands per Expand
+// ($$ is $, $0 is the whole match, other $names are
+// empty -- seam (b)).
+fn go_regexp_replace_all_string(re: &GoRegexp, src: Vec<u8>, repl: Vec<u8>) -> Vec<u8> {
+    return __go_regexp_replace_all(re, src, repl, false);
+}
+
+// (*Regexp).ReplaceAllLiteralString: repl is
+// substituted directly, with no $ expansion.
+fn go_regexp_replace_all_literal_string(re: &GoRegexp, src: Vec<u8>, repl: Vec<u8>) -> Vec<u8> {
+    return __go_regexp_replace_all(re, src, repl, true);
+}
+
+// (*Regexp).ReplaceAll: the byte-slice form of
+// ReplaceAllString.
+fn go_regexp_replace_all(re: &GoRegexp, src: Vec<u8>, repl: Vec<u8>) -> Vec<u8> {
+    return __go_regexp_replace_all(re, src, repl, false);
+}
+
+// (*Regexp).ReplaceAllLiteral: the byte-slice form of
+// ReplaceAllLiteralString.
+fn go_regexp_replace_all_literal(re: &GoRegexp, src: Vec<u8>, repl: Vec<u8>) -> Vec<u8> {
+    return __go_regexp_replace_all(re, src, repl, true);
+}

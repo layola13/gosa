@@ -1,0 +1,1324 @@
+// gostd bytes: the SLA-side model of Go's bytes
+// package over byte slices (Vec<u8>). Organisation
+// follows the psa_std precedent: public entry points
+// go_<pkg>_<name>, private helpers __go_<pkg>_<name>,
+// panic codes listed up front. The pure functions
+// mirror strings.sla (same algorithms, byte-slice
+// inputs); the case tables are the same ASCII +
+// Latin-1 subset Go's full Unicode tables are
+// replaced by -- see NOTES-text.md.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77404  bytes.Buffer.Grow with a negative count
+//          (Go panics the same way)
+//   77405  bytes.Buffer.Truncate / Next / Peek out of
+//          range (Go panics the same way)
+//   77406  a function that needs a Go value gostd
+//          cannot represent: a func(rune) value
+//          (Map, FieldsFunc, IndexFunc,
+//          LastIndexFunc, TrimFunc, TrimLeftFunc,
+//          TrimRightFunc, ContainsFunc), an
+//          iter.Seq iterator (FieldsSeq, SplitSeq,
+//          SplitAfterSeq, Lines), or a
+//          unicode.SpecialCase (ToUpperSpecial,
+//          ToLowerSpecial, ToTitleSpecial). Loud
+//          refusal: the frontend must refuse these
+//          at the call site; the stubs below panic
+//          if one is ever emitted.
+//
+// ErrTooLarge sentinel (target id; errors.sla
+// reserves the 900000-999999 range):
+//   900021 bytes.ErrTooLarge
+//          ("bytes.Buffer: too large")
+//
+// VALUE REPRESENTATION (gostd contract):
+//   Go []byte / string -> Vec<u8>
+//   Go byte            -> u8
+//   Go rune            -> i64 (GoRune.r)
+//   Go error           -> GosError heap ptr
+//   Go (T, error)      -> result structs below
+
+const GO_BYTES_MIN_READ: i64 = 512;
+
+// ---------- shared byte helpers ----------
+
+fn __go_b_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_b_slice(b: Vec<u8>, lo: i64, hi: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __go_b_eq(a: Vec<u8>, b: Vec<u8>) -> bool {
+    if len(a) != len(b) { return false; };
+    let i = 0;
+    while i < len(a) {
+        if a[i] != b[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn __go_b_match_at(s: Vec<u8>, i: i64, sep: Vec<u8>) -> bool {
+    if i + len(sep) > len(s) { return false; };
+    let k = 0;
+    while k < len(sep) {
+        if s[i + k] != sep[k] { return false; };
+        k = k + 1;
+    }
+    return true;
+}
+
+// unicode.IsSpace, gostd subset (same table as
+// strings.sla __go_str_is_space): ASCII whitespace
+// plus the Unicode spaces Go lists.
+fn __go_b_is_space(r: i64) -> bool {
+    if r == 9 { return true; };
+    if r == 10 { return true; };
+    if r == 11 { return true; };
+    if r == 12 { return true; };
+    if r == 13 { return true; };
+    if r == 32 { return true; };
+    if r == 133 { return true; };
+    if r == 160 { return true; };
+    if r == 5760 { return true; };
+    if r >= 8192 {
+        if r <= 8202 { return true; };
+    };
+    if r == 8232 { return true; };
+    if r == 8233 { return true; };
+    if r == 8239 { return true; };
+    if r == 8287 { return true; };
+    if r == 12288 { return true; };
+    return false;
+}
+
+// ---------- ErrTooLarge ----------
+
+// bytes.ErrTooLarge = "bytes.Buffer: too large"
+fn go_bytes_err_too_large() -> ptr {
+    let m = Vec::new();
+    m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(66u8); m.push(117u8); m.push(102u8); m.push(102u8);
+    m.push(101u8); m.push(114u8); m.push(58u8); m.push(32u8); m.push(116u8); m.push(111u8); m.push(111u8); m.push(32u8); m.push(108u8); m.push(97u8);
+    m.push(114u8); m.push(103u8); m.push(101u8);
+    return go_errors_new_with_id(m, 900021);
+}
+
+// ---------- pure functions ----------
+
+// bytes.Clone(b) []byte
+fn go_bytes_clone(b: Vec<u8>) -> Vec<u8> {
+    return __go_b_slice(b, 0, len(b));
+}
+
+// bytes.Compare(a, b) int
+fn go_bytes_compare(a: Vec<u8>, b: Vec<u8>) -> i64 {
+    let n = len(a);
+    if len(b) < n { n = len(b); };
+    let i = 0;
+    while i < n {
+        if a[i] != b[i] {
+            if a[i] < b[i] { return 0 - 1; };
+            return 1;
+        };
+        i = i + 1;
+    }
+    if len(a) < len(b) { return 0 - 1; };
+    if len(a) > len(b) { return 1; };
+    return 0;
+}
+
+// bytes.Contains(b, subslice) bool
+fn go_bytes_contains(b: Vec<u8>, subslice: Vec<u8>) -> bool {
+    return go_bytes_index(b, subslice) >= 0;
+}
+
+// bytes.ContainsAny(b, chars) bool: chars is a
+// string (Vec<u8>); any rune of chars in b.
+fn go_bytes_contains_any(b: Vec<u8>, chars: Vec<u8>) -> bool {
+    return go_bytes_index_any(b, chars) >= 0;
+}
+
+// bytes.ContainsRune(b, r) bool
+fn go_bytes_contains_rune(b: Vec<u8>, r: i64) -> bool {
+    return go_bytes_index_rune(b, r) >= 0;
+}
+
+// bytes.Count(s, sep) int: non-overlapping; empty
+// sep counts 1 + rune count (Go semantics).
+fn go_bytes_count(s: Vec<u8>, sep: Vec<u8>) -> i64 {
+    if len(sep) == 0 {
+        return 1 + __go_utf8_rune_count(s);
+    };
+    let n = 0;
+    let i = 0;
+    while i + len(sep) <= len(s) {
+        if __go_b_match_at(s, i, sep) {
+            n = n + 1;
+            i = i + len(sep);
+        } else {
+            i = i + 1;
+        };
+    }
+    return n;
+}
+
+// bytes.Cut(s, sep) (before, after, found)
+struct GoBytesCut {
+    before: Vec<u8>,
+    after: Vec<u8>,
+    found: bool,
+}
+
+fn go_bytes_cut(s: Vec<u8>, sep: Vec<u8>) -> GoBytesCut {
+    let i = go_bytes_index(s, sep);
+    if i < 0 {
+        return GoBytesCut { before: __go_b_slice(s, 0, len(s)), after: Vec::new(), found: false };
+    };
+    return GoBytesCut { before: __go_b_slice(s, 0, i), after: __go_b_slice(s, i + len(sep), len(s)), found: true };
+}
+
+// bytes.CutLast(s, sep) (before, after, found)
+fn go_bytes_cut_last(s: Vec<u8>, sep: Vec<u8>) -> GoBytesCut {
+    let i = go_bytes_last_index(s, sep);
+    if i < 0 {
+        return GoBytesCut { before: __go_b_slice(s, 0, len(s)), after: Vec::new(), found: false };
+    };
+    return GoBytesCut { before: __go_b_slice(s, 0, i), after: __go_b_slice(s, i + len(sep), len(s)), found: true };
+}
+
+// bytes.CutPrefix(s, prefix) (after, found)
+struct GoBytesCut2 {
+    v: Vec<u8>,
+    found: bool,
+}
+
+fn go_bytes_cut_prefix(s: Vec<u8>, prefix: Vec<u8>) -> GoBytesCut2 {
+    if go_bytes_has_prefix(s, prefix) {
+        return GoBytesCut2 { v: __go_b_slice(s, len(prefix), len(s)), found: true };
+    };
+    return GoBytesCut2 { v: __go_b_slice(s, 0, len(s)), found: false };
+}
+
+// bytes.CutSuffix(s, suffix) (before, found)
+fn go_bytes_cut_suffix(s: Vec<u8>, suffix: Vec<u8>) -> GoBytesCut2 {
+    if go_bytes_has_suffix(s, suffix) {
+        return GoBytesCut2 { v: __go_b_slice(s, 0, len(s) - len(suffix)), found: true };
+    };
+    return GoBytesCut2 { v: __go_b_slice(s, 0, len(s)), found: false };
+}
+
+// bytes.Equal(a, b) bool
+fn go_bytes_equal(a: Vec<u8>, b: Vec<u8>) -> bool {
+    return __go_b_eq(a, b);
+}
+
+// bytes.Fields(s) [][]byte: split on unicode spaces.
+fn go_bytes_fields(s: Vec<u8>) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        while i < len(s) {
+            let d = __go_utf8_decode(s, i);
+            if !__go_b_is_space(d.r) { break; };
+            i = i + d.size;
+        }
+        if i >= len(s) { break; };
+        let start = i;
+        while i < len(s) {
+            let d = __go_utf8_decode(s, i);
+            if __go_b_is_space(d.r) { break; };
+            i = i + d.size;
+        }
+        out.push(__go_b_slice(s, start, i));
+    }
+    return out;
+}
+
+// bytes.HasPrefix(s, prefix) bool
+fn go_bytes_has_prefix(s: Vec<u8>, prefix: Vec<u8>) -> bool {
+    return __go_b_match_at(s, 0, prefix);
+}
+
+// bytes.HasSuffix(s, suffix) bool
+fn go_bytes_has_suffix(s: Vec<u8>, suffix: Vec<u8>) -> bool {
+    if len(suffix) > len(s) { return false; };
+    return __go_b_match_at(s, len(s) - len(suffix), suffix);
+}
+
+// bytes.Index(s, sep) int
+fn go_bytes_index(s: Vec<u8>, sep: Vec<u8>) -> i64 {
+    if len(sep) == 0 { return 0; };
+    let i = 0;
+    while i + len(sep) <= len(s) {
+        if __go_b_match_at(s, i, sep) { return i; };
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// bytes.IndexAny(s, chars) int: first byte index
+// whose rune is in chars (chars is a string).
+fn go_bytes_index_any(s: Vec<u8>, chars: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        let j = 0;
+        while j < len(chars) {
+            let c = __go_utf8_decode(chars, j);
+            if d.r == c.r { return i; };
+            j = j + c.size;
+        }
+        i = i + d.size;
+    }
+    return 0 - 1;
+}
+
+// bytes.IndexByte(b, c) int
+fn go_bytes_index_byte(b: Vec<u8>, c: u8) -> i64 {
+    let i = 0;
+    while i < len(b) {
+        if b[i] == c { return i; };
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// bytes.IndexRune(s, r) int
+fn go_bytes_index_rune(s: Vec<u8>, r: i64) -> i64 {
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if d.r == r { return i; };
+        i = i + d.size;
+    }
+    return 0 - 1;
+}
+
+// bytes.Join(s [][]byte, sep []byte) []byte
+fn go_bytes_join(elems: Vec<Vec<u8>>, sep: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(elems) {
+        if i > 0 { __go_b_append(out, sep); };
+        __go_b_append(out, elems[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// bytes.LastIndex(s, sep) int
+fn go_bytes_last_index(s: Vec<u8>, sep: Vec<u8>) -> i64 {
+    if len(sep) == 0 { return len(s); };
+    if len(sep) > len(s) { return 0 - 1; };
+    let i = len(s) - len(sep);
+    while i >= 0 {
+        if __go_b_match_at(s, i, sep) { return i; };
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// bytes.LastIndexAny(s, chars) int
+fn go_bytes_last_index_any(s: Vec<u8>, chars: Vec<u8>) -> i64 {
+    let i = len(s);
+    while i > 0 {
+        // Step back to the previous rune start.
+        let j = i - 1;
+        while j > 0 {
+            if (s[j] as i64) < 128 { break; };
+            if (s[j] as i64) >= 192 { break; };
+            j = j - 1;
+        }
+        let d = __go_utf8_decode(s, j);
+        let k = 0;
+        while k < len(chars) {
+            let c = __go_utf8_decode(chars, k);
+            if d.r == c.r { return j; };
+            k = k + c.size;
+        }
+        i = j;
+    }
+    return 0 - 1;
+}
+
+// bytes.LastIndexByte(b, c) int
+fn go_bytes_last_index_byte(b: Vec<u8>, c: u8) -> i64 {
+    let i = len(b) - 1;
+    while i >= 0 {
+        if b[i] == c { return i; };
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// bytes.LastIndexRune(s, r) int: same walk as
+// LastIndexAny, single rune.
+fn go_bytes_last_index_rune(s: Vec<u8>, r: i64) -> i64 {
+    let i = len(s);
+    while i > 0 {
+        let j = i - 1;
+        while j > 0 {
+            if (s[j] as i64) < 128 { break; };
+            if (s[j] as i64) >= 192 { break; };
+            j = j - 1;
+        }
+        let d = __go_utf8_decode(s, j);
+        if d.r == r { return j; };
+        i = j;
+    }
+    return 0 - 1;
+}
+
+// ---------- split ----------
+
+fn __go_b_explode(s: Vec<u8>) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    if len(s) == 0 {
+        out.push(Vec::new());
+        return out;
+    };
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        out.push(__go_b_slice(s, i, i + d.size));
+        i = i + d.size;
+    }
+    return out;
+}
+
+// genSplit workhorse (mirrors strings.sla).
+fn __go_b_gen_split(s: Vec<u8>, sep: Vec<u8>, after: bool, n: i64) -> Vec<Vec<u8>> {
+    if n == 0 { return Vec::new(); };
+    if len(sep) == 0 {
+        let all = __go_b_explode(s);
+        if n < 0 { return all; };
+        if n >= len(all) { return all; };
+        let out = Vec::new();
+        let i = 0;
+        let bytepos = 0;
+        while i < len(s) {
+            if len(out) == n - 1 { break; };
+            let d = __go_utf8_decode(s, i);
+            out.push(__go_b_slice(s, i, i + d.size));
+            i = i + d.size;
+            bytepos = i;
+        }
+        out.push(__go_b_slice(s, bytepos, len(s)));
+        return out;
+    };
+    let out = Vec::new();
+    let start = 0;
+    let i = 0;
+    while i + len(sep) <= len(s) {
+        if n > 0 {
+            if len(out) == n - 1 { break; };
+        };
+        if __go_b_match_at(s, i, sep) {
+            let end = i;
+            if after { end = i + len(sep); };
+            out.push(__go_b_slice(s, start, end));
+            start = i + len(sep);
+            if after { start = end; };
+            i = i + len(sep);
+        } else {
+            i = i + 1;
+        };
+    }
+    out.push(__go_b_slice(s, start, len(s)));
+    return out;
+}
+
+// bytes.Split / SplitN / SplitAfter / SplitAfterN
+fn go_bytes_split(s: Vec<u8>, sep: Vec<u8>) -> Vec<Vec<u8>> {
+    return __go_b_gen_split(s, sep, false, -1);
+}
+
+fn go_bytes_split_n(s: Vec<u8>, sep: Vec<u8>, n: i64) -> Vec<Vec<u8>> {
+    return __go_b_gen_split(s, sep, false, n);
+}
+
+fn go_bytes_split_after(s: Vec<u8>, sep: Vec<u8>) -> Vec<Vec<u8>> {
+    return __go_b_gen_split(s, sep, true, -1);
+}
+
+fn go_bytes_split_after_n(s: Vec<u8>, sep: Vec<u8>, n: i64) -> Vec<Vec<u8>> {
+    return __go_b_gen_split(s, sep, true, n);
+}
+
+// ---------- replace ----------
+
+// bytes.Replace(s, old, new, n): n < 0 replaces
+// all. Empty old matches at every rune boundary.
+fn go_bytes_replace(s: Vec<u8>, old: Vec<u8>, newv: Vec<u8>, n: i64) -> Vec<u8> {
+    if n == 0 { return __go_b_slice(s, 0, len(s)); };
+    if __go_b_eq(old, newv) { return __go_b_slice(s, 0, len(s)); };
+    let out = Vec::new();
+    if len(old) == 0 {
+        let done = 0;
+        let i = 0;
+        if n < 0 || done < n {
+            __go_b_append(out, newv);
+            done = done + 1;
+        };
+        while i < len(s) {
+            let d = __go_utf8_decode(s, i);
+            let k = 0;
+            while k < d.size {
+                out.push(s[i + k]);
+                k = k + 1;
+            }
+            i = i + d.size;
+            if n < 0 || done < n {
+                __go_b_append(out, newv);
+                done = done + 1;
+            };
+        }
+        return out;
+    };
+    let done = 0;
+    let i = 0;
+    while i < len(s) {
+        if (n < 0 || done < n) && __go_b_match_at(s, i, old) {
+            __go_b_append(out, newv);
+            done = done + 1;
+            i = i + len(old);
+        } else {
+            out.push(s[i]);
+            i = i + 1;
+        };
+    }
+    return out;
+}
+
+// bytes.ReplaceAll(s, old, new)
+fn go_bytes_replace_all(s: Vec<u8>, old: Vec<u8>, newv: Vec<u8>) -> Vec<u8> {
+    return go_bytes_replace(s, old, newv, -1);
+}
+
+// bytes.Runes(s) []rune
+fn go_bytes_runes(s: Vec<u8>) -> Vec<i64> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        out.push(d.r);
+        i = i + d.size;
+    }
+    return out;
+}
+
+// ---------- case mapping ----------
+
+// ASCII + Latin-1 supplement simple case mappings
+// (same subset as strings.sla; Go uses the full
+// Unicode tables, which gostd does not carry).
+fn __go_b_to_upper_rune(r: i64) -> i64 {
+    if r >= 97 {
+        if r <= 122 { return r - 32; };
+    };
+    if r >= 224 {
+        if r <= 254 {
+            if r != 247 { return r - 32; };
+        };
+    };
+    if r == 255 { return 376; };
+    if r == 181 { return 924; };
+    if r == 223 { return 7838; };
+    return r;
+}
+
+fn __go_b_to_lower_rune(r: i64) -> i64 {
+    if r >= 65 {
+        if r <= 90 { return r + 32; };
+    };
+    if r >= 192 {
+        if r <= 222 {
+            if r != 215 { return r + 32; };
+        };
+    };
+    if r == 376 { return 255; };
+    if r == 924 { return 956; };
+    if r == 7838 { return 223; };
+    if r == 8490 { return 107; };
+    return r;
+}
+
+fn __go_b_map_runes(s: Vec<u8>, upper: bool) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if d.ok {
+            let m = d.r;
+            if upper {
+                m = __go_b_to_upper_rune(d.r);
+            } else {
+                m = __go_b_to_lower_rune(d.r);
+            };
+            __go_utf8_append(out, m);
+        } else {
+            out.push(s[i]);
+        };
+        i = i + d.size;
+    }
+    return out;
+}
+
+// bytes.ToUpper / ToLower
+fn go_bytes_to_upper(s: Vec<u8>) -> Vec<u8> {
+    return __go_b_map_runes(s, true);
+}
+
+fn go_bytes_to_lower(s: Vec<u8>) -> Vec<u8> {
+    return __go_b_map_runes(s, false);
+}
+
+// bytes.ToTitle: every rune title-cased. Over the
+// ASCII + Latin-1 subset ToTitle agrees with
+// ToUpper (digraph title forms live outside it).
+fn go_bytes_to_title(s: Vec<u8>) -> Vec<u8> {
+    return __go_b_map_runes(s, true);
+}
+
+// bytes.Title: title-case the first letter of each
+// word (words start after a unicode space).
+fn go_bytes_title(s: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let prev_sep = true;
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if d.ok {
+            if prev_sep {
+                __go_utf8_append(out, __go_b_to_upper_rune(d.r));
+            } else {
+                __go_utf8_append(out, __go_b_to_lower_rune(d.r));
+            };
+            prev_sep = __go_b_is_space(d.r);
+        } else {
+            out.push(s[i]);
+            prev_sep = false;
+        };
+        i = i + d.size;
+    }
+    return out;
+}
+
+// ---------- EqualFold ----------
+
+// unicode.SimpleFold, gostd subset (mirrors
+// strings.sla): ASCII letters plus the K/k/KELVIN
+// and S/s/LONG-S cycles.
+fn __go_b_simple_fold(r: i64) -> i64 {
+    if r >= 65 {
+        if r <= 90 {
+            if r == 75 { return 107; };
+            if r == 83 { return 115; };
+            return r + 32;
+        };
+    };
+    if r >= 97 {
+        if r <= 122 {
+            if r == 107 { return 8490; };
+            if r == 115 { return 383; };
+            return r - 32;
+        };
+    };
+    if r == 8490 { return 75; };
+    if r == 383 { return 83; };
+    return r;
+}
+
+fn __go_b_fold_eq(a: i64, b: i64) -> bool {
+    if a == b { return true; };
+    let f = __go_b_simple_fold(a);
+    while f != a {
+        if f == b { return true; };
+        f = __go_b_simple_fold(f);
+    }
+    return false;
+}
+
+// bytes.EqualFold(s, t) bool
+fn go_bytes_equal_fold(s: Vec<u8>, t: Vec<u8>) -> bool {
+    let i = 0;
+    let j = 0;
+    while i < len(s) {
+        if j >= len(t) { return false; };
+        let d1 = __go_utf8_decode(s, i);
+        let d2 = __go_utf8_decode(t, j);
+        if !__go_b_fold_eq(d1.r, d2.r) { return false; };
+        i = i + d1.size;
+        j = j + d2.size;
+    }
+    if j < len(t) { return false; };
+    return true;
+}
+
+// ---------- trim ----------
+
+fn __go_b_in_cutset(r: i64, cutset: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(cutset) {
+        let d = __go_utf8_decode(cutset, i);
+        if d.r == r { return true; };
+        i = i + d.size;
+    }
+    return false;
+}
+
+// bytes.Trim(s, cutset) []byte
+fn go_bytes_trim(s: Vec<u8>, cutset: Vec<u8>) -> Vec<u8> {
+    return go_bytes_trim_right(go_bytes_trim_left(s, cutset), cutset);
+}
+
+fn go_bytes_trim_left(s: Vec<u8>, cutset: Vec<u8>) -> Vec<u8> {
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if !__go_b_in_cutset(d.r, cutset) { break; };
+        i = i + d.size;
+    }
+    return __go_b_slice(s, i, len(s));
+}
+
+fn go_bytes_trim_right(s: Vec<u8>, cutset: Vec<u8>) -> Vec<u8> {
+    let i = len(s);
+    while i > 0 {
+        let j = i - 1;
+        while j > 0 {
+            if (s[j] as i64) < 128 { break; };
+            if (s[j] as i64) >= 192 { break; };
+            j = j - 1;
+        }
+        let d = __go_utf8_decode(s, j);
+        if !__go_b_in_cutset(d.r, cutset) { break; };
+        i = j;
+    }
+    return __go_b_slice(s, 0, i);
+}
+
+// bytes.TrimSpace(s) []byte
+fn go_bytes_trim_space(s: Vec<u8>) -> Vec<u8> {
+    let lo = 0;
+    while lo < len(s) {
+        let d = __go_utf8_decode(s, lo);
+        if !__go_b_is_space(d.r) { break; };
+        lo = lo + d.size;
+    }
+    let hi = len(s);
+    while hi > lo {
+        let j = hi - 1;
+        while j > lo {
+            if (s[j] as i64) < 128 { break; };
+            if (s[j] as i64) >= 192 { break; };
+            j = j - 1;
+        }
+        let d = __go_utf8_decode(s, j);
+        if !__go_b_is_space(d.r) { break; };
+        hi = j;
+    }
+    return __go_b_slice(s, lo, hi);
+}
+
+// bytes.TrimPrefix / TrimSuffix
+fn go_bytes_trim_prefix(s: Vec<u8>, prefix: Vec<u8>) -> Vec<u8> {
+    if go_bytes_has_prefix(s, prefix) {
+        return __go_b_slice(s, len(prefix), len(s));
+    };
+    return __go_b_slice(s, 0, len(s));
+}
+
+fn go_bytes_trim_suffix(s: Vec<u8>, suffix: Vec<u8>) -> Vec<u8> {
+    if go_bytes_has_suffix(s, suffix) {
+        return __go_b_slice(s, 0, len(s) - len(suffix));
+    };
+    return __go_b_slice(s, 0, len(s));
+}
+
+// bytes.ToValidUTF8(s, replacement) []byte: each
+// RUN of invalid bytes is replaced by one copy of
+// the replacement (Go semantics).
+fn go_bytes_to_valid_utf8(s: Vec<u8>, replacement: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let invalid = false;
+    let i = 0;
+    while i < len(s) {
+        let c = s[i] as i64;
+        if c < 128 {
+            out.push(s[i]);
+            invalid = false;
+            i = i + 1;
+            continue;
+        };
+        let d = __go_utf8_decode(s, i);
+        if !d.ok {
+            i = i + 1;
+            if !invalid {
+                invalid = true;
+                __go_b_append(out, replacement);
+            };
+            continue;
+        };
+        invalid = false;
+        let k = 0;
+        while k < d.size {
+            out.push(s[i + k]);
+            k = k + 1;
+        }
+        i = i + d.size;
+    }
+    return out;
+}
+
+// ---------- callback / iterator refusals (77406) ----------
+
+// These need a Go func value, an iter.Seq iterator,
+// or a unicode.SpecialCase -- none of which gostd
+// can represent. The frontend must refuse them at
+// the call site; the stubs panic if ever emitted.
+fn go_bytes_contains_func(b: Vec<u8>) -> bool {
+    panic(77406);
+}
+
+fn go_bytes_fields_func(s: Vec<u8>) -> Vec<Vec<u8>> {
+    panic(77406);
+}
+
+fn go_bytes_fields_func_seq(s: Vec<u8>) -> Vec<Vec<u8>> {
+    panic(77406);
+}
+
+fn go_bytes_fields_seq(s: Vec<u8>) -> Vec<Vec<u8>> {
+    panic(77406);
+}
+
+fn go_bytes_index_func(s: Vec<u8>) -> i64 {
+    panic(77406);
+}
+
+fn go_bytes_last_index_func(s: Vec<u8>) -> i64 {
+    panic(77406);
+}
+
+fn go_bytes_lines(s: Vec<u8>) -> Vec<Vec<u8>> {
+    panic(77406);
+}
+
+fn go_bytes_map(s: Vec<u8>) -> Vec<u8> {
+    panic(77406);
+}
+
+fn go_bytes_split_after_seq(s: Vec<u8>, sep: Vec<u8>) -> Vec<Vec<u8>> {
+    panic(77406);
+}
+
+fn go_bytes_split_seq(s: Vec<u8>, sep: Vec<u8>) -> Vec<Vec<u8>> {
+    panic(77406);
+}
+
+fn go_bytes_to_lower_special(s: Vec<u8>) -> Vec<u8> {
+    panic(77406);
+}
+
+fn go_bytes_to_title_special(s: Vec<u8>) -> Vec<u8> {
+    panic(77406);
+}
+
+fn go_bytes_to_upper_special(s: Vec<u8>) -> Vec<u8> {
+    panic(77406);
+}
+
+fn go_bytes_trim_func(s: Vec<u8>) -> Vec<u8> {
+    panic(77406);
+}
+
+fn go_bytes_trim_left_func(s: Vec<u8>) -> Vec<u8> {
+    panic(77406);
+}
+
+fn go_bytes_trim_right_func(s: Vec<u8>) -> Vec<u8> {
+    panic(77406);
+}
+
+// ---------- Buffer ----------
+
+// bytes.Buffer: a growable byte buffer. off is the
+// read offset; last_read tracks the last read op
+// for UnreadByte/UnreadRune using Go's readOp
+// encoding: -1 = any other read (Read, ReadByte,
+// ReadBytes, Next), 0 = non-read, 1..4 = ReadRune
+// of that rune size.
+struct GosBuffer {
+    buf: Vec<u8>,
+    off: i64,
+    last_read: i64,
+}
+
+struct GoBytesResult {
+    n: i64,
+    err: ptr,
+}
+
+struct GoBytesLine {
+    v: Vec<u8>,
+    err: ptr,
+}
+
+struct GoBytesRune {
+    r: i64,
+    size: i64,
+    err: ptr,
+}
+
+fn go_bytes_new_buffer(buf: Vec<u8>) -> GosBuffer {
+    return GosBuffer { buf: __go_b_slice(buf, 0, len(buf)), off: 0, last_read: 0 };
+}
+
+fn go_bytes_new_buffer_string(s: Vec<u8>) -> GosBuffer {
+    return GosBuffer { buf: __go_b_slice(s, 0, len(s)), off: 0, last_read: 0 };
+}
+
+fn go_bytes_buffer_len(b: &GosBuffer) -> i64 {
+    return len(b.buf) - b.off;
+}
+
+// Available: capacity headroom. gostd's Vec has no
+// capacity surface, so this is 0 (documented
+// divergence; Go reports cap - len).
+fn go_bytes_buffer_available(b: &GosBuffer) -> i64 {
+    return 0;
+}
+
+// AvailableBuffer: the writable capacity as a
+// slice. No capacity surface in gostd: empty.
+fn go_bytes_buffer_available_buffer(b: &GosBuffer) -> Vec<u8> {
+    return Vec::new();
+}
+
+fn go_bytes_buffer_bytes(b: &GosBuffer) -> Vec<u8> {
+    return __go_b_slice(b.buf, b.off, len(b.buf));
+}
+
+// Cap: no capacity surface; returns Len.
+fn go_bytes_buffer_cap(b: &GosBuffer) -> i64 {
+    return go_bytes_buffer_len(b);
+}
+
+// Grow(n): a capacity hint in Go; gostd's Vec grows
+// on push, so this is a no-op except that a
+// negative n panics (Go: "bytes.Buffer.Grow:
+// negative count").
+fn go_bytes_buffer_grow(b: &GosBuffer, n: i64) -> void {
+    if n < 0 { panic(77404); };
+    return;
+}
+
+// Next(n): the next n bytes, advancing. Go panics
+// on a negative n via slice bounds (77405 here).
+fn go_bytes_buffer_next(b: &GosBuffer, n: i64) -> Vec<u8> {
+    if n < 0 { panic(77405); };
+    b.last_read = 0;
+    let m = go_bytes_buffer_len(b);
+    if n > m { n = m; };
+    let out = __go_b_slice(b.buf, b.off, b.off + n);
+    b.off = b.off + n;
+    if n > 0 { b.last_read = 0 - 1; };
+    return out;
+}
+
+// Peek(n): the next n bytes without advancing; a
+// short read returns the rest + EOF. Negative n
+// panics (Go: slice bounds).
+fn go_bytes_buffer_peek(b: &GosBuffer, n: i64) -> GoBytesLine {
+    if n < 0 { panic(77405); };
+    if go_bytes_buffer_len(b) < n {
+        return GoBytesLine { v: __go_b_slice(b.buf, b.off, len(b.buf)), err: go_strings_eof() };
+    };
+    return GoBytesLine { v: __go_b_slice(b.buf, b.off, b.off + n), err: go_errors_nil() };
+}
+
+fn go_bytes_buffer_read(b: &GosBuffer, dst: Vec<u8>, max: i64) -> GoBytesResult {
+    b.last_read = 0;
+    let m = go_bytes_buffer_len(b);
+    if m > max { m = max; };
+    if m <= 0 {
+        return GoBytesResult { n: 0, err: go_strings_eof() };
+    };
+    let i = 0;
+    while i < m {
+        dst.push(b.buf[b.off + i]);
+        i = i + 1;
+    }
+    b.off = b.off + m;
+    if m > 0 { b.last_read = 0 - 1; };
+    return GoBytesResult { n: m, err: go_errors_nil() };
+}
+
+fn go_bytes_buffer_read_byte(b: &GosBuffer) -> GoBytesRune {
+    if go_bytes_buffer_len(b) <= 0 {
+        return GoBytesRune { r: 0, size: 0, err: go_strings_eof() };
+    };
+    let c = b.buf[b.off] as i64;
+    b.off = b.off + 1;
+    b.last_read = 0 - 1;
+    return GoBytesRune { r: c, size: 1, err: go_errors_nil() };
+}
+
+// ReadBytes(delim): through the delimiter
+// inclusive; EOF when the delimiter is absent
+// (the bytes read so far are still returned).
+fn go_bytes_buffer_read_bytes(b: &GosBuffer, delim: u8) -> GoBytesLine {
+    let i = b.off;
+    while i < len(b.buf) {
+        if b.buf[i] == delim {
+            let out = __go_b_slice(b.buf, b.off, i + 1);
+            b.off = i + 1;
+            b.last_read = 0 - 1;
+            return GoBytesLine { v: out, err: go_errors_nil() };
+        };
+        i = i + 1;
+    }
+    let out = __go_b_slice(b.buf, b.off, len(b.buf));
+    b.off = len(b.buf);
+    b.last_read = 0 - 1;
+    return GoBytesLine { v: out, err: go_strings_eof() };
+}
+
+// ReadFrom(r): the slice form appends src.
+fn go_bytes_buffer_read_from(b: &GosBuffer, src: Vec<u8>) -> GoBytesResult {
+    b.last_read = 0;
+    __go_b_append(b.buf, src);
+    return GoBytesResult { n: len(src), err: go_errors_nil() };
+}
+
+fn go_bytes_buffer_read_rune(b: &GosBuffer) -> GoBytesRune {
+    if go_bytes_buffer_len(b) <= 0 {
+        return GoBytesRune { r: 0, size: 0, err: go_strings_eof() };
+    };
+    let c = b.buf[b.off] as i64;
+    if c < 128 {
+        b.off = b.off + 1;
+        b.last_read = 1;
+        return GoBytesRune { r: c, size: 1, err: go_errors_nil() };
+    };
+    let d = __go_utf8_decode(b.buf, b.off);
+    b.off = b.off + d.size;
+    b.last_read = d.size;
+    return GoBytesRune { r: d.r, size: d.size, err: go_errors_nil() };
+}
+
+fn go_bytes_buffer_read_string(b: &GosBuffer, delim: u8) -> GoBytesLine {
+    return go_bytes_buffer_read_bytes(b, delim);
+}
+
+fn go_bytes_buffer_reset(b: &GosBuffer) -> void {
+    b.buf = Vec::new();
+    b.off = 0;
+    b.last_read = 0;
+    return;
+}
+
+fn go_bytes_buffer_string(b: &GosBuffer) -> Vec<u8> {
+    return __go_b_slice(b.buf, b.off, len(b.buf));
+}
+
+// Truncate(n): keep the first n unread bytes.
+// Panics when n < 0 or n > Len (Go: "bytes.Buffer:
+// truncation out of range"). n == 0 resets.
+fn go_bytes_buffer_truncate(b: &GosBuffer, n: i64) -> void {
+    if n == 0 {
+        go_bytes_buffer_reset(b);
+        return;
+    };
+    b.last_read = 0;
+    if n < 0 { panic(77405); };
+    if n > go_bytes_buffer_len(b) { panic(77405); };
+    // Rebuild the buffer so the unread tail is
+    // exactly the first n unread bytes.
+    let kept = __go_b_slice(b.buf, b.off, b.off + n);
+    b.buf = kept;
+    b.off = 0;
+    return;
+}
+
+// UnreadByte: Go errors only when the last op was
+// not a read ("bytes.Buffer: UnreadByte: previous
+// operation was not a successful read"); any read
+// qualifies, and it steps back one byte if off > 0.
+fn go_bytes_buffer_unread_byte(b: &GosBuffer) -> ptr {
+    if b.last_read == 0 {
+        let m = Vec::new();
+        m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(66u8); m.push(117u8); m.push(102u8); m.push(102u8);
+        m.push(101u8); m.push(114u8); m.push(58u8); m.push(32u8); m.push(85u8); m.push(110u8); m.push(114u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(66u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(58u8); m.push(32u8); m.push(112u8); m.push(114u8); m.push(101u8); m.push(118u8);
+        m.push(105u8); m.push(111u8); m.push(117u8); m.push(115u8); m.push(32u8); m.push(111u8); m.push(112u8); m.push(101u8); m.push(114u8); m.push(97u8);
+        m.push(116u8); m.push(105u8); m.push(111u8); m.push(110u8); m.push(32u8); m.push(119u8); m.push(97u8); m.push(115u8); m.push(32u8); m.push(110u8);
+        m.push(111u8); m.push(116u8); m.push(32u8); m.push(97u8); m.push(32u8); m.push(115u8); m.push(117u8); m.push(99u8); m.push(99u8); m.push(101u8);
+        m.push(115u8); m.push(115u8); m.push(102u8); m.push(117u8); m.push(108u8); m.push(32u8); m.push(114u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        return go_errors_new(m);
+    };
+    b.last_read = 0;
+    if b.off > 0 { b.off = b.off - 1; };
+    return go_errors_nil();
+}
+
+// UnreadRune: Go errors unless the last op was a
+// ReadRune (last_read 1..4 = the rune size); it
+// steps back by that size.
+fn go_bytes_buffer_unread_rune(b: &GosBuffer) -> ptr {
+    if b.last_read <= 0 {
+        let m = Vec::new();
+        m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(66u8); m.push(117u8); m.push(102u8); m.push(102u8);
+        m.push(101u8); m.push(114u8); m.push(58u8); m.push(32u8); m.push(85u8); m.push(110u8); m.push(114u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(82u8); m.push(117u8); m.push(110u8); m.push(101u8); m.push(58u8); m.push(32u8); m.push(112u8); m.push(114u8); m.push(101u8); m.push(118u8);
+        m.push(105u8); m.push(111u8); m.push(117u8); m.push(115u8); m.push(32u8); m.push(111u8); m.push(112u8); m.push(101u8); m.push(114u8); m.push(97u8);
+        m.push(116u8); m.push(105u8); m.push(111u8); m.push(110u8); m.push(32u8); m.push(119u8); m.push(97u8); m.push(115u8); m.push(32u8); m.push(110u8);
+        m.push(111u8); m.push(116u8); m.push(32u8); m.push(97u8); m.push(32u8); m.push(115u8); m.push(117u8); m.push(99u8); m.push(99u8); m.push(101u8);
+        m.push(115u8); m.push(115u8); m.push(102u8); m.push(117u8); m.push(108u8); m.push(32u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(82u8); m.push(117u8); m.push(110u8); m.push(101u8);
+        return go_errors_new(m);
+    };
+    if b.off >= b.last_read { b.off = b.off - b.last_read; };
+    b.last_read = 0;
+    return go_errors_nil();
+}
+
+fn go_bytes_buffer_write(b: &GosBuffer, p: Vec<u8>) -> GoBytesResult {
+    b.last_read = 0;
+    __go_b_append(b.buf, p);
+    return GoBytesResult { n: len(p), err: go_errors_nil() };
+}
+
+fn go_bytes_buffer_write_byte(b: &GosBuffer, c: u8) -> ptr {
+    b.last_read = 0;
+    b.buf.push(c);
+    return go_errors_nil();
+}
+
+fn go_bytes_buffer_write_rune(b: &GosBuffer, r: i64) -> GoBytesResult {
+    b.last_read = 0;
+    let before = len(b.buf);
+    __go_utf8_append(b.buf, r);
+    return GoBytesResult { n: len(b.buf) - before, err: go_errors_nil() };
+}
+
+fn go_bytes_buffer_write_string(b: &GosBuffer, s: Vec<u8>) -> GoBytesResult {
+    b.last_read = 0;
+    __go_b_append(b.buf, s);
+    return GoBytesResult { n: len(s), err: go_errors_nil() };
+}
+
+// WriteTo(w): the slice form appends the unread
+// bytes to dst and drains the buffer.
+fn go_bytes_buffer_write_to(b: &GosBuffer, dst: Vec<u8>) -> GoBytesResult {
+    let n = go_bytes_buffer_len(b);
+    __go_b_append(dst, __go_b_slice(b.buf, b.off, len(b.buf)));
+    b.off = len(b.buf);
+    b.last_read = 0;
+    return GoBytesResult { n: n, err: go_errors_nil() };
+}
+
+// ---------- Reader ----------
+
+// bytes.Reader: a read-only reader over a fixed
+// slice, with seeking. prev holds the index of the
+// previous rune (set by ReadRune), or -1.
+struct GosBytesReader {
+    b: Vec<u8>,
+    i: i64,
+    prev: i64,
+}
+
+fn go_bytes_new_reader(b: Vec<u8>) -> GosBytesReader {
+    return GosBytesReader { b: b, i: 0, prev: -1 };
+}
+
+fn go_bytes_reader_len(r: &GosBytesReader) -> i64 {
+    let n = len(r.b) - r.i;
+    if n < 0 { return 0; };
+    return n;
+}
+
+fn go_bytes_reader_size(r: &GosBytesReader) -> i64 {
+    return len(r.b);
+}
+
+fn go_bytes_reader_read(r: &GosBytesReader, dst: Vec<u8>, max: i64) -> GoBytesResult {
+    if r.i >= len(r.b) {
+        return GoBytesResult { n: 0, err: go_strings_eof() };
+    };
+    r.prev = -1;
+    let n = 0;
+    while n < max {
+        if r.i >= len(r.b) { break; };
+        dst.push(r.b[r.i]);
+        r.i = r.i + 1;
+        n = n + 1;
+    }
+    return GoBytesResult { n: n, err: go_errors_nil() };
+}
+
+// ReadAt(b, off): off < 0 -> error; a short read
+// ends with EOF.
+fn go_bytes_reader_read_at(r: &GosBytesReader, dst: Vec<u8>, max: i64, off: i64) -> GoBytesResult {
+    if off < 0 {
+        let m = Vec::new();
+        m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(101u8); m.push(114u8); m.push(46u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8); m.push(65u8); m.push(116u8); m.push(58u8);
+        m.push(32u8); m.push(110u8); m.push(101u8); m.push(103u8); m.push(97u8); m.push(116u8); m.push(105u8); m.push(118u8); m.push(101u8); m.push(32u8);
+        m.push(111u8); m.push(102u8); m.push(102u8); m.push(115u8); m.push(101u8); m.push(116u8);
+        return GoBytesResult { n: 0, err: go_errors_new(m) };
+    };
+    if off >= len(r.b) {
+        return GoBytesResult { n: 0, err: go_strings_eof() };
+    };
+    let n = 0;
+    while n < max {
+        if off + n >= len(r.b) { break; };
+        dst.push(r.b[off + n]);
+        n = n + 1;
+    }
+    if n < max {
+        return GoBytesResult { n: n, err: go_strings_eof() };
+    };
+    return GoBytesResult { n: n, err: go_errors_nil() };
+}
+
+fn go_bytes_reader_read_byte(r: &GosBytesReader) -> GoBytesRune {
+    if r.i >= len(r.b) {
+        return GoBytesRune { r: 0, size: 0, err: go_strings_eof() };
+    };
+    let c = r.b[r.i] as i64;
+    r.i = r.i + 1;
+    r.prev = -1;
+    return GoBytesRune { r: c, size: 1, err: go_errors_nil() };
+}
+
+fn go_bytes_reader_read_rune(r: &GosBytesReader) -> GoBytesRune {
+    if r.i >= len(r.b) {
+        return GoBytesRune { r: 0, size: 0, err: go_strings_eof() };
+    };
+    let d = __go_utf8_decode(r.b, r.i);
+    r.prev = r.i;
+    r.i = r.i + d.size;
+    return GoBytesRune { r: d.r, size: d.size, err: go_errors_nil() };
+}
+
+fn go_bytes_reader_reset(r: &GosBytesReader, b: Vec<u8>) -> void {
+    r.b = b;
+    r.i = 0;
+    r.prev = -1;
+    return;
+}
+
+// Seek: whence 0/1/2; invalid whence or a
+// negative resulting position returns an error
+// (Go: "bytes.Reader.Seek: invalid whence" /
+// "bytes.Reader.Seek: negative position").
+fn go_bytes_reader_seek(r: &GosBytesReader, offset: i64, whence: i64) -> GoBytesResult {
+    let base = 0;
+    if whence == 0 {
+        base = 0;
+    } else {
+        if whence == 1 {
+            base = r.i;
+        } else {
+            if whence == 2 {
+                base = len(r.b);
+            } else {
+                let m = Vec::new();
+                m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8);
+                m.push(101u8); m.push(114u8); m.push(46u8); m.push(83u8); m.push(101u8); m.push(101u8); m.push(107u8); m.push(58u8); m.push(32u8); m.push(105u8);
+                m.push(110u8); m.push(118u8); m.push(97u8); m.push(108u8); m.push(105u8); m.push(100u8); m.push(32u8); m.push(119u8); m.push(104u8); m.push(101u8);
+                m.push(110u8); m.push(99u8); m.push(101u8);
+                return GoBytesResult { n: 0, err: go_errors_new(m) };
+            };
+        };
+    };
+    let np = base + offset;
+    if np < 0 {
+        let m = Vec::new();
+        m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(101u8); m.push(114u8); m.push(46u8); m.push(83u8); m.push(101u8); m.push(101u8); m.push(107u8); m.push(58u8); m.push(32u8); m.push(110u8);
+        m.push(101u8); m.push(103u8); m.push(97u8); m.push(116u8); m.push(105u8); m.push(118u8); m.push(101u8); m.push(32u8); m.push(112u8); m.push(111u8);
+        m.push(115u8); m.push(105u8); m.push(116u8); m.push(105u8); m.push(111u8); m.push(110u8);
+        return GoBytesResult { n: 0, err: go_errors_new(m) };
+    };
+    r.i = np;
+    r.prev = -1;
+    return GoBytesResult { n: np, err: go_errors_nil() };
+}
+
+// UnreadByte: Go errors only at the beginning of
+// the slice; any read qualifies, it steps back one
+// byte.
+fn go_bytes_reader_unread_byte(r: &GosBytesReader) -> ptr {
+    if r.i <= 0 {
+        let m = Vec::new();
+        m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(101u8); m.push(114u8); m.push(46u8); m.push(85u8); m.push(110u8); m.push(114u8); m.push(101u8); m.push(97u8); m.push(100u8); m.push(66u8);
+        m.push(121u8); m.push(116u8); m.push(101u8); m.push(58u8); m.push(32u8); m.push(97u8); m.push(116u8); m.push(32u8); m.push(98u8); m.push(101u8);
+        m.push(103u8); m.push(105u8); m.push(110u8); m.push(110u8); m.push(105u8); m.push(110u8); m.push(103u8); m.push(32u8); m.push(111u8); m.push(102u8);
+        m.push(32u8); m.push(115u8); m.push(108u8); m.push(105u8); m.push(99u8); m.push(101u8);
+        return go_errors_new(m);
+    };
+    r.prev = -1;
+    r.i = r.i - 1;
+    return go_errors_nil();
+}
+
+// UnreadRune: Go errors at the beginning of the
+// slice, or when the previous operation was not
+// ReadRune; it rewinds to the previous rune's index.
+fn go_bytes_reader_unread_rune(r: &GosBytesReader) -> ptr {
+    if r.i <= 0 {
+        let m = Vec::new();
+        m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(101u8); m.push(114u8); m.push(46u8); m.push(85u8); m.push(110u8); m.push(114u8); m.push(101u8); m.push(97u8); m.push(100u8); m.push(82u8);
+        m.push(117u8); m.push(110u8); m.push(101u8); m.push(58u8); m.push(32u8); m.push(97u8); m.push(116u8); m.push(32u8); m.push(98u8); m.push(101u8);
+        m.push(103u8); m.push(105u8); m.push(110u8); m.push(110u8); m.push(105u8); m.push(110u8); m.push(103u8); m.push(32u8); m.push(111u8); m.push(102u8);
+        m.push(32u8); m.push(115u8); m.push(108u8); m.push(105u8); m.push(99u8); m.push(101u8);
+        return go_errors_new(m);
+    };
+    if r.prev < 0 {
+        let m = Vec::new();
+        m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(115u8); m.push(46u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8);
+        m.push(101u8); m.push(114u8); m.push(46u8); m.push(85u8); m.push(110u8); m.push(114u8); m.push(101u8); m.push(97u8); m.push(100u8); m.push(82u8);
+        m.push(117u8); m.push(110u8); m.push(101u8); m.push(58u8); m.push(32u8); m.push(112u8); m.push(114u8); m.push(101u8); m.push(118u8); m.push(105u8);
+        m.push(111u8); m.push(117u8); m.push(115u8); m.push(32u8); m.push(111u8); m.push(112u8); m.push(101u8); m.push(114u8); m.push(97u8); m.push(116u8);
+        m.push(105u8); m.push(111u8); m.push(110u8); m.push(32u8); m.push(119u8); m.push(97u8); m.push(115u8); m.push(32u8); m.push(110u8); m.push(111u8);
+        m.push(116u8); m.push(32u8); m.push(82u8); m.push(101u8); m.push(97u8); m.push(100u8); m.push(82u8); m.push(117u8); m.push(110u8); m.push(101u8);
+        return go_errors_new(m);
+    };
+    r.i = r.prev;
+    r.prev = -1;
+    return go_errors_nil();
+}
+
+// WriteTo(w): the slice form appends the unread
+// bytes to dst.
+fn go_bytes_reader_write_to(r: &GosBytesReader, dst: Vec<u8>) -> GoBytesResult {
+    let n = go_bytes_reader_len(r);
+    let i = r.i;
+    while i < len(r.b) {
+        dst.push(r.b[i]);
+        i = i + 1;
+    }
+    r.i = len(r.b);
+    r.prev = -1;
+    return GoBytesResult { n: n, err: go_errors_nil() };
+}

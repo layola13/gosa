@@ -1,0 +1,1684 @@
+// gostd bufio: the SLA-side model of Go's bufio package
+// (Reader / Writer / ReadWriter / Scanner + the four
+// built-in split functions), over byte strings (Vec<u8>).
+// Oracle: Go 1.27.2 stdlib, /usr/local/go/src/bufio/
+// (bufio.go + scan.go), read 2026-11-26. Organisation
+// follows the psa_std / gostd precedent: public entry
+// points go_<pkg>_<name>, private helpers
+// __go_<pkg>_<name>, panic codes listed up front.
+//
+// Splice position: bufio sits after io in the library
+// order (census §7.2.1, 1a). It calls errors.sla
+// (go_errors_new / _with_id / _nil) and strconv.sla
+// (__go_utf8_decode / __go_utf8_append), so it must
+// splice after errors + strconv. Cross-file calls are
+// plain function calls.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77415  bufio read error / invalid state: the
+//          underlying reader/writer returned a negative
+//          count, returned more bytes than it appended,
+//          or an impossible count; fill called on a
+//          full buffer; Scanner saw too many empty
+//          tokens without progressing; ReadLine's
+//          rewind-past-start (unreachable in Go).
+//          (Go panics errNegativeRead /
+//          errNegativeWrite / "tried to fill full
+//          buffer" / "too many empty tokens" in the
+//          same places.)
+//   77403  bufio buffer misuse: Scanner.Buffer or
+//          Scanner.Split called after Scan started
+//          (Go panics "Buffer called after Scan" /
+//          "Split called after Scan").
+//          (R1400: formally assigned to bufio; the
+//          old io.sla:12 "reserved" note is rewritten.)
+//   NOTE on the brief's "negative size" example: the
+//   oracle does NOT panic there. Go 1.27.2
+//   NewReaderSize clamps with max(size, 16) and
+//   NewWriterSize defaults size <= 0 to 4096, so
+//   gostd clamps/defaults the same way and claims no
+//   panic for it. 77403 covers the genuine Go panics
+//   above instead. (77401 errors, 77410/77413 sync,
+//   77411/77412 strconv, 77416/77417 strings,
+//   77420/77421/77423 time, 77430-77439 sort,
+//   77440-77442 runtime, 77446/77447 fmt,
+//   77451/77452 math belong to other files; see
+//   NOTES-runtime.md for the whole-library map.)
+//
+// Target ids (gostd owns 900000-999999):
+//   900010 io.EOF -- SHARED, not bufio's. bufio
+//          returns io.EOF (via go_bufio_eof()); it
+//          defines NO second EOF sentinel. The io
+//          line's EOF constructor, if it adds one,
+//          must use this same id.
+//   900033 bufio.ErrBufferFull
+//   900034 bufio.ErrNegativeCount
+//   900035 bufio.ErrInvalidUnreadByte
+//   900023 bufio.ErrInvalidUnreadRune
+//   900024 bufio.ErrTooLong (Scanner)
+//   900025 bufio.ErrNegativeAdvance (Scanner)
+//   900026 bufio.ErrAdvanceTooFar (Scanner)
+//   900027 bufio.ErrBadReadCount (Scanner)
+//   900028 bufio.ErrFinalToken (Scanner)
+//   (900001/900002 strconv, 900010 io.EOF already in
+//   use elsewhere. Errors are GosError values built
+//   by go_errors_new_with_id, so errors.Is works by
+//   target id through go_errors_is.)
+//
+// ============ THE IO SEAM (R1400: bufio_ctor_handles) ============
+// The underlying reader / writer is an io HANDLE,
+// not a bare fn value (central ruling R1400, Muse
+// relay 16006; the closure-adapter route S3 was
+// proven impossible in RULING-EXEC-170.md §3.2, and
+// the handle route is §3.4 option 2). io.sla defines
+// the handle types at the end of the file:
+//
+//   GosIoReader -- tagged handle over io's concrete
+//     readers (LimitReader / SectionReader /
+//     MultiReader / TeeReader), read through
+//     go_io_reader_read(&h, dst, max) -> GoIoResult.
+//   GosIoWriter -- tagged handle over io's concrete
+//     writers (Discard / MultiWriter / OffsetWriter),
+//     written through go_io_writer_write(&h, p).
+//
+// The constructors take these handles BY VALUE and
+// the structs retain them in `rd` / `wr` fields; the
+// frontend builds a handle with go_io_reader_from_* /
+// go_io_writer_from_* and must not keep using the
+// original after handing it over (same by-value
+// ownership model as ReadWriter, see below).
+// Transient handles (Reader.WriteTo's writer,
+// Writer.ReadFrom's reader) are BORROWED
+// (&GosIoReader / &GosIoWriter): the caller keeps
+// its handle and sees the state updates. A reader
+// from another package (strings / bytes) reaches
+// bufio by materialising its bytes and wrapping them
+// in a LimitReader handle, per io.sla's contract.
+//   The read dispatch appends up to `max` bytes to
+//   the supplied Vec and returns { n, err }; n is the
+//   number of bytes appended; err is nil on success.
+//   A handle that lies about n is a broken reader
+//   and gostd panics 77415 on it.
+//   Read/write RESULTS are unified on GoIoResult
+//   (io.sla): GoBufioReadResult / GoBufioWriteResult
+//   are deleted (R1400: result-type unification rides
+//   with the seam change). GoBufioCountResult stays:
+//   it counts, it is not a byte count into a buffer.
+//   77403 is formally bufio's (R1400): the io.sla:12
+//   "reserved" comment is rewritten, io claims
+//   nothing there.
+//   io.ErrNoProgress and io.ErrShortWrite carry the
+//   io line's target ids (900012 / 900014, R1378):
+//   __go_bufio_no_progress / __go_bufio_short_write
+//   build them with go_errors_new_with_id, so
+//   errors.Is matches io's go_io_err_no_progress /
+//   go_io_err_short_write. (Note: the message bytes
+//   differ -- bufio writes "io: no progress" /
+//   "io: short write", io writes the Go messages
+//   "multiple Read calls return no data or error" /
+//   "short write" -- same id, different text; the
+//   central/debug phase may align the text.)
+//   No WriterTo / ReaderFrom / StringWriter fast
+//   paths: Reader.WriteTo and Writer.ReadFrom /
+//   WriteString run the generic loop only. The
+//   fast paths need interface assertions over the
+//   underlying reader/writer, which the handle seam
+//   cannot express. The generic path is always
+//   correct; it only costs copies.
+//
+// R1426 (liii) lib_borrow: every fn in this file that APPENDS
+// into a dst takes dst: &Vec<u8> (io.sla's readers likewise).
+// A by-value dst is a copy: pushes into it are invisible to
+// the caller (the (liii) defect, SLA-FIXES-170.md §4: fill /
+// Reader.Read / ReadFrom / scanner-fill all guarded on
+// len(scratch) after the read, so the old code panicked 77415
+// on the first successful underlying read). Internal scratch
+// buffers are passed as &scratch; the frontend passes the
+// Reader.Read destination by borrow.
+//
+// Loud refusals in this file: panics 77415/77403
+// above. Nothing is silently stubbed.
+//
+// Divergences from Go (all deliberate, all noted):
+//   - Peek returns a COPY of the buffered bytes, not
+//     a slice into the buffer: Go's bytes stop being
+//     valid at the next read, gostd's copy stays
+//     valid. Contents at call time are identical.
+//   - Scanner.Bytes returns the stored token Vec
+//     (an alias, as in Go -- overwritten by the next
+//     Scan), while split functions receive a COPY of
+//     the unprocessed data, never the live buffer.
+//   - ReadWriter stores its Reader and Writer BY
+//     VALUE. Go's ReadWriter shares the very same
+//     Reader/Writer objects. The gostd pair is
+//     consistent only while it is the sole owner:
+//     NewReadWriter takes ownership; do NOT keep
+//     using the original Reader/Writer afterwards
+//     (their buffered state would split from the
+//     pair's). Use the pair's .r / .w fields.
+//   - A zero-value Reader/Writer/Scanner is NOT
+//     usable (Go's is, after Reset). The
+//     constructors are required; Reset on a struct
+//     whose buffer was never allocated grows a
+//     default one, but the handle fields still need a
+//     constructor or a Reset call to be set.
+//   - ReadLine's nil line is an empty Vec<u8>
+//     (gostd has no nil slices; len 0 is the test).
+//   - Scanner.Buffer takes the caller's buffer as a
+//     copy of its full length (Vec exposes no
+//     capacity); Go uses buf[0:cap(buf)].
+//   - Writer.AvailableBuffer returns an empty Vec
+//     (no capacity to report); append to it and pass
+//     it to the next Write, as in Go.
+//   - A 0-byte nil-error write from the underlying
+//     writer spins forever in Go's Write loop too;
+//     gostd matches Go (it hangs) rather than
+//     inventing an error.
+//
+// Coverage (census §7.2.1 bufio, 1a):
+//   Reader: NewReader/NewReaderSize, Read/ReadByte/
+//     ReadRune/ReadBytes/ReadString/ReadSlice/
+//     ReadLine/Peek/UnreadByte/UnreadRune/Discard/
+//     Buffered/Reset/Size (+ WriteTo, extra).
+//   Writer: NewWriter/NewWriterSize, Write/WriteByte/
+//     WriteString/WriteRune/Available/Buffered/
+//     Flush/Reset (+ Size/AvailableBuffer/ReadFrom).
+//   ReadWriter: NewReadWriter.
+//   Scanner: NewScanner, Scan/Text/Bytes/Err/Split/
+//     Buffer; split funcs ScanLines/ScanWords/
+//     ScanRunes/ScanBytes.
+//   Sentinel accessors: go_bufio_eof + the nine
+//   go_bufio_err_* constructors above.
+
+const GO_BUFIO_DEFAULT_SIZE: i64 = 4096;
+const GO_BUFIO_MIN_READ_SIZE: i64 = 16;
+const GO_BUFIO_MAX_EMPTY_READS: i64 = 100;
+const GO_BUFIO_MAX_SCAN_TOKEN_SIZE: i64 = 65536;
+const GO_BUFIO_START_BUF_SIZE: i64 = 4096;
+
+const GO_BUFIO_ID_EOF: i64 = 900010;
+const GO_BUFIO_ID_BUFFER_FULL: i64 = 900033;
+const GO_BUFIO_ID_NEGATIVE_COUNT: i64 = 900034;
+const GO_BUFIO_ID_INVALID_UNREAD_BYTE: i64 = 900035;
+const GO_BUFIO_ID_INVALID_UNREAD_RUNE: i64 = 900023;
+const GO_BUFIO_ID_TOO_LONG: i64 = 900024;
+const GO_BUFIO_ID_NEGATIVE_ADVANCE: i64 = 900025;
+const GO_BUFIO_ID_ADVANCE_TOO_FAR: i64 = 900026;
+const GO_BUFIO_ID_BAD_READ_COUNT: i64 = 900027;
+const GO_BUFIO_ID_FINAL_TOKEN: i64 = 900028;
+
+// ---------- result structs ----------
+
+// (n, err) for a read into an append target, and for
+// a write of a whole Vec, is GoIoResult (io.sla):
+// R1400 unifies the read/write result types on
+// GoIoResult, so GoBufioReadResult /
+// GoBufioWriteResult are DELETED (they were
+// structurally identical to GoIoResult, { n, err }).
+// GoBufioCountResult below is a different struct:
+// it counts, it is not a byte count into a buffer.
+
+// (n, err) where n is a count, not a byte count into
+// a caller buffer: Discard / WriteTo / ReadFrom.
+struct GoBufioCountResult {
+    n: i64,
+    err: ptr,
+}
+
+// Peek: the bytes (a copy, see header) + error.
+struct GoBufioPeekResult {
+    data: Vec<u8>,
+    err: ptr,
+}
+
+struct GoBufioByteResult {
+    b: u8,
+    err: ptr,
+}
+
+struct GoBufioRuneResult {
+    r: i64,
+    size: i64,
+    err: ptr,
+}
+
+// ReadSlice / ReadBytes / ReadString payload + error.
+struct GoBufioSliceResult {
+    line: Vec<u8>,
+    err: ptr,
+}
+
+struct GoBufioBytesResult {
+    data: Vec<u8>,
+    err: ptr,
+}
+
+// ReadLine: line (no terminator), isPrefix, error.
+struct GoBufioLineResult {
+    line: Vec<u8>,
+    is_prefix: bool,
+    err: ptr,
+}
+
+// Writer.WriteRune: bytes written + error.
+struct GoBufioWriteRuneResult {
+    size: i64,
+    err: ptr,
+}
+
+// collectFragments: the full buffers, the final
+// fragment, their combined length, and the error.
+struct GoBufioFragments {
+    full: Vec<Vec<u8>>,
+    frag: Vec<u8>,
+    total: i64,
+    err: ptr,
+}
+
+// SplitFunc result: bytes to advance, the token (if
+// any), and the error (if any). ErrFinalToken is
+// signalled by returning the final-token sentinel
+// (target id 900028) as err; see Scanner.Scan.
+struct GoBufioSplitResult {
+    advance: i64,
+    token: Vec<u8>,
+    has_token: bool,
+    err: ptr,
+}
+
+// ---------- byte helpers ----------
+
+fn __go_bufio_append(dst: &Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_bufio_slice(b: Vec<u8>, lo: i64, hi: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Allocate a zero-filled Vec of exactly `size`
+// bytes: the Reader/Writer backing buffer, whose
+// length IS its capacity in gostd.
+fn __go_bufio_new_buf(size: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < size {
+        out.push(0u8);
+        i = i + 1;
+    }
+    return out;
+}
+
+// First index of c in b[from:to], or -1.
+fn __go_bufio_index_byte_from(b: Vec<u8>, from: i64, to: i64, c: u8) -> i64 {
+    let i = from;
+    while i < to {
+        if b[i] == c { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn __go_bufio_index_byte(b: Vec<u8>, c: u8) -> i64 {
+    return __go_bufio_index_byte_from(b, 0, len(b), c);
+}
+
+// ---------- error helpers ----------
+
+// Is err a non-nil error with this target id?
+fn __go_bufio_is_err(err: ptr, target_id: i64) -> bool {
+    if err == go_errors_nil() { return false; };
+    return go_errors_target_id(err) == target_id;
+}
+
+fn __go_bufio_is_eof(err: ptr) -> bool {
+    return __go_bufio_is_err(err, GO_BUFIO_ID_EOF);
+}
+
+fn __go_bufio_no_progress() -> ptr {
+    let msg = Vec::new();
+    msg.push(105u8); msg.push(111u8); msg.push(58u8); msg.push(32u8);
+    msg.push(110u8); msg.push(111u8); msg.push(32u8); msg.push(112u8);
+    msg.push(114u8); msg.push(111u8); msg.push(103u8); msg.push(114u8);
+    msg.push(101u8); msg.push(115u8); msg.push(115u8);
+    return go_errors_new_with_id(msg, 900012);
+}
+
+fn __go_bufio_short_write() -> ptr {
+    let msg = Vec::new();
+    msg.push(105u8); msg.push(111u8); msg.push(58u8); msg.push(32u8);
+    msg.push(115u8); msg.push(104u8); msg.push(111u8); msg.push(114u8);
+    msg.push(116u8); msg.push(32u8); msg.push(119u8); msg.push(114u8);
+    msg.push(105u8); msg.push(116u8); msg.push(101u8);
+    return go_errors_new_with_id(msg, 900014);
+}
+
+// ---------- sentinel constructors ----------
+
+// io.EOF, target id 900010. This is the SAME
+// sentinel the io line owns -- not a second one.
+// (strings.sla's go_strings_eof builds the identical
+// id; whichever the frontend calls, errors.Is by id
+// matches.)
+fn go_bufio_eof() -> ptr {
+    let msg = Vec::new();
+    msg.push(69u8); msg.push(79u8); msg.push(70u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_EOF);
+}
+
+// bufio.ErrBufferFull: "bufio: buffer full"
+fn go_bufio_err_buffer_full() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(58u8); msg.push(32u8); msg.push(98u8);
+    msg.push(117u8); msg.push(102u8); msg.push(102u8); msg.push(101u8);
+    msg.push(114u8); msg.push(32u8); msg.push(102u8); msg.push(117u8);
+    msg.push(108u8); msg.push(108u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_BUFFER_FULL);
+}
+
+// bufio.ErrNegativeCount: "bufio: negative count"
+fn go_bufio_err_negative_count() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(58u8); msg.push(32u8); msg.push(110u8);
+    msg.push(101u8); msg.push(103u8); msg.push(97u8); msg.push(116u8);
+    msg.push(105u8); msg.push(118u8); msg.push(101u8); msg.push(32u8);
+    msg.push(99u8); msg.push(111u8); msg.push(117u8); msg.push(110u8);
+    msg.push(116u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_NEGATIVE_COUNT);
+}
+
+// bufio.ErrInvalidUnreadByte:
+// "bufio: invalid use of UnreadByte"
+fn go_bufio_err_invalid_unread_byte() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(58u8); msg.push(32u8); msg.push(105u8);
+    msg.push(110u8); msg.push(118u8); msg.push(97u8); msg.push(108u8);
+    msg.push(105u8); msg.push(100u8); msg.push(32u8); msg.push(117u8);
+    msg.push(115u8); msg.push(101u8); msg.push(32u8); msg.push(111u8);
+    msg.push(102u8); msg.push(32u8); msg.push(85u8); msg.push(110u8);
+    msg.push(114u8); msg.push(101u8); msg.push(97u8); msg.push(100u8);
+    msg.push(66u8); msg.push(121u8); msg.push(116u8); msg.push(101u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_INVALID_UNREAD_BYTE);
+}
+
+// bufio.ErrInvalidUnreadRune:
+// "bufio: invalid use of UnreadRune"
+fn go_bufio_err_invalid_unread_rune() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(58u8); msg.push(32u8); msg.push(105u8);
+    msg.push(110u8); msg.push(118u8); msg.push(97u8); msg.push(108u8);
+    msg.push(105u8); msg.push(100u8); msg.push(32u8); msg.push(117u8);
+    msg.push(115u8); msg.push(101u8); msg.push(32u8); msg.push(111u8);
+    msg.push(102u8); msg.push(32u8); msg.push(85u8); msg.push(110u8);
+    msg.push(114u8); msg.push(101u8); msg.push(97u8); msg.push(100u8);
+    msg.push(82u8); msg.push(117u8); msg.push(110u8); msg.push(101u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_INVALID_UNREAD_RUNE);
+}
+
+// bufio.ErrTooLong: "bufio.Scanner: token too long"
+fn go_bufio_err_too_long() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(46u8); msg.push(83u8); msg.push(99u8);
+    msg.push(97u8); msg.push(110u8); msg.push(110u8); msg.push(101u8);
+    msg.push(114u8); msg.push(58u8); msg.push(32u8); msg.push(116u8);
+    msg.push(111u8); msg.push(107u8); msg.push(101u8); msg.push(110u8);
+    msg.push(32u8); msg.push(116u8); msg.push(111u8); msg.push(111u8);
+    msg.push(32u8); msg.push(108u8); msg.push(111u8); msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_TOO_LONG);
+}
+
+// bufio.ErrNegativeAdvance: "bufio.Scanner:
+// SplitFunc returns negative advance count"
+fn go_bufio_err_negative_advance() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(46u8); msg.push(83u8); msg.push(99u8);
+    msg.push(97u8); msg.push(110u8); msg.push(110u8); msg.push(101u8);
+    msg.push(114u8); msg.push(58u8); msg.push(32u8); msg.push(83u8);
+    msg.push(112u8); msg.push(108u8); msg.push(105u8); msg.push(116u8);
+    msg.push(70u8); msg.push(117u8); msg.push(110u8); msg.push(99u8);
+    msg.push(32u8); msg.push(114u8); msg.push(101u8); msg.push(116u8);
+    msg.push(117u8); msg.push(114u8); msg.push(110u8); msg.push(115u8);
+    msg.push(32u8); msg.push(110u8); msg.push(101u8); msg.push(103u8);
+    msg.push(97u8); msg.push(116u8); msg.push(105u8); msg.push(118u8);
+    msg.push(101u8); msg.push(32u8); msg.push(97u8); msg.push(100u8);
+    msg.push(118u8); msg.push(97u8); msg.push(110u8); msg.push(99u8);
+    msg.push(101u8); msg.push(32u8); msg.push(99u8); msg.push(111u8);
+    msg.push(117u8); msg.push(110u8); msg.push(116u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_NEGATIVE_ADVANCE);
+}
+
+// bufio.ErrAdvanceTooFar: "bufio.Scanner:
+// SplitFunc returns advance count beyond input"
+fn go_bufio_err_advance_too_far() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(46u8); msg.push(83u8); msg.push(99u8);
+    msg.push(97u8); msg.push(110u8); msg.push(110u8); msg.push(101u8);
+    msg.push(114u8); msg.push(58u8); msg.push(32u8); msg.push(83u8);
+    msg.push(112u8); msg.push(108u8); msg.push(105u8); msg.push(116u8);
+    msg.push(70u8); msg.push(117u8); msg.push(110u8); msg.push(99u8);
+    msg.push(32u8); msg.push(114u8); msg.push(101u8); msg.push(116u8);
+    msg.push(117u8); msg.push(114u8); msg.push(110u8); msg.push(115u8);
+    msg.push(32u8); msg.push(97u8); msg.push(100u8); msg.push(118u8);
+    msg.push(97u8); msg.push(110u8); msg.push(99u8); msg.push(101u8);
+    msg.push(32u8); msg.push(99u8); msg.push(111u8); msg.push(117u8);
+    msg.push(110u8); msg.push(116u8); msg.push(32u8); msg.push(98u8);
+    msg.push(101u8); msg.push(121u8); msg.push(111u8); msg.push(110u8);
+    msg.push(100u8); msg.push(32u8); msg.push(105u8); msg.push(110u8);
+    msg.push(112u8); msg.push(117u8); msg.push(116u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_ADVANCE_TOO_FAR);
+}
+
+// bufio.ErrBadReadCount: "bufio.Scanner: Read
+// returned impossible count"
+fn go_bufio_err_bad_read_count() -> ptr {
+    let msg = Vec::new();
+    msg.push(98u8); msg.push(117u8); msg.push(102u8); msg.push(105u8);
+    msg.push(111u8); msg.push(46u8); msg.push(83u8); msg.push(99u8);
+    msg.push(97u8); msg.push(110u8); msg.push(110u8); msg.push(101u8);
+    msg.push(114u8); msg.push(58u8); msg.push(32u8); msg.push(82u8);
+    msg.push(101u8); msg.push(97u8); msg.push(100u8); msg.push(32u8);
+    msg.push(114u8); msg.push(101u8); msg.push(116u8); msg.push(117u8);
+    msg.push(114u8); msg.push(110u8); msg.push(101u8); msg.push(100u8);
+    msg.push(32u8); msg.push(105u8); msg.push(109u8); msg.push(112u8);
+    msg.push(111u8); msg.push(115u8); msg.push(115u8); msg.push(105u8);
+    msg.push(98u8); msg.push(108u8); msg.push(101u8); msg.push(32u8);
+    msg.push(99u8); msg.push(111u8); msg.push(117u8); msg.push(110u8);
+    msg.push(116u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_BAD_READ_COUNT);
+}
+
+// bufio.ErrFinalToken: "final token" -- the split
+// function's stop-with-a-token (or stop-now)
+// signal, consumed by Scanner.Scan, never surfaced
+// as a Scanner error.
+fn go_bufio_err_final_token() -> ptr {
+    let msg = Vec::new();
+    msg.push(102u8); msg.push(105u8); msg.push(110u8); msg.push(97u8);
+    msg.push(108u8); msg.push(32u8); msg.push(116u8); msg.push(111u8);
+    msg.push(107u8); msg.push(101u8); msg.push(110u8);
+    return go_errors_new_with_id(msg, GO_BUFIO_ID_FINAL_TOKEN);
+}
+
+// ---------- UTF-8 helpers ----------
+
+// Expected byte length of the rune starting with
+// lead byte b0. Invalid lead bytes (continuation
+// bytes, 0xF5+) count as length 1: Go decodes them
+// as one U+FFFD, and FullRune treats them as whole.
+fn __go_bufio_rune_len(b0: i64) -> i64 {
+    if b0 < 128 { return 1; };
+    if b0 < 192 { return 1; };
+    if b0 < 224 { return 2; };
+    if b0 < 240 { return 3; };
+    if b0 < 245 { return 4; };
+    return 1;
+}
+
+// Does b[i:end] hold a complete rune (valid or
+// invalid-but-whole)? Mirrors utf8.FullRune over the
+// window: a truncated multi-byte lead is incomplete.
+fn __go_bufio_full_rune_to(b: Vec<u8>, i: i64, end: i64) -> bool {
+    if i >= end { return false; };
+    return end - i >= __go_bufio_rune_len(b[i] as i64);
+}
+
+// Go's scan.go isSpace (unicode.IsSpace minus the
+// unicode package): ASCII whitespace, NEL, NBSP,
+// U+1680, U+2000-U+200A, U+2028/U+2029, U+202F,
+// U+205F, U+3000.
+fn __go_bufio_is_space(r: i64) -> bool {
+    if r <= 255 {
+        if r == 32 { return true; };
+        if r == 9 { return true; };
+        if r == 10 { return true; };
+        if r == 11 { return true; };
+        if r == 12 { return true; };
+        if r == 13 { return true; };
+        if r == 133 { return true; };
+        if r == 160 { return true; };
+        return false;
+    };
+    if r >= 8192 {
+        if r <= 8202 { return true; };
+    };
+    if r == 5760 { return true; };
+    if r == 8232 { return true; };
+    if r == 8233 { return true; };
+    if r == 8239 { return true; };
+    if r == 8287 { return true; };
+    if r == 12288 { return true; };
+    return false;
+}
+
+// ================= Reader =================
+
+// bufio.Reader: buffered input over an io reader
+// handle (GosIoReader; see the IO SEAM in the
+// header). buf is a fixed-length
+// Vec (length = capacity); r/w are read/write
+// positions; err/has_err is the sticky error Go
+// keeps in b.err; last_byte (-1 = invalid) is the
+// last byte read for UnreadByte; last_rune_size
+// (-1 = invalid) is the size of the last rune read
+// for UnreadRune.
+struct GoBufioReader {
+    buf: Vec<u8>,
+    rd: GosIoReader,
+    r: i64,
+    w: i64,
+    err: ptr,
+    has_err: bool,
+    last_byte: i64,
+    last_rune_size: i64,
+}
+
+// bufio.NewReaderSize(rd, size): buffer at least
+// size bytes, at least minReadBufferSize (16). Go
+// returns the underlying *Reader unchanged when rd
+// already is one large enough; the handle seam
+// cannot test that, so gostd always wraps (the wrap
+// is transparent: same bytes, same errors).
+fn go_bufio_new_reader_size(rd: GosIoReader, size: i64) -> GoBufioReader {
+    let n = size;
+    if n < GO_BUFIO_MIN_READ_SIZE { n = GO_BUFIO_MIN_READ_SIZE; };
+    return GoBufioReader {
+        buf: __go_bufio_new_buf(n),
+        rd: rd,
+        r: 0,
+        w: 0,
+        err: go_errors_nil(),
+        has_err: false,
+        last_byte: -1,
+        last_rune_size: -1,
+    };
+}
+
+// bufio.NewReader(rd): default 4096-byte buffer.
+fn go_bufio_new_reader(rd: GosIoReader) -> GoBufioReader {
+    return go_bufio_new_reader_size(rd, GO_BUFIO_DEFAULT_SIZE);
+}
+
+// Reader.Size: size of the underlying buffer.
+fn go_bufio_reader_size(r: &GoBufioReader) -> i64 {
+    return len(r.buf);
+}
+
+// Reader.Buffered: bytes readable from the buffer.
+fn go_bufio_reader_buffered(r: &GoBufioReader) -> i64 {
+    return r.w - r.r;
+}
+
+// Reader.Reset(rd): discard buffered data and all
+// state, switch to a new underlying reader. The
+// buffer is kept (Go keeps b.buf); a struct whose
+// buffer was never allocated grows a default one.
+fn go_bufio_reader_reset(r: &GoBufioReader, rd: GosIoReader) -> void {
+    if len(r.buf) == 0 {
+        r.buf = __go_bufio_new_buf(GO_BUFIO_DEFAULT_SIZE);
+    };
+    r.rd = rd;
+    r.r = 0;
+    r.w = 0;
+    r.err = go_errors_nil();
+    r.has_err = false;
+    r.last_byte = -1;
+    r.last_rune_size = -1;
+    return;
+}
+
+// Take the sticky error and clear it (Go's readErr).
+fn __go_bufio_read_err(r: &GoBufioReader) -> ptr {
+    if !r.has_err { return go_errors_nil(); };
+    let e = r.err;
+    r.err = go_errors_nil();
+    r.has_err = false;
+    return e;
+}
+
+// fill reads a new chunk into the buffer (Go's
+// fill): slide, then up to 100 reads from the
+// underlying reader. An error (even with n > 0)
+// becomes the sticky error; 100 consecutive empty
+// reads become io.ErrNoProgress (target id 900012,
+// R1378).
+fn __go_bufio_fill(r: &GoBufioReader) -> void {
+    if r.r > 0 {
+        let i = 0;
+        while i < r.w - r.r {
+            r.buf[i] = r.buf[r.r + i];
+            i = i + 1;
+        }
+        r.w = r.w - r.r;
+        r.r = 0;
+    };
+    if r.w >= len(r.buf) { panic(77415); };
+    let tries = 0;
+    while tries < GO_BUFIO_MAX_EMPTY_READS {
+        let scratch = Vec::new();
+        let res = go_io_reader_read(&r.rd, &scratch, len(r.buf) - r.w);
+        if res.n < 0 { panic(77415); };
+        if res.n > len(scratch) { panic(77415); };
+        if res.n > len(r.buf) - r.w { panic(77415); };
+        let i = 0;
+        while i < res.n {
+            r.buf[r.w + i] = scratch[i];
+            i = i + 1;
+        }
+        r.w = r.w + res.n;
+        if res.err != go_errors_nil() {
+            r.err = res.err;
+            r.has_err = true;
+            return;
+        };
+        if res.n > 0 { return; };
+        tries = tries + 1;
+    }
+    r.err = __go_bufio_no_progress();
+    r.has_err = true;
+    return;
+}
+
+// Reader.Peek(n): the next n bytes without
+// advancing. Returns a COPY (see header). n < 0
+// gives ErrNegativeCount; n larger than the buffer
+// gives the buffered bytes + ErrBufferFull; a short
+// read gives what is buffered + the sticky error
+// (or ErrBufferFull when the sticky error is nil).
+// Peek invalidates UnreadByte/UnreadRune.
+fn go_bufio_reader_peek(r: &GoBufioReader, n: i64) -> GoBufioPeekResult {
+    if n < 0 {
+        return GoBufioPeekResult { data: Vec::new(), err: go_bufio_err_negative_count() };
+    };
+    r.last_byte = -1;
+    r.last_rune_size = -1;
+    while r.w - r.r < n && r.w - r.r < len(r.buf) && !r.has_err {
+        __go_bufio_fill(r);
+    }
+    if n > len(r.buf) {
+        return GoBufioPeekResult { data: __go_bufio_slice(r.buf, r.r, r.w), err: go_bufio_err_buffer_full() };
+    };
+    let avail = r.w - r.r;
+    let take = n;
+    let err = go_errors_nil();
+    if avail < n {
+        take = avail;
+        err = __go_bufio_read_err(r);
+        if err == go_errors_nil() { err = go_bufio_err_buffer_full(); };
+    };
+    return GoBufioPeekResult { data: __go_bufio_slice(r.buf, r.r, r.r + take), err: err };
+}
+
+// Reader.Discard(n): skip the next n bytes.
+// Returns the number actually discarded + error.
+fn go_bufio_reader_discard(r: &GoBufioReader, n: i64) -> GoBufioCountResult {
+    if n < 0 {
+        return GoBufioCountResult { n: 0, err: go_bufio_err_negative_count() };
+    };
+    if n == 0 {
+        return GoBufioCountResult { n: 0, err: go_errors_nil() };
+    };
+    r.last_byte = -1;
+    r.last_rune_size = -1;
+    let remain = n;
+    while true {
+        let skip = r.w - r.r;
+        if skip == 0 {
+            __go_bufio_fill(r);
+            skip = r.w - r.r;
+        };
+        if skip > remain { skip = remain; };
+        r.r = r.r + skip;
+        remain = remain - skip;
+        if remain == 0 {
+            return GoBufioCountResult { n: n, err: go_errors_nil() };
+        };
+        if r.has_err {
+            return GoBufioCountResult { n: n - remain, err: __go_bufio_read_err(r) };
+        };
+    }
+}
+
+// Reader.Read(dst, max): append up to max bytes to
+// dst. Go's Read(p []byte) takes the destination
+// slice; gostd takes the append target + the count
+// (same convention as strings.Reader.Read). A large
+// read with an empty buffer goes straight to the
+// underlying reader; otherwise at most one
+// underlying read fills the buffer and the result
+// is copied out. n > 0 with a sticky error (e.g.
+// data + EOF) returns the data with nil error and
+// keeps the error sticky, as Go does.
+fn go_bufio_reader_read(r: &GoBufioReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if max == 0 {
+        if r.w - r.r > 0 {
+            return GoIoResult { n: 0, err: go_errors_nil() };
+        };
+        return GoIoResult { n: 0, err: __go_bufio_read_err(r) };
+    };
+    if r.r == r.w {
+        if r.has_err {
+            return GoIoResult { n: 0, err: __go_bufio_read_err(r) };
+        };
+        if max >= len(r.buf) {
+            let before = len(dst);
+            let res = go_io_reader_read(&r.rd, dst, max);
+            if res.n < 0 { panic(77415); };
+            if res.n > len(dst) - before { panic(77415); };
+            if res.n > 0 {
+                r.last_byte = dst[len(dst) - 1] as i64;
+                r.last_rune_size = -1;
+            };
+            return GoIoResult { n: res.n, err: res.err };
+        };
+        r.r = 0;
+        r.w = 0;
+        let scratch = Vec::new();
+        let res = go_io_reader_read(&r.rd, &scratch, len(r.buf));
+        if res.n < 0 { panic(77415); };
+        if res.n > len(scratch) { panic(77415); };
+        if res.n == 0 {
+            return GoIoResult { n: 0, err: res.err };
+        };
+        let i = 0;
+        while i < res.n {
+            r.buf[i] = scratch[i];
+            i = i + 1;
+        }
+        r.w = res.n;
+        if res.err != go_errors_nil() {
+            r.err = res.err;
+            r.has_err = true;
+        };
+    };
+    let avail = r.w - r.r;
+    let n = max;
+    if avail < n { n = avail; };
+    let i = 0;
+    while i < n {
+        dst.push(r.buf[r.r + i]);
+        i = i + 1;
+    }
+    r.r = r.r + n;
+    r.last_byte = r.buf[r.r - 1] as i64;
+    r.last_rune_size = -1;
+    return GoIoResult { n: n, err: go_errors_nil() };
+}
+
+// Reader.ReadByte.
+fn go_bufio_reader_read_byte(r: &GoBufioReader) -> GoBufioByteResult {
+    r.last_rune_size = -1;
+    while r.r == r.w {
+        if r.has_err {
+            return GoBufioByteResult { b: 0, err: __go_bufio_read_err(r) };
+        };
+        __go_bufio_fill(r);
+    }
+    let c = r.buf[r.r];
+    r.r = r.r + 1;
+    r.last_byte = c as i64;
+    return GoBufioByteResult { b: c, err: go_errors_nil() };
+}
+
+// Reader.UnreadByte: unread the most recently read
+// byte. Errors (ErrInvalidUnreadByte) when the last
+// operation was not a read, or when the read
+// position is at the start of a non-empty buffer
+// with nothing to step back over.
+fn go_bufio_reader_unread_byte(r: &GoBufioReader) -> ptr {
+    if r.last_byte < 0 || (r.r == 0 && r.w > 0) {
+        return go_bufio_err_invalid_unread_byte();
+    };
+    if r.r > 0 {
+        r.r = r.r - 1;
+    } else {
+        r.w = 1;
+    };
+    r.buf[r.r] = r.last_byte as u8;
+    r.last_byte = -1;
+    r.last_rune_size = -1;
+    return go_errors_nil();
+}
+
+// Reader.ReadRune: one UTF-8 rune + its byte size.
+// An invalid encoding consumes one byte and returns
+// U+FFFD with size 1 (via __go_utf8_decode).
+fn go_bufio_reader_read_rune(r: &GoBufioReader) -> GoBufioRuneResult {
+    while r.r + 4 > r.w && !__go_bufio_full_rune_to(r.buf, r.r, r.w) && !r.has_err && r.w - r.r < len(r.buf) {
+        __go_bufio_fill(r);
+    }
+    r.last_rune_size = -1;
+    if r.r == r.w {
+        return GoBufioRuneResult { r: 0, size: 0, err: __go_bufio_read_err(r) };
+    };
+    let win = __go_bufio_slice(r.buf, r.r, r.w);
+    let d = __go_utf8_decode(win, 0);
+    r.r = r.r + d.size;
+    r.last_byte = r.buf[r.r - 1] as i64;
+    r.last_rune_size = d.size;
+    return GoBufioRuneResult { r: d.r, size: d.size, err: go_errors_nil() };
+}
+
+// Reader.UnreadRune: valid only right after a
+// successful ReadRune.
+fn go_bufio_reader_unread_rune(r: &GoBufioReader) -> ptr {
+    if r.last_rune_size < 0 || r.r < r.last_rune_size {
+        return go_bufio_err_invalid_unread_rune();
+    };
+    r.r = r.r - r.last_rune_size;
+    r.last_byte = -1;
+    r.last_rune_size = -1;
+    return go_errors_nil();
+}
+
+// Record the last byte of a ReadSlice line, as Go
+// does (so UnreadByte after ReadSlice/ReadLine
+// unreads the delimiter, or the last data byte).
+fn __go_bufio_note_last(r: &GoBufioReader, line: Vec<u8>) -> void {
+    if len(line) > 0 {
+        r.last_byte = line[len(line) - 1] as i64;
+        r.last_rune_size = -1;
+    };
+    return;
+}
+
+// Reader.ReadSlice(delim): bytes up to and including
+// the first delim, or the buffered bytes + error
+// when the input ends first. ErrBufferFull when the
+// buffer fills without a delim (the whole buffer is
+// returned and consumed). The returned bytes are a
+// copy; Go's slice aliases the buffer and dies at
+// the next read.
+fn go_bufio_reader_read_slice(r: &GoBufioReader, delim: u8) -> GoBufioSliceResult {
+    let s = 0;
+    while true {
+        let i = __go_bufio_index_byte_from(r.buf, r.r + s, r.w, delim);
+        if i >= 0 {
+            let end = i + 1;
+            let line = __go_bufio_slice(r.buf, r.r, end);
+            r.r = end;
+            __go_bufio_note_last(r, line);
+            return GoBufioSliceResult { line: line, err: go_errors_nil() };
+        };
+        if r.has_err {
+            let line = __go_bufio_slice(r.buf, r.r, r.w);
+            r.r = r.w;
+            let err = __go_bufio_read_err(r);
+            __go_bufio_note_last(r, line);
+            return GoBufioSliceResult { line: line, err: err };
+        };
+        if r.w - r.r >= len(r.buf) {
+            let line = __go_bufio_slice(r.buf, r.r, r.w);
+            r.r = r.w;
+            __go_bufio_note_last(r, line);
+            return GoBufioSliceResult { line: line, err: go_bufio_err_buffer_full() };
+        };
+        s = r.w - r.r;
+        __go_bufio_fill(r);
+    }
+}
+
+// Reader.ReadLine: one line without the end-of-line
+// bytes. isPrefix is true when the line was too long
+// for the buffer (the rest comes from future calls).
+// A trailing \r straddling the buffer boundary is
+// put back for the next call, as in Go. A non-empty
+// final line without a newline returns nil error,
+// as in Go; an empty line at EOF returns the error.
+fn go_bufio_reader_read_line(r: &GoBufioReader) -> GoBufioLineResult {
+    let res = go_bufio_reader_read_slice(r, 10u8);
+    if __go_bufio_is_err(res.err, GO_BUFIO_ID_BUFFER_FULL) {
+        let line = res.line;
+        if len(line) > 0 && line[len(line) - 1] == 13u8 {
+            if r.r == 0 { panic(77415); };
+            r.r = r.r - 1;
+            line = __go_bufio_slice(line, 0, len(line) - 1);
+        };
+        return GoBufioLineResult { line: line, is_prefix: true, err: go_errors_nil() };
+    };
+    if len(res.line) == 0 {
+        return GoBufioLineResult { line: Vec::new(), is_prefix: false, err: res.err };
+    };
+    let line = res.line;
+    if line[len(line) - 1] == 10u8 {
+        let drop = 1;
+        if len(line) > 1 && line[len(line) - 2] == 13u8 { drop = 2; };
+        line = __go_bufio_slice(line, 0, len(line) - drop);
+    };
+    return GoBufioLineResult { line: line, is_prefix: false, err: go_errors_nil() };
+}
+
+// collectFragments (Go's unexported helper): read
+// slices until the delim, accumulating whole
+// buffers. Returns the pieces, the final fragment,
+// their combined length, and the error.
+fn __go_bufio_collect_fragments(r: &GoBufioReader, delim: u8) -> GoBufioFragments {
+    let full = Vec::new();
+    let frag = Vec::new();
+    let total = 0;
+    let err = go_errors_nil();
+    while true {
+        let res = go_bufio_reader_read_slice(r, delim);
+        if res.err == go_errors_nil() {
+            frag = res.line;
+            break;
+        };
+        if !__go_bufio_is_err(res.err, GO_BUFIO_ID_BUFFER_FULL) {
+            frag = res.line;
+            err = res.err;
+            break;
+        };
+        full.push(__go_bufio_slice(res.line, 0, len(res.line)));
+        total = total + len(res.line);
+    }
+    total = total + len(frag);
+    return GoBufioFragments { full: full, frag: frag, total: total, err: err };
+}
+
+// Reader.ReadBytes(delim): data up to and including
+// the delim, or the data read before the error.
+fn go_bufio_reader_read_bytes(r: &GoBufioReader, delim: u8) -> GoBufioBytesResult {
+    let parts = __go_bufio_collect_fragments(r, delim);
+    let out = Vec::new();
+    let i = 0;
+    while i < len(parts.full) {
+        __go_bufio_append(&out, parts.full[i]);
+        i = i + 1;
+    }
+    __go_bufio_append(&out, parts.frag);
+    return GoBufioBytesResult { data: out, err: parts.err };
+}
+
+// Reader.ReadString(delim): same as ReadBytes; a Go
+// string is a Vec<u8> in gostd, so the shape is
+// identical and the two share the collector.
+fn go_bufio_reader_read_string(r: &GoBufioReader, delim: u8) -> GoBufioBytesResult {
+    return go_bufio_reader_read_bytes(r, delim);
+}
+
+// Write the buffered bytes to the writer handle (Go's
+// writeBuf). Returns the count + error; the
+// reader's position advances by the count written.
+fn __go_bufio_write_buf(r: &GoBufioReader, wr: &GosIoWriter) -> GoBufioCountResult {
+    let chunk = __go_bufio_slice(r.buf, r.r, r.w);
+    let res = go_io_writer_write(wr, chunk);
+    if res.n < 0 { panic(77415); };
+    if res.n > len(chunk) { panic(77415); };
+    r.r = r.r + res.n;
+    return GoBufioCountResult { n: res.n, err: res.err };
+}
+
+// Reader.WriteTo(wr): flush the buffered bytes to
+// the writer, then keep filling and flushing until
+// the input ends. No WriterTo/ReaderFrom fast paths
+// (see the IO SEAM in the header). A trailing io.EOF is
+// swallowed and reported as nil, as in Go.
+fn go_bufio_reader_write_to(r: &GoBufioReader, wr: &GosIoWriter) -> GoBufioCountResult {
+    r.last_byte = -1;
+    r.last_rune_size = -1;
+    let n = 0;
+    if r.r < r.w {
+        let res = __go_bufio_write_buf(r, wr);
+        n = n + res.n;
+        if res.err != go_errors_nil() {
+            return GoBufioCountResult { n: n, err: res.err };
+        };
+    };
+    if r.w - r.r < len(r.buf) {
+        __go_bufio_fill(r);
+    };
+    while r.r < r.w {
+        let res = __go_bufio_write_buf(r, wr);
+        n = n + res.n;
+        if res.err != go_errors_nil() {
+            return GoBufioCountResult { n: n, err: res.err };
+        };
+        __go_bufio_fill(r);
+    }
+    if r.has_err && __go_bufio_is_eof(r.err) {
+        r.err = go_errors_nil();
+        r.has_err = false;
+    };
+    return GoBufioCountResult { n: n, err: __go_bufio_read_err(r) };
+}
+
+// ================= Writer =================
+
+// bufio.Writer: buffered output over an io writer
+// handle (GosIoWriter; see the IO SEAM in the
+// header). buf is a
+// fixed-length Vec (length = capacity); n is the
+// number of buffered bytes; err/has_err is the
+// sticky error: once set, no more data is accepted
+// and every write and Flush returns it, as in Go.
+struct GoBufioWriter {
+    err: ptr,
+    has_err: bool,
+    buf: Vec<u8>,
+    n: i64,
+    wr: GosIoWriter,
+}
+
+// bufio.NewWriterSize(wr, size): buffer at least
+// size bytes; size <= 0 defaults to 4096. Go
+// returns the underlying *Writer unchanged when wr
+// already is one large enough; the handle seam
+// cannot test that, so gostd always wraps.
+fn go_bufio_new_writer_size(wr: GosIoWriter, size: i64) -> GoBufioWriter {
+    let n = size;
+    if n <= 0 { n = GO_BUFIO_DEFAULT_SIZE; };
+    return GoBufioWriter {
+        err: go_errors_nil(),
+        has_err: false,
+        buf: __go_bufio_new_buf(n),
+        n: 0,
+        wr: wr,
+    };
+}
+
+// bufio.NewWriter(wr): default 4096-byte buffer.
+fn go_bufio_new_writer(wr: GosIoWriter) -> GoBufioWriter {
+    return go_bufio_new_writer_size(wr, GO_BUFIO_DEFAULT_SIZE);
+}
+
+// Writer.Size: size of the underlying buffer.
+fn go_bufio_writer_size(w: &GoBufioWriter) -> i64 {
+    return len(w.buf);
+}
+
+// Writer.Available: unused bytes in the buffer.
+fn go_bufio_writer_available(w: &GoBufioWriter) -> i64 {
+    return len(w.buf) - w.n;
+}
+
+// Writer.Buffered: bytes written into the buffer.
+fn go_bufio_writer_buffered(w: &GoBufioWriter) -> i64 {
+    return w.n;
+}
+
+// Writer.AvailableBuffer: an empty buffer for the
+// caller to append to and pass to the next Write.
+// gostd has no capacity to report, so this is a
+// fresh empty Vec (see header).
+fn go_bufio_writer_available_buffer(w: &GoBufioWriter) -> Vec<u8> {
+    return Vec::new();
+}
+
+// Writer.Reset(wr): discard unflushed data, clear
+// the error, switch to a new underlying writer. The
+// buffer is kept; a struct whose buffer was never
+// allocated grows a default one.
+fn go_bufio_writer_reset(w: &GoBufioWriter, wr: GosIoWriter) -> void {
+    if len(w.buf) == 0 {
+        w.buf = __go_bufio_new_buf(GO_BUFIO_DEFAULT_SIZE);
+    };
+    w.err = go_errors_nil();
+    w.has_err = false;
+    w.n = 0;
+    w.wr = wr;
+    return;
+}
+
+// Writer.Flush: write buffered data to the
+// underlying writer. A short write with a nil error
+// becomes io.ErrShortWrite (target id 900014,
+// R1378). On error the
+// unwritten tail is shifted to the front of the
+// buffer and the error sticks.
+fn go_bufio_writer_flush(w: &GoBufioWriter) -> ptr {
+    if w.has_err { return w.err; };
+    if w.n == 0 { return go_errors_nil(); };
+    let chunk = __go_bufio_slice(w.buf, 0, w.n);
+    let res = go_io_writer_write(&w.wr, chunk);
+    if res.n < 0 { panic(77415); };
+    if res.n > w.n { panic(77415); };
+    let err = res.err;
+    if res.n < w.n && err == go_errors_nil() {
+        err = __go_bufio_short_write();
+    };
+    if err != go_errors_nil() {
+        if res.n > 0 && res.n < w.n {
+            let i = 0;
+            while i < w.n - res.n {
+                w.buf[i] = w.buf[res.n + i];
+                i = i + 1;
+            }
+        };
+        w.n = w.n - res.n;
+        w.err = err;
+        w.has_err = true;
+        return w.err;
+    };
+    w.n = 0;
+    return go_errors_nil();
+}
+
+// The shared Write / WriteString loop (Go's two
+// methods differ only in the StringWriter fast path,
+// which the handle seam cannot express (see the IO
+// SEAM in the header) -- so both run this loop). Large
+// writes with an empty buffer go straight to the
+// underlying writer; otherwise data is copied into
+// the buffer and flushed when full.
+fn __go_bufio_writer_write_all(w: &GoBufioWriter, p: Vec<u8>) -> GoIoResult {
+    let nn = 0;
+    let off = 0;
+    while len(p) - off > go_bufio_writer_available(w) && !w.has_err {
+        if w.n == 0 {
+            let chunk = __go_bufio_slice(p, off, len(p));
+            let res = go_io_writer_write(&w.wr, chunk);
+            if res.n < 0 { panic(77415); };
+            if res.n > len(p) - off { panic(77415); };
+            nn = nn + res.n;
+            off = off + res.n;
+            if res.err != go_errors_nil() {
+                w.err = res.err;
+                w.has_err = true;
+            };
+        } else {
+            let space = go_bufio_writer_available(w);
+            let i = 0;
+            while i < space {
+                w.buf[w.n + i] = p[off + i];
+                i = i + 1;
+            }
+            w.n = w.n + space;
+            nn = nn + space;
+            off = off + space;
+            let _e = go_bufio_writer_flush(w);
+        };
+    }
+    if w.has_err {
+        return GoIoResult { n: nn, err: w.err };
+    };
+    let n = len(p) - off;
+    let i = 0;
+    while i < n {
+        w.buf[w.n + i] = p[off + i];
+        i = i + 1;
+    }
+    w.n = w.n + n;
+    nn = nn + n;
+    return GoIoResult { n: nn, err: go_errors_nil() };
+}
+
+// Writer.Write(p): contents of p into the buffer.
+fn go_bufio_writer_write(w: &GoBufioWriter, p: Vec<u8>) -> GoIoResult {
+    return __go_bufio_writer_write_all(w, p);
+}
+
+// Writer.WriteString(s): a Go string is a Vec<u8>
+// in gostd, so this is Write over the same loop
+// (no StringWriter fast path -- see header).
+fn go_bufio_writer_write_string(w: &GoBufioWriter, s: Vec<u8>) -> GoIoResult {
+    return __go_bufio_writer_write_all(w, s);
+}
+
+// Writer.WriteByte(c).
+fn go_bufio_writer_write_byte(w: &GoBufioWriter, c: u8) -> ptr {
+    if w.has_err { return w.err; };
+    if go_bufio_writer_available(w) <= 0 {
+        let e = go_bufio_writer_flush(w);
+        if e != go_errors_nil() { return w.err; };
+    };
+    w.buf[w.n] = c;
+    w.n = w.n + 1;
+    return go_errors_nil();
+}
+
+// Writer.WriteRune(r): one Unicode code point. An
+// out-of-range or surrogate rune encodes as U+FFFD
+// (via __go_utf8_append), matching Go's
+// utf8.EncodeRune. A buffer too small for 4 bytes
+// even after a flush falls back to WriteString of
+// the encoded rune, as in Go.
+fn go_bufio_writer_write_rune(w: &GoBufioWriter, r: i64) -> GoBufioWriteRuneResult {
+    if r >= 0 && r < 128 {
+        let e = go_bufio_writer_write_byte(w, r as u8);
+        if e != go_errors_nil() {
+            return GoBufioWriteRuneResult { size: 0, err: e };
+        };
+        return GoBufioWriteRuneResult { size: 1, err: go_errors_nil() };
+    };
+    if w.has_err {
+        return GoBufioWriteRuneResult { size: 0, err: w.err };
+    };
+    if go_bufio_writer_available(w) < 4 {
+        let e = go_bufio_writer_flush(w);
+        if e != go_errors_nil() {
+            return GoBufioWriteRuneResult { size: 0, err: w.err };
+        };
+        if go_bufio_writer_available(w) < 4 {
+            let tmp = Vec::new();
+            __go_utf8_append(tmp, r);
+            let res = go_bufio_writer_write(w, tmp);
+            return GoBufioWriteRuneResult { size: res.n, err: res.err };
+        };
+    };
+    let tmp = Vec::new();
+    __go_utf8_append(tmp, r);
+    let i = 0;
+    while i < len(tmp) {
+        w.buf[w.n + i] = tmp[i];
+        i = i + 1;
+    }
+    w.n = w.n + len(tmp);
+    return GoBufioWriteRuneResult { size: len(tmp), err: go_errors_nil() };
+}
+
+// Writer.ReadFrom(rd): read from the reader handle
+// into the buffer and flush as needed, until the
+// reader errors (EOF included). No ReaderFrom fast
+// path (see the IO SEAM in the header). A trailing EOF with
+// room left in the buffer is swallowed and reported
+// as nil; a trailing EOF with a full buffer flushes
+// first, as in Go. 100 consecutive empty reads
+// become io.ErrNoProgress (target id 900012,
+// R1378).
+fn go_bufio_writer_read_from(w: &GoBufioWriter, rd: &GosIoReader) -> GoBufioCountResult {
+    if w.has_err {
+        return GoBufioCountResult { n: 0, err: w.err };
+    };
+    let n = 0;
+    let rerr = go_errors_nil();
+    while true {
+        if go_bufio_writer_available(w) == 0 {
+            let e = go_bufio_writer_flush(w);
+            if e != go_errors_nil() {
+                return GoBufioCountResult { n: n, err: e };
+            };
+        };
+        let nr = 0;
+        let m = 0;
+        rerr = go_errors_nil();
+        // scratch is hoisted: it is read after the loop (copy into w.buf),
+        // so it must outlive the loop; re-created fresh each iteration.
+        let scratch = Vec::new();
+        while nr < GO_BUFIO_MAX_EMPTY_READS {
+            scratch = Vec::new();
+            let res = go_io_reader_read(rd, &scratch, go_bufio_writer_available(w));
+            if res.n < 0 { panic(77415); };
+            if res.n > len(scratch) { panic(77415); };
+            if res.n > go_bufio_writer_available(w) { panic(77415); };
+            m = res.n;
+            rerr = res.err;
+            if m != 0 || rerr != go_errors_nil() { break; };
+            nr = nr + 1;
+        }
+        if nr == GO_BUFIO_MAX_EMPTY_READS {
+            return GoBufioCountResult { n: n, err: __go_bufio_no_progress() };
+        };
+        let i = 0;
+        while i < m {
+            w.buf[w.n + i] = scratch[i];
+            i = i + 1;
+        }
+        w.n = w.n + m;
+        n = n + m;
+        if rerr != go_errors_nil() { break; };
+    }
+    if __go_bufio_is_eof(rerr) {
+        if go_bufio_writer_available(w) == 0 {
+            let e = go_bufio_writer_flush(w);
+            return GoBufioCountResult { n: n, err: e };
+        };
+        return GoBufioCountResult { n: n, err: go_errors_nil() };
+    };
+    return GoBufioCountResult { n: n, err: rerr };
+}
+
+// ================= ReadWriter =================
+
+// bufio.ReadWriter: a Reader + a Writer pair. Go
+// embeds *Reader / *Writer, so the pair shares the
+// very same objects. gostd stores both BY VALUE:
+// NewReadWriter takes ownership of the pair, and
+// the caller must not keep using the original
+// Reader/Writer afterwards (see header). Method
+// calls go to the pair's .r / .w fields with the
+// go_bufio_reader_* / go_bufio_writer_* functions.
+struct GoBufioReadWriter {
+    r: GoBufioReader,
+    w: GoBufioWriter,
+}
+
+// bufio.NewReadWriter(r, w).
+fn go_bufio_new_read_writer(r: GoBufioReader, w: GoBufioWriter) -> GoBufioReadWriter {
+    return GoBufioReadWriter { r: r, w: w };
+}
+
+// ================= Scanner =================
+
+// bufio.Scanner: tokenise input with a split
+// function (default ScanLines). token/has_token
+// hold the last token; buf/start/end are the
+// unprocessed window; err/has_err is the sticky
+// error (EOF included -- Err() hides it, as in
+// Go); empties counts successive empty tokens;
+// scan_called gates Buffer/Split (Go panics after
+// Scan starts); done stops scanning for good.
+struct GoBufioScanner {
+    rd: GosIoReader,
+    split: fn(Vec<u8>, bool) -> GoBufioSplitResult,
+    max_token_size: i64,
+    token: Vec<u8>,
+    has_token: bool,
+    buf: Vec<u8>,
+    start: i64,
+    end: i64,
+    err: ptr,
+    has_err: bool,
+    empties: i64,
+    scan_called: bool,
+    done: bool,
+}
+
+// bufio.NewScanner(rd): split defaults to
+// ScanLines, max token size 64 KiB, no buffer
+// allocated yet (the first Scan grows one).
+fn go_bufio_new_scanner(rd: GosIoReader) -> GoBufioScanner {
+    return GoBufioScanner {
+        rd: rd,
+        split: go_bufio_scan_lines,
+        max_token_size: GO_BUFIO_MAX_SCAN_TOKEN_SIZE,
+        token: Vec::new(),
+        has_token: false,
+        buf: Vec::new(),
+        start: 0,
+        end: 0,
+        err: go_errors_nil(),
+        has_err: false,
+        empties: 0,
+        scan_called: false,
+        done: false,
+    };
+}
+
+// Record the first error (an EOF already stored is
+// replaced by a later real error, as in Go's
+// setErr). A nil error is never recorded.
+fn __go_bufio_scanner_set_err(s: &GoBufioScanner, err: ptr) -> void {
+    if err == go_errors_nil() { return; };
+    if !s.has_err || __go_bufio_is_eof(s.err) {
+        s.err = err;
+        s.has_err = true;
+    };
+    return;
+}
+
+// Consume n bytes of the unprocessed window (Go's
+// advance). A negative advance is
+// ErrNegativeAdvance; advancing past the window is
+// ErrAdvanceTooFar.
+fn __go_bufio_scanner_advance(s: &GoBufioScanner, n: i64) -> bool {
+    if n < 0 {
+        __go_bufio_scanner_set_err(s, go_bufio_err_negative_advance());
+        return false;
+    };
+    if n > s.end - s.start {
+        __go_bufio_scanner_set_err(s, go_bufio_err_advance_too_far());
+        return false;
+    };
+    s.start = s.start + n;
+    return true;
+}
+
+// Scanner.Buffer(buf, max): set the initial buffer
+// and the maximum token size. Panics 77403 after
+// Scan started. The buffer is copied at its full
+// length (Vec exposes no capacity).
+fn go_bufio_scanner_buffer(s: &GoBufioScanner, buf: Vec<u8>, max: i64) -> void {
+    if s.scan_called { panic(77403); };
+    s.buf = __go_bufio_slice(buf, 0, len(buf));
+    s.max_token_size = max;
+    return;
+}
+
+// Scanner.Split(split): set the split function.
+// Panics 77403 after Scan started.
+fn go_bufio_scanner_split(s: &GoBufioScanner, split: fn(Vec<u8>, bool) -> GoBufioSplitResult) -> void {
+    if s.scan_called { panic(77403); };
+    s.split = split;
+    return;
+}
+
+// Scanner.Err: the first non-EOF error, or nil.
+// (An EOF stored as the sticky error is hidden.)
+fn go_bufio_scanner_err(s: &GoBufioScanner) -> ptr {
+    if !s.has_err { return go_errors_nil(); };
+    if __go_bufio_is_eof(s.err) { return go_errors_nil(); };
+    return s.err;
+}
+
+// Scanner.Bytes: the most recent token. This is
+// the stored token Vec itself (an alias, as in Go:
+// overwritten by the next Scan). Empty before the
+// first token.
+fn go_bufio_scanner_bytes(s: &GoBufioScanner) -> Vec<u8> {
+    if s.has_token { return s.token; };
+    return Vec::new();
+}
+
+// Scanner.Text: the most recent token as a string.
+// A Go string is a Vec<u8> in gostd.
+fn go_bufio_scanner_text(s: &GoBufioScanner) -> Vec<u8> {
+    return go_bufio_scanner_bytes(s);
+}
+
+// Scanner.Scan: advance to the next token. False
+// at EOF, on the first I/O error, or when a token
+// is too large for the buffer. A split function
+// returning ErrFinalToken stops scanning with no
+// error (and delivers its token, if any, as the
+// last one). More than 100 empty tokens without
+// progressing panics 77415, as in Go.
+fn go_bufio_scanner_scan(s: &GoBufioScanner) -> bool {
+    if s.done { return false; };
+    s.scan_called = true;
+    while true {
+        if s.end > s.start || s.has_err {
+            let data = __go_bufio_slice(s.buf, s.start, s.end);
+            let sp = s.split;
+            let res = sp(data, s.has_err);
+            if res.err != go_errors_nil() {
+                if __go_bufio_is_err(res.err, GO_BUFIO_ID_FINAL_TOKEN) {
+                    s.token = res.token;
+                    s.has_token = res.has_token;
+                    s.done = true;
+                    return res.has_token;
+                };
+                __go_bufio_scanner_set_err(s, res.err);
+                return false;
+            };
+            if !__go_bufio_scanner_advance(s, res.advance) {
+                return false;
+            };
+            s.token = res.token;
+            s.has_token = res.has_token;
+            if res.has_token {
+                if !s.has_err || res.advance > 0 {
+                    s.empties = 0;
+                } else {
+                    s.empties = s.empties + 1;
+                    if s.empties > GO_BUFIO_MAX_EMPTY_READS { panic(77415); };
+                };
+                return true;
+            };
+        };
+        if s.has_err {
+            s.start = 0;
+            s.end = 0;
+            return false;
+        };
+        if s.start > 0 && (s.end == len(s.buf) || s.start > len(s.buf) / 2) {
+            let i = 0;
+            while i < s.end - s.start {
+                s.buf[i] = s.buf[s.start + i];
+                i = i + 1;
+            }
+            s.end = s.end - s.start;
+            s.start = 0;
+        };
+        if s.end == len(s.buf) {
+            if len(s.buf) >= s.max_token_size || len(s.buf) > 9223372036854775807 / 2 {
+                __go_bufio_scanner_set_err(s, go_bufio_err_too_long());
+                return false;
+            };
+            let new_size = len(s.buf) * 2;
+            if new_size == 0 { new_size = GO_BUFIO_START_BUF_SIZE; };
+            if new_size > s.max_token_size { new_size = s.max_token_size; };
+            let new_buf = __go_bufio_new_buf(new_size);
+            let i = 0;
+            while i < s.end - s.start {
+                new_buf[i] = s.buf[s.start + i];
+                i = i + 1;
+            }
+            s.buf = new_buf;
+            s.end = s.end - s.start;
+            s.start = 0;
+        };
+        let tries = 0;
+        while true {
+            let scratch = Vec::new();
+            let res = go_io_reader_read(&s.rd, &scratch, len(s.buf) - s.end);
+            if res.n < 0 || len(s.buf) - s.end < res.n {
+                __go_bufio_scanner_set_err(s, go_bufio_err_bad_read_count());
+                break;
+            };
+            if res.n > len(scratch) {
+                __go_bufio_scanner_set_err(s, go_bufio_err_bad_read_count());
+                break;
+            };
+            let i = 0;
+            while i < res.n {
+                s.buf[s.end + i] = scratch[i];
+                i = i + 1;
+            }
+            s.end = s.end + res.n;
+            if res.err != go_errors_nil() {
+                __go_bufio_scanner_set_err(s, res.err);
+                break;
+            };
+            if res.n > 0 {
+                s.empties = 0;
+                break;
+            };
+            tries = tries + 1;
+            if tries > GO_BUFIO_MAX_EMPTY_READS {
+                __go_bufio_scanner_set_err(s, __go_bufio_no_progress());
+                break;
+            };
+        }
+    }
+}
+
+// ================= split functions =================
+
+// A split result with no token and no error.
+fn __go_bufio_split_none(advance: i64) -> GoBufioSplitResult {
+    return GoBufioSplitResult { advance: advance, token: Vec::new(), has_token: false, err: go_errors_nil() };
+}
+
+fn __go_bufio_split_token(advance: i64, token: Vec<u8>) -> GoBufioSplitResult {
+    return GoBufioSplitResult { advance: advance, token: token, has_token: true, err: go_errors_nil() };
+}
+
+// bufio.ScanBytes: each byte is a token.
+fn go_bufio_scan_bytes(data: Vec<u8>, at_eof: bool) -> GoBufioSplitResult {
+    if len(data) == 0 {
+        return __go_bufio_split_none(0);
+    };
+    return __go_bufio_split_token(1, __go_bufio_slice(data, 0, 1));
+}
+
+// Drop a terminal \r (Go's dropCR).
+fn __go_bufio_drop_cr(data: Vec<u8>) -> Vec<u8> {
+    if len(data) > 0 && data[len(data) - 1] == 13u8 {
+        return __go_bufio_slice(data, 0, len(data) - 1);
+    };
+    return __go_bufio_slice(data, 0, len(data));
+}
+
+// bufio.ScanRunes: each UTF-8 rune is a token.
+// Erroneous encodings become U+FFFD (EF BF BD),
+// advancing one byte -- the same as ranging over
+// the input as a string. An incomplete rune at the
+// end of the data asks for more input (unless at
+// EOF, where it is an error rune).
+fn go_bufio_scan_runes(data: Vec<u8>, at_eof: bool) -> GoBufioSplitResult {
+    if len(data) == 0 {
+        return __go_bufio_split_none(0);
+    };
+    if data[0] < 128 {
+        return __go_bufio_split_token(1, __go_bufio_slice(data, 0, 1));
+    };
+    let d = __go_utf8_decode(data, 0);
+    if d.size > 1 {
+        return __go_bufio_split_token(d.size, __go_bufio_slice(data, 0, d.size));
+    };
+    if !at_eof && !__go_bufio_full_rune_to(data, 0, len(data)) {
+        return __go_bufio_split_none(0);
+    };
+    let tok = Vec::new();
+    tok.push(239u8); tok.push(191u8); tok.push(189u8);
+    return __go_bufio_split_token(1, tok);
+}
+
+// bufio.ScanLines: each line, stripped of its
+// trailing \r?\n. The last non-empty line is
+// returned even without a newline.
+fn go_bufio_scan_lines(data: Vec<u8>, at_eof: bool) -> GoBufioSplitResult {
+    if len(data) == 0 {
+        return __go_bufio_split_none(0);
+    };
+    let i = __go_bufio_index_byte(data, 10u8);
+    if i >= 0 {
+        return __go_bufio_split_token(i + 1, __go_bufio_drop_cr(__go_bufio_slice(data, 0, i)));
+    };
+    if at_eof {
+        return __go_bufio_split_token(len(data), __go_bufio_drop_cr(data));
+    };
+    return __go_bufio_split_none(0);
+}
+
+// bufio.ScanWords: space-separated words, with
+// surrounding spaces deleted. Never returns an
+// empty token. Space is Go's scan.go isSpace set.
+fn go_bufio_scan_words(data: Vec<u8>, at_eof: bool) -> GoBufioSplitResult {
+    let start = 0;
+    while start < len(data) {
+        let d = __go_utf8_decode(data, start);
+        if !__go_bufio_is_space(d.r) { break; };
+        start = start + d.size;
+    }
+    let i = start;
+    while i < len(data) {
+        let d = __go_utf8_decode(data, i);
+        if __go_bufio_is_space(d.r) {
+            return __go_bufio_split_token(i + d.size, __go_bufio_slice(data, start, i));
+        };
+        i = i + d.size;
+    }
+    if at_eof && len(data) > start {
+        return __go_bufio_split_token(len(data), __go_bufio_slice(data, start, len(data)));
+    };
+    return __go_bufio_split_none(start);
+}

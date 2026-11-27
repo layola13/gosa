@@ -1,0 +1,363 @@
+// gostd cmp: the SLA-side model of Go's cmp package.
+//
+// Oracle: Go 1.27.2 stdlib src/cmp/cmp.go (the whole package
+// is one small file, 70 lines), read 2026-11-27. Census:
+// CENSUS-170.md rev1 section 7.2.1, wave 1b, generic-
+// instantiation prerequisite handled SLA-side by
+// CONCRETE-TYPE INSTANTIATION (see the seam below).
+//
+// Organisation follows the psa_std / gostd precedent: one
+// .sla file per Go package, public entry points
+// go_<pkg>_<name>, private helpers __go_<pkg>_<name>,
+// panic codes listed up front, loud refusals instead of
+// silent approximations. Strings are Vec<u8> everywhere.
+// Splice position: cmp sits AFTER the existing 21-file
+// splice order (errors, math, strconv, strings, fmt,
+// sync, time, sort, runtime, io, bytes, hash, crc32,
+// fnv, base64, hex, utf8, path, flag, bufio, log,
+// context) -- i.e. appended at the end, position 22.
+// It needs bytes.sla (go_bytes_compare, position 11),
+// which precedes it. cmp is a dependency of slices/maps
+// only conceptually: slices and maps take their
+// comparators from the frontend, they do not call cmp
+// functions, so cmp does not need to precede them and
+// nothing in the current splice depends on cmp; the
+// append-at-end position is safe. Cross-file calls are
+// plain function calls.
+//
+// Cross-file dependencies (all in earlier splice files):
+//   bytes.sla   go_bytes_compare (the Vec<u8> form --
+//               Go string ordering IS lexicographic
+//               bytewise ordering, exactly bytes.Compare)
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   NONE claimed. The f64 form is implemented for real
+//   (see below), so the assigned loud-refusal code 77433
+//   (f64 comparison before the float surface lands) is
+//   NOT used and stays unclaimed. No other function in
+//   this file panics.
+// Target ids: NONE claimed. cmp has no error values in
+// Go, so the assigned id 900044 is NOT used and stays
+// unclaimed. Do not invent sentinels for this package.
+//
+// THE FLOAT FACE -- why there is no loud-refusal stub.
+// The brief allowed the f64 form to be a loud-refusal
+// stub (77433) if the float surface did not exist in
+// the corpus. It DOES exist: f64 is a first-class SLA
+// type (math.sla uses f64 throughout, with @extern
+// sa_math_* faces; flag.sla stores f64 values and
+// calls go_strconv_format_float), f64 comparisons
+// (<, >, ==, != against f64 and 0.0 literals) are used
+// all over math.sla (go_math_is_nan is literally
+// `return x != x;`, go_math_abs uses `x < 0.0`), and
+// the oracle's isNaN is exactly `x != x`. So the f64
+// forms below are real implementations, not stubs, and
+// 77433 is left unclaimed. What is NOT landed is a
+// gostd float *package* surface (math/big, float
+// formatting edge cases live in strconv, not here) --
+// cmp needs none of that: Compare/Less/Or on f64 need
+// only comparison operators and the x != x NaN test.
+//
+// THE SEAMS -- integration checks, one per item the
+// task brief names. None of these is decided silently
+// inside this file; each names the party that must
+// confirm it at integration time.
+//
+// (a) CONCRETE-TYPE INSTANTIATION / the Ordered
+//     constraint. SLA has no generics and no Ordered
+//     constraint, so Go's generic Compare[T Ordered],
+//     Less[T Ordered] and Or[T comparable] are written
+//     as one concrete instantiation per ordered type
+//     the splice needs:
+//       i64     -- all Go signed ints (int, int8/16/32/
+//                  64); widening to i64 is exact for
+//                  every signed width, so one form
+//                  covers them all
+//       f64     -- Go float64 (and float32, which
+//                  widens to f64 exactly -- see seam
+//                  (e))
+//       Vec<u8> -- Go string AND []byte: both order
+//                  lexicographically bytewise, so one
+//                  form (delegating to bytes.Compare)
+//                  covers both
+//       bool    -- NOT in Go's Ordered (see the
+//                  divergence note below); provided
+//                  because the splice's slices/maps
+//                  lines asked for it
+//     The Ordered constraint itself is a FRONTEND
+//     type fact: the frontend only emits these calls
+//     for a T that satisfies Go's Ordered (or, for the
+//     bool form, for a bool operand the frontend has
+//     explicitly decided to order as false < true).
+//     No new instantiation may be invented by the
+//     mapping line: an unlisted type (uint64, uintptr,
+//     complex, a named ordered type the frontend has
+//     not mapped) is a frontend refusal, not a silent
+//     cast into one of these forms -- except for the
+//     exact widenings named in seams (a) and (e).
+//
+// (b) OR IS VARIADIC IN GO. Go's Or takes `vals ...T`.
+//     SLA has no variadic spelling, so every Or form
+//     takes a single Vec<T> and the frontend collects
+//     the call-site arguments into that Vec. The
+//     headline form is go_cmp_or_i64: Go's canonical
+//     use of Or is chaining Compare results
+//     (cmp.Or(cmp.Compare(a, b), cmp.Compare(c, d))),
+//     and Compare results ARE i64s, so the chaining
+//     form is the i64 form over a Vec<i64> of
+//     comparison outcomes. The f64 / bytes / bool Or
+//     forms are the same rule (first non-zero value,
+//     else the zero value) at those types.
+//
+// (c) UNSIGNED INTS. No u64 instantiation is written:
+//     uint32 and smaller unsigned widths fit i64
+//     exactly, so the frontend may map them onto the
+//     i64 form; uint64 / uintptr values above
+//     MaxInt64 (2^63 - 1) do NOT fit, and the frontend
+//     must refuse a cmp.Compare on such a value (or a
+//     later wave adds go_cmp_compare_u64). Never
+//     silently truncate a uint64 into i64.
+//
+// (d) NO ERROR VALUES. cmp returns no errors in Go
+//     (Compare returns int, Less returns bool, Or
+//     returns T), so there is no GosError surface in
+//     this file and no target id is claimed.
+//
+// (e) FLOAT32. Go float32 is not a distinct SLA type.
+//     The f64 form serves float32 too: widening f32
+//     to f64 is exact, and NaN / -0.0 behaviour is
+//     identical after widening (NaN stays NaN, -0.0
+//     stays -0.0, and -0.0 == 0.0 compares equal in
+//     both widths). The frontend maps a float32
+//     Compare/Less/Or onto the f64 form.
+//
+// (f) NO MUTABLE GLOBALS, NO THREADS, NO CLOSURES.
+//     cmp is pure: every function is a pure function
+//     of its arguments. Nothing in this file spawns a
+//     thread or builds a closure, so the block-closure
+//     parser restriction (RULING-EXEC-170.md section
+//     1) never arises here.
+//
+// DIVERGENCES (all deliberate, all noted here):
+//   - bool is NOT in Go's Ordered: cmp.Compare[bool]
+//     does not compile in Go. The bool forms here
+//     (false < true) are a gostd extension for the
+//     splice's slices/maps lines, NOT a mapping of
+//     any Go source form: the frontend must NEVER
+//     emit go_cmp_compare_bool for a Go
+//     cmp.Compare[bool] call (that source is a Go
+//     compile error, and the frontend must report it
+//     as one).
+//   - Go's Less/Compare take their operands by value
+//     and are generic; the concrete forms here are
+//     the same semantics at each listed type, nothing
+//     more.
+//   - Go's Or returns its argument type T; the Or
+//     forms here return the concrete T of their
+//     instantiation, with the zero value (0, 0.0,
+//     empty Vec<u8>, false) when every argument is
+//     zero -- exactly Go's rule.
+//
+// LOUD REFUSALS (every gap in this file panics with a
+// claimed code; nothing is a silent stub):
+//   NONE. Every entry point in this file is
+//   implemented. The assigned 77433 stays unclaimed
+//   because the f64 form is real (see the float-face
+//   note above); if a future wave finds an ordered
+//   type the corpus cannot represent, that wave claims
+//   a fresh code -- it must not reuse 77433 for a
+//   different meaning, and it must not silently stub.
+//
+// Nothing in this file has been compiled or tested
+// (write-first batch; the debug phase is separate).
+
+@import "sa_std/vec.sa"
+
+// ---------- private helpers ----------
+
+// Go's cmp.isNaN, verbatim: `return x != x`. This is
+// the same test as math.sla's go_math_is_nan; it is
+// written out here (rather than calling across to
+// math.sla) so cmp tracks the oracle's own helper and
+// so the f64 forms depend on nothing but bytes.sla.
+// A NaN is the only f64 value unequal to itself.
+fn __go_cmp_is_nan_f64(x: f64) -> bool {
+    return x != x;
+}
+
+// ---------- i64 ----------
+
+// cmp.Compare[int64](x, y): -1 if x < y, 0 if x == y,
+// +1 if x > y. Also serves Go int/int8/int16/int32
+// (exact widening; seam (a)).
+fn go_cmp_compare_i64(x: i64, y: i64) -> i64 {
+    if x < y {
+        return 0 - 1;
+    };
+    if x > y {
+        return 1;
+    };
+    return 0;
+}
+
+// cmp.Less[int64](x, y): x < y. For i64 there is no
+// NaN case, so this is exactly the oracle's
+// `(isNaN(x) && !isNaN(y)) || x < y` with isNaN
+// identically false.
+fn go_cmp_less_i64(x: i64, y: i64) -> bool {
+    return x < y;
+}
+
+// cmp.Or[int64](vals...): the first non-zero value, or
+// 0 if every value is zero. This is the comparison-
+// chaining form: callers pass a Vec<i64> of Compare
+// results (seam (b)).
+fn go_cmp_or_i64(vals: Vec<i64>) -> i64 {
+    let i = 0;
+    while i < len(vals) {
+        if vals[i] != 0 {
+            return vals[i];
+        };
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---------- f64 ----------
+
+// cmp.Compare[float64](x, y), following the oracle
+// exactly: a NaN is less than any non-NaN, a NaN is
+// equal to a NaN, and -0.0 is equal to 0.0 (IEEE
+// -0.0 == 0.0, so both < and > are false and the
+// result is 0). Also serves Go float32 (exact
+// widening; seam (e)).
+fn go_cmp_compare_f64(x: f64, y: f64) -> i64 {
+    if __go_cmp_is_nan_f64(x) {
+        if __go_cmp_is_nan_f64(y) {
+            return 0;
+        };
+        return 0 - 1;
+    };
+    if __go_cmp_is_nan_f64(y) {
+        return 1;
+    };
+    if x < y {
+        return 0 - 1;
+    };
+    if x > y {
+        return 1;
+    };
+    return 0;
+}
+
+// cmp.Less[float64](x, y): a NaN is less than any
+// non-NaN, and -0.0 is not less than (is equal to)
+// 0.0. Written with nested ifs, not && / ||: the
+// oracle's `(isNaN(x) && !isNaN(y)) || x < y` is
+// spelled out so the eager && / || semantics
+// (task 156 defect (xviii)) cannot change the result
+// -- both branches here are pure, but the nested form
+// is also the corpus style.
+fn go_cmp_less_f64(x: f64, y: f64) -> bool {
+    if __go_cmp_is_nan_f64(x) {
+        if __go_cmp_is_nan_f64(y) {
+            return false;
+        };
+        return true;
+    };
+    return x < y;
+}
+
+// cmp.Or[float64](vals...): the first value != 0.0,
+// or 0.0 if every value is zero. NaN counts as
+// non-zero (NaN != 0.0), exactly as in Go, where the
+// zero value is 0.0 and NaN != 0.0.
+fn go_cmp_or_f64(vals: Vec<f64>) -> f64 {
+    let i = 0;
+    while i < len(vals) {
+        if vals[i] != 0.0 {
+            return vals[i];
+        };
+        i = i + 1;
+    }
+    return 0.0;
+}
+
+// ---------- Vec<u8> (Go string / []byte) ----------
+
+// cmp.Compare[string](x, y): Go string ordering is
+// lexicographic bytewise ordering -- identical to
+// bytes.Compare, so this delegates to it. The same
+// form serves Go []byte comparisons (bytes.Compare
+// is that function). No separate string form exists:
+// Go string and []byte orderings agree byte for byte,
+// including on non-UTF-8 bytes (ordering is by byte,
+// never by rune).
+fn go_cmp_compare_bytes(x: Vec<u8>, y: Vec<u8>) -> i64 {
+    return go_bytes_compare(x, y);
+}
+
+// cmp.Less[string](x, y): x < y bytewise. Serves Go
+// string and []byte alike (see above).
+fn go_cmp_less_bytes(x: Vec<u8>, y: Vec<u8>) -> bool {
+    return go_bytes_compare(x, y) < 0;
+}
+
+// cmp.Or[string](vals...) / cmp.Or[[]byte](vals...):
+// the first non-empty value, or the empty Vec<u8> if
+// every value is empty. Go's zero value for string
+// and []byte is the empty value; len > 0 is the
+// non-zero test at both types.
+fn go_cmp_or_bytes(vals: Vec<Vec<u8>>) -> Vec<u8> {
+    let i = 0;
+    while i < len(vals) {
+        if len(vals[i]) > 0 {
+            return vals[i];
+        };
+        i = i + 1;
+    }
+    return Vec::new();
+}
+
+// ---------- bool ----------
+
+// cmp.Compare over bool (gostd extension -- bool is
+// NOT in Go's Ordered; see the divergence note):
+// false < true, so false vs true is -1, true vs false
+// is +1, equal values are 0. Written without bool ==
+// (nested ifs on the values themselves, corpus style).
+fn go_cmp_compare_bool(x: bool, y: bool) -> i64 {
+    if x {
+        if y {
+            return 0;
+        };
+        return 1;
+    };
+    if y {
+        return 0 - 1;
+    };
+    return 0;
+}
+
+// cmp.Less over bool (extension, same note): only
+// false < true.
+fn go_cmp_less_bool(x: bool, y: bool) -> bool {
+    if x {
+        return false;
+    };
+    return y;
+}
+
+// cmp.Or[bool](vals...): the first true value, or
+// false if every value is false. Go's zero value for
+// bool is false.
+fn go_cmp_or_bool(vals: Vec<bool>) -> bool {
+    let i = 0;
+    while i < len(vals) {
+        if vals[i] {
+            return true;
+        };
+        i = i + 1;
+    }
+    return false;
+}

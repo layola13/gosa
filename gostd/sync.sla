@@ -1,0 +1,431 @@
+// gostd sync: Go's sync package over the SLA natives the
+// gosla frontend already emits (Chan<T>, thread::spawn).
+//
+// DESIGN: there is no SLA-level Mutex type in the sa_std /
+// sla_std surface gostd can see, so gostd builds its mutex
+// from a capacity-1 Chan<i64> used as a binary semaphore:
+// the channel holds exactly one token while the mutex is
+// unlocked; Lock receives the token, Unlock returns it.
+// This gives honest blocking semantics on the same Chan
+// native as gosla's own chan emission (demos/27).
+//
+// LOUD DIVERGENCES (all documented, none silent):
+//   - Mutex.TryLock / RWMutex.TryLock / TryRLock REFUSE
+//     (panic 77413): a non-blocking channel receive does
+//     not exist in the SLA Chan surface yet (substrate gap
+//     S5: chan try_send/try_recv/timeout). Inventing a racy
+//     poll here would be a silent wrong answer.
+//   - Unlock of an unlocked mutex BLOCKS (the token send
+//     waits for a Lock that already took the token) where
+//     Go panics "sync: unlock of unlocked mutex". Same root
+//     cause: no try_send surface to detect the full token
+//     channel. Flagged for the S5 fix.
+//   - Zero values are NOT usable: Go's sync types work at
+//     their zero value, gostd values must come from the
+//     _new constructors (the token channel must exist).
+//     The frontend emits _new for every var decl of these
+//     types; a gostd value copied after first use is as
+//     invalid as a copied Go mutex (Go vet complains; gostd
+//     would alias the same token channel).
+//   - WaitGroup.Wait busy-waits with thread yields instead
+//     of parking on a runtime semaphore. Observable CPU
+//     behaviour differs; synchronisation semantics do not.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77410 WaitGroup counter goes negative (Go panics:
+//         "sync: negative WaitGroup counter").
+//   77413 TryLock-family refusal (see above).
+// (77411 / 77412 belong to strconv in the text half and
+// are NOT sync's; an earlier draft of this header wrongly
+// reserved them. Once re-entrancy and Cond-without-lock
+// are undetectable without owner tracking gostd does not
+// have; Go deadlocks in those cases and gostd deadlocks
+// on the token channel, the honest equivalent available.)
+
+@import "sa_std/task.sai"
+@import "sa_std/thread.sai"
+@import "sa_std/vec.sa"
+@import "sa_std/hashmap.sa"
+@import "sa_std/core/option.sa"
+
+// ================= Mutex =================
+
+struct GoMutex {
+    tok: Chan<i64>,
+}
+
+fn go_sync_mutex_new() -> GoMutex {
+    let tok: Chan<i64> = Chan::new(1);
+    let m = GoMutex { tok: tok };
+    m.tok.send(1);
+    return m;
+}
+
+fn go_sync_mutex_lock(m: &GoMutex) -> void {
+    let (_t, _ok) = m.tok.recv();
+    return;
+}
+
+fn go_sync_mutex_unlock(m: &GoMutex) -> void {
+    // See header: unlocking an unlocked mutex blocks here
+    // (channel full) instead of panicking. Loud in docs,
+    // not detectable in code without try_send.
+    m.tok.send(1);
+    return;
+}
+
+fn go_sync_mutex_try_lock(m: &GoMutex) -> bool {
+    panic(77413);
+}
+
+// ================= RWMutex =================
+//
+// Go semantics: a writer excludes readers and writers; a
+// blocked Lock call excludes new readers (writer
+// preference), so readers cannot starve a waiting writer.
+// State lives under an internal GoMutex; waiters spin with
+// thread yields outside the internal lock.
+
+struct GoRWMutex {
+    mu: GoMutex,
+    readers: i64,
+    writer_active: bool,
+    writers_waiting: i64,
+}
+
+fn go_sync_rwmutex_new() -> GoRWMutex {
+    return GoRWMutex {
+        mu: go_sync_mutex_new(),
+        readers: 0,
+        writer_active: false,
+        writers_waiting: 0,
+    };
+}
+
+fn go_sync_rwmutex_r_lock(m: &GoRWMutex) -> void {
+    while true {
+        go_sync_mutex_lock(&m.mu);
+        if m.writer_active {
+            go_sync_mutex_unlock(&m.mu);
+            let _y = sa_thread_yield_now();
+        } else {
+            if m.writers_waiting > 0 {
+                go_sync_mutex_unlock(&m.mu);
+                let _y2 = sa_thread_yield_now();
+            } else {
+                m.readers = m.readers + 1;
+                go_sync_mutex_unlock(&m.mu);
+                return;
+            };
+        }
+    }
+}
+
+fn go_sync_rwmutex_r_unlock(m: &GoRWMutex) -> void {
+    go_sync_mutex_lock(&m.mu);
+    m.readers = m.readers - 1;
+    go_sync_mutex_unlock(&m.mu);
+    return;
+}
+
+fn go_sync_rwmutex_lock(m: &GoRWMutex) -> void {
+    go_sync_mutex_lock(&m.mu);
+    m.writers_waiting = m.writers_waiting + 1;
+    go_sync_mutex_unlock(&m.mu);
+    while true {
+        go_sync_mutex_lock(&m.mu);
+        if m.writer_active {
+            go_sync_mutex_unlock(&m.mu);
+            let _y = sa_thread_yield_now();
+        } else {
+            if m.readers > 0 {
+                go_sync_mutex_unlock(&m.mu);
+                let _y2 = sa_thread_yield_now();
+            } else {
+                m.writer_active = true;
+                m.writers_waiting = m.writers_waiting - 1;
+                go_sync_mutex_unlock(&m.mu);
+                return;
+            };
+        }
+    }
+}
+
+fn go_sync_rwmutex_unlock(m: &GoRWMutex) -> void {
+    go_sync_mutex_lock(&m.mu);
+    m.writer_active = false;
+    go_sync_mutex_unlock(&m.mu);
+    return;
+}
+
+fn go_sync_rwmutex_try_lock(m: &GoRWMutex) -> bool {
+    panic(77413);
+}
+
+fn go_sync_rwmutex_try_r_lock(m: &GoRWMutex) -> bool {
+    panic(77413);
+}
+
+// Downgrade / RLock-after-Lock deadlock cases follow Go:
+// they deadlock, here on the yield loops, there on the
+// runtime semaphore. No gostd code pretends otherwise.
+
+// ================= WaitGroup =================
+
+struct GoWaitGroup {
+    mu: GoMutex,
+    count: i64,
+}
+
+fn go_sync_waitgroup_new() -> GoWaitGroup {
+    return GoWaitGroup { mu: go_sync_mutex_new(), count: 0 };
+}
+
+fn go_sync_waitgroup_add(w: &GoWaitGroup, delta: i64) -> void {
+    go_sync_mutex_lock(&w.mu);
+    w.count = w.count + delta;
+    if w.count < 0 {
+        // Go panics and the counter is left negative; the
+        // panic is process-fatal here too, so the state
+        // after this point is unobservable.
+        panic(77410);
+    };
+    go_sync_mutex_unlock(&w.mu);
+    return;
+}
+
+fn go_sync_waitgroup_done(w: &GoWaitGroup) -> void {
+    go_sync_waitgroup_add(w, -1);
+    return;
+}
+
+fn go_sync_waitgroup_wait(w: &GoWaitGroup) -> void {
+    // Busy-wait with yields (see header divergence). The
+    // counter is re-read under the mutex every pass, so a
+    // racing Add is observed exactly as Go specifies
+    // (Add with positive delta at counter==0 racing Wait
+    // is a documented Go misuse; gostd makes no extra
+    // promise there either).
+    while true {
+        go_sync_mutex_lock(&w.mu);
+        let c = w.count;
+        go_sync_mutex_unlock(&w.mu);
+        if c == 0 {
+            return;
+        };
+        let _y = sa_thread_yield_now();
+    }
+}
+
+// ================= Once =================
+
+struct GoOnce {
+    mu: GoMutex,
+    done: bool,
+}
+
+fn go_sync_once_new() -> GoOnce {
+    return GoOnce { mu: go_sync_mutex_new(), done: false };
+}
+
+// f is a function value of type fn() -> void (the
+// frontend wraps the Go func literal). Go semantics: f
+// runs exactly once; concurrent Do calls block until the
+// first f returns. If f panics, Go still marks the Once
+// done; an SLA panic is process-fatal in the gostd
+// runtime, so the divergence is unobservable.
+fn go_sync_once_do(o: &GoOnce, f: fn() -> void) -> void {
+    go_sync_mutex_lock(&o.mu);
+    if o.done {
+        go_sync_mutex_unlock(&o.mu);
+        return;
+    };
+    f();
+    o.done = true;
+    go_sync_mutex_unlock(&o.mu);
+    return;
+}
+
+// ================= Cond (minimal) =================
+//
+// Go's Cond: Wait atomically unlocks the associated
+// Locker and suspends; Signal wakes one waiter; Broadcast
+// wakes all. gostd's Cond keeps a FIFO registry of
+// private capacity-1 channels, one per waiter: Wait
+// registers its channel under the internal mutex, then
+// unlocks the caller's mutex, blocks on its channel, and
+// re-locks before returning -- the exact Go ordering.
+// Signal/Broadcast pop waiters under the internal mutex
+// and send on their channels; capacity 1 with exactly one
+// send per channel means those sends never block.
+
+struct GoCond {
+    mu: GoMutex,
+    waiters: Vec<Chan<bool>>,
+}
+
+fn go_sync_cond_new() -> GoCond {
+    return GoCond { mu: go_sync_mutex_new(), waiters: Vec::new() };
+}
+
+// m is the mutex the caller holds (Go: c.L). The frontend
+// passes the same GoMutex the Go code associated via
+// NewCond; gostd does not store the binding.
+fn go_sync_cond_wait(c: &GoCond, m: &GoMutex) -> void {
+    let mine: Chan<bool> = Chan::new(1);
+    go_sync_mutex_lock(&c.mu);
+    c.waiters.push(mine);
+    go_sync_mutex_unlock(&c.mu);
+    go_sync_mutex_unlock(m);
+    let (_v, _ok) = mine.recv();
+    mine.destroy();
+    go_sync_mutex_lock(m);
+    return;
+}
+
+fn __go_cond_pop_first(c: &GoCond) -> (Chan<bool>, bool) {
+    // Caller holds c.mu.
+    let n = len(c.waiters);
+    if n == 0 {
+        let empty: Chan<bool> = Chan::new(0);
+        return (empty, false);
+    };
+    let first = c.waiters[0];
+    let i = 1;
+    while i < n {
+        c.waiters[i - 1] = c.waiters[i];
+        i = i + 1;
+    }
+    let _dropped = c.waiters.pop();
+    return (first, true);
+}
+
+fn go_sync_cond_signal(c: &GoCond) -> void {
+    go_sync_mutex_lock(&c.mu);
+    let (w, has) = __go_cond_pop_first(c);
+    go_sync_mutex_unlock(&c.mu);
+    if has {
+        w.send(true);
+    };
+    return;
+}
+
+fn go_sync_cond_broadcast(c: &GoCond) -> void {
+    go_sync_mutex_lock(&c.mu);
+    let pending: Vec<Chan<bool>> = Vec::new();
+    while len(c.waiters) > 0 {
+        let (w, has) = __go_cond_pop_first(c);
+        if has {
+            pending.push(w);
+        };
+    }
+    go_sync_mutex_unlock(&c.mu);
+    let n = len(pending);
+    let i = 0;
+    while i < n {
+        pending[i].send(true);
+        i = i + 1;
+    }
+    return;
+}
+
+// ================= Map =================
+//
+// sync.Map over a mutex-guarded HashMap. Go's sync.Map is
+// optimised for read-mostly workloads with a lock-free
+// read path; gostd takes the mutex on every operation.
+// Semantics (which keys exist, what LoadOrStore reports)
+// match Go; performance shape does not, and gostd does
+// not claim it does.
+//
+// K must satisfy the SLA HashMap key surface and V must
+// have a default value (Load's miss path mirrors the
+// frontend's own map-index emission, which uses
+// copied().unwrap_or_default() -- see gosa demo 15).
+
+struct GoSyncMap<K, V> {
+    mu: GoMutex,
+    m: HashMap<K, V>,
+}
+
+fn go_sync_map_new<K, V>() -> GoSyncMap<K, V> {
+    return GoSyncMap { mu: go_sync_mutex_new(), m: HashMap::new() };
+}
+
+fn go_sync_map_load<K, V>(sm: &GoSyncMap<K, V>, k: K) -> (V, bool) {
+    go_sync_mutex_lock(&sm.mu);
+    let got = sm.m.get(k);
+    let ok = got.is_some();
+    let v = got.copied().unwrap_or_default();
+    go_sync_mutex_unlock(&sm.mu);
+    return (v, ok);
+}
+
+fn go_sync_map_store<K, V>(sm: &GoSyncMap<K, V>, k: K, v: V) -> void {
+    go_sync_mutex_lock(&sm.mu);
+    sm.m.insert(k, v);
+    go_sync_mutex_unlock(&sm.mu);
+    return;
+}
+
+fn go_sync_map_load_or_store<K, V>(sm: &GoSyncMap<K, V>, k: K, v: V) -> (V, bool) {
+    go_sync_mutex_lock(&sm.mu);
+    let got = sm.m.get(k);
+    if got.is_some() {
+        let actual = got.copied().unwrap_or_default();
+        go_sync_mutex_unlock(&sm.mu);
+        return (actual, true);
+    };
+    sm.m.insert(k, v);
+    go_sync_mutex_unlock(&sm.mu);
+    return (v, false);
+}
+
+fn go_sync_map_load_and_delete<K, V>(sm: &GoSyncMap<K, V>, k: K) -> (V, bool) {
+    go_sync_mutex_lock(&sm.mu);
+    let got = sm.m.get(k);
+    if got.is_some() {
+        let actual = got.copied().unwrap_or_default();
+        sm.m.remove(k);
+        go_sync_mutex_unlock(&sm.mu);
+        return (actual, true);
+    };
+    let zero = got.copied().unwrap_or_default();
+    go_sync_mutex_unlock(&sm.mu);
+    return (zero, false);
+}
+
+fn go_sync_map_delete<K, V>(sm: &GoSyncMap<K, V>, k: K) -> void {
+    go_sync_mutex_lock(&sm.mu);
+    sm.m.remove(k);
+    go_sync_mutex_unlock(&sm.mu);
+    return;
+}
+
+// Range calls f(k, v) for each entry until f returns
+// false. The key set is snapshotted under the mutex and
+// each value is re-read live, so entries deleted after
+// the snapshot are skipped and entries stored after it
+// are not visited -- inside Go's (deliberately loose)
+// Range contract. The generic key snapshot rides on the
+// same __go_hashmap_keys surface flagged in runtime.sla.
+fn go_sync_map_range<K, V>(sm: &GoSyncMap<K, V>, f: fn(K, V) -> bool) -> void {
+    go_sync_mutex_lock(&sm.mu);
+    let keys = __go_hashmap_keys_g(&sm.m);
+    go_sync_mutex_unlock(&sm.mu);
+    let n = len(keys);
+    let i = 0;
+    while i < n {
+        let (v, ok) = go_sync_map_load(sm, keys[i]);
+        if ok {
+            if f(keys[i], v) {
+                i = i + 1;
+            } else {
+                return;
+            };
+        } else {
+            i = i + 1;
+        }
+    }
+    return;
+}

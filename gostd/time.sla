@@ -1,0 +1,784 @@
+// gostd time: Go's time package -- Duration arithmetic,
+// formatting and parsing, the Time value shape, and the
+// Sleep / After / Timer / Ticker helpers -- over the
+// sa_std time externs:
+//   sa_time_instant_ns() -> u64   (monotonic clock, ns)
+//   sa_time_unix_ns()    -> i64   (wall clock, ns)
+//   sa_time_unix_ms()    -> i64
+//   sa_time_sleep_ns(ns) -> i32
+//   sa_time_get_* (ms)   -> i64   (UTC field getters)
+//
+// GoDuration is a bare i64 of nanoseconds, exactly as in
+// Go (type Duration int64). GoTime mirrors Go's time.Time
+// split: a wall-clock reading plus a monotonic reading.
+// Go strips the monotonic reading in Add/AddDate results
+// and uses it in Sub when both operands carry one; gostd
+// does the same (has_mono flag).
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77420 held unallocated for this file. ParseDuration
+//         does NOT panic: like the text half's strconv, it
+//         reports failure as a GosError value inside its
+//         result struct (see go_time_parse_duration).
+//   77421 Duration overflow in Round/Trunc paths where Go
+//         would produce a wrapped value gostd refuses to
+//         guess; also NewTicker with a non-positive period
+//         (Go panics with its own message there).
+//   77423 AddDate refusal: the sa_time_set_field extern
+//         contract (field codes, month-length rules) is
+//         not confirmed at gostd's layer, and a wrong
+//         AddDate is worse than a loud refusal.
+
+@import "sa_std/time.sai"
+@import "sa_std/task.sai"
+@import "sa_std/thread.sai"
+@import "sa_std/vec.sa"
+
+// ---- Duration constants (nanoseconds) ----
+
+const GO_NANOSECOND: i64 = 1;
+const GO_MICROSECOND: i64 = 1000;
+const GO_MILLISECOND: i64 = 1000000;
+const GO_SECOND: i64 = 1000000000;
+const GO_MINUTE: i64 = 60000000000;
+const GO_HOUR: i64 = 3600000000000;
+
+// ================= Duration =================
+
+fn go_time_duration_nanoseconds(d: i64) -> i64 {
+    return d;
+}
+
+fn go_time_duration_microseconds(d: i64) -> i64 {
+    return d / 1000;
+}
+
+fn go_time_duration_milliseconds(d: i64) -> i64 {
+    return d / 1000000;
+}
+
+fn go_time_duration_seconds(d: i64) -> f64 {
+    return (d as f64) / 1000000000.0;
+}
+
+fn go_time_duration_minutes(d: i64) -> f64 {
+    return (d as f64) / 60000000000.0;
+}
+
+fn go_time_duration_hours(d: i64) -> f64 {
+    return (d as f64) / 3600000000000.0;
+}
+
+// Duration.Truncate: rounds down (toward zero in
+// magnitude terms: Go truncates toward zero for positive
+// m by dropping the remainder of |d|).
+fn go_time_duration_truncate(d: i64, m: i64) -> i64 {
+    if m <= 0 {
+        return d;
+    };
+    if d == -9223372036854775807 - 1 {
+        // |d| is not representable; Go's own implementation
+        // works in uint64 here. gostd refuses rather than
+        // wrap (77421).
+        panic(77421);
+    };
+    if d < 0 {
+        return -((-d / m) * m);
+    };
+    return (d / m) * m;
+}
+
+// Duration.Round: nearest multiple of m, halfway away
+// from zero (Go's documented behaviour).
+fn go_time_duration_round(d: i64, m: i64) -> i64 {
+    if m <= 0 {
+        return d;
+    };
+    if d == -9223372036854775807 - 1 {
+        panic(77421);
+    };
+    let neg = d < 0;
+    let a = d;
+    if neg {
+        a = -d;
+    };
+    let q = a / m;
+    let r = a % m;
+    let rounded = q * m;
+    if r + r >= m {
+        rounded = rounded + m;
+    };
+    if neg {
+        return -rounded;
+    };
+    return rounded;
+}
+
+// ---- Duration.String (Go's exact formatting rules) ----
+//
+// fmtFrac/fmtInt equivalent: the largest unit leads;
+// sub-second durations print in ms/us/ns with a trimmed
+// fraction; second-and-up print h/m/s composites with a
+// trimmed 9-digit fraction on the seconds.
+
+fn __go_time_append_u64(buf: &Vec<u8>, v: u64) -> void {
+    if v == 0 {
+        buf.push(48);
+        return;
+    };
+    let digits: Vec<u8> = Vec::new();
+    let x = v;
+    while x > 0 {
+        digits.push((48 + (x % 10)) as u8);
+        x = x / 10;
+    }
+    let i = len(digits);
+    while i > 0 {
+        i = i - 1;
+        buf.push(digits[i]);
+    }
+    return;
+}
+
+// Appends '.' + the fraction digits of frac (frac is
+// understood to have exactly `width` digits, zero-padded
+// on the left), with trailing zeros trimmed. Appends
+// nothing when frac == 0.
+fn __go_time_append_frac(buf: &Vec<u8>, frac: u64, width: i64) -> void {
+    if frac == 0 {
+        return;
+    };
+    // rev[i] = the i-th least significant digit character.
+    let rev: Vec<u8> = Vec::new();
+    let x = frac;
+    let i = 0;
+    while i < width {
+        rev.push((48 + (x % 10)) as u8);
+        x = x / 10;
+        i = i + 1;
+    }
+    // Trailing zeros of the printed fraction are the
+    // leading zeros of rev; keep = width - that count.
+    // frac != 0 guarantees a non-zero digit exists.
+    let tz = 0;
+    while tz < width {
+        if rev[tz] == 48 {
+            tz = tz + 1;
+        } else {
+            break;
+        }
+    }
+    let keep = width - tz;
+    buf.push(46);
+    let j = 0;
+    while j < keep {
+        buf.push(rev[width - 1 - j]);
+        j = j + 1;
+    }
+    return;
+}
+
+fn go_time_duration_string(d: i64) -> Vec<u8> {
+    if d == 0 {
+        let z: Vec<u8> = Vec::new();
+        z.push(48);
+        z.push(115);
+        return z;
+    };
+    let buf: Vec<u8> = Vec::new();
+    let u: u64 = 0;
+    if d < 0 {
+        buf.push(45);
+        // Magnitude in u64, MinInt-safe.
+        u = (0 - (d + 1)) as u64 + 1;
+    } else {
+        u = d as u64;
+    };
+    if u < 1000 {
+        __go_time_append_u64(&buf, u);
+        buf.push(110);
+        buf.push(115);
+        return buf;
+    };
+    if u < 1000000 {
+        __go_time_append_u64(&buf, u / 1000);
+        __go_time_append_frac(&buf, u % 1000, 3);
+        // U+00B5 micro sign, UTF-8 C2 B5 -- Go prints µs.
+        buf.push(194);
+        buf.push(181);
+        buf.push(115);
+        return buf;
+    };
+    if u < 1000000000 {
+        __go_time_append_u64(&buf, u / 1000000);
+        __go_time_append_frac(&buf, u % 1000000, 6);
+        buf.push(109);
+        buf.push(115);
+        return buf;
+    };
+    let sec_total = u / 1000000000;
+    let frac = u % 1000000000;
+    let h = sec_total / 3600;
+    let rem = sec_total % 3600;
+    let mnt = rem / 60;
+    let sec = rem % 60;
+    if h > 0 {
+        __go_time_append_u64(&buf, h);
+        buf.push(104);
+    };
+    if h > 0 {
+        __go_time_append_u64(&buf, mnt);
+        buf.push(109);
+    } else {
+        if mnt > 0 {
+            __go_time_append_u64(&buf, mnt);
+            buf.push(109);
+        };
+    };
+    __go_time_append_u64(&buf, sec);
+    __go_time_append_frac(&buf, frac, 9);
+    buf.push(115);
+    return buf;
+}
+
+// ---- ParseDuration (Go grammar) ----
+//
+// Grammar: [sign] ( number unit )+ | "0". Units: ns, us,
+// µs (C2 B5), μs (CE BC, Greek mu), ms, s, m, h. Numbers
+// may be fractional ("1.5h", ".5s"). The result follows
+// the gostd text half's (value, error) convention: a
+// result struct whose err is a GosError ptr, nil on
+// success (strconv's GoConv* shape). Go's error text is
+// `time: invalid duration "<input>"` for every failure
+// class here; Go distinguishes "unknown unit" in its
+// message for one class, gostd does not -- divergence
+// noted in NOTES-runtime.md.
+// Divergence: the fractional segment is accumulated in
+// exact integer arithmetic; Go accumulates it in float64
+// and can differ by 1ns on pathological inputs (e.g. very
+// long fraction digit strings). Documented in NOTES.
+
+struct GoTimeDurationResult {
+    v: i64,
+    err: ptr,
+}
+
+fn __go_time_invalid_duration(s: &Vec<u8>) -> ptr {
+    let msg: Vec<u8> = Vec::new();
+    // time: invalid duration "
+    let prefix: Vec<u8> = Vec::new();
+    prefix.push(116);
+    prefix.push(105);
+    prefix.push(109);
+    prefix.push(101);
+    prefix.push(58);
+    prefix.push(32);
+    prefix.push(105);
+    prefix.push(110);
+    prefix.push(118);
+    prefix.push(97);
+    prefix.push(108);
+    prefix.push(105);
+    prefix.push(100);
+    prefix.push(32);
+    prefix.push(100);
+    prefix.push(117);
+    prefix.push(114);
+    prefix.push(97);
+    prefix.push(116);
+    prefix.push(105);
+    prefix.push(111);
+    prefix.push(110);
+    prefix.push(32);
+    prefix.push(34);
+    let i = 0;
+    while i < len(prefix) {
+        msg.push(prefix[i]);
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(s) {
+        msg.push(s[j]);
+        j = j + 1;
+    }
+    msg.push(34);
+    return go_errors_new(msg);
+}
+
+fn __go_time_unit_ns(s: &Vec<u8>, i: i64, n: i64) -> (i64, i64, bool) {
+    // Returns (unit_ns, bytes_consumed, ok).
+    if i >= n {
+        return (0, 0, false);
+    };
+    let b = s[i];
+    if b == 110 {
+        // 'n' -> ns
+        if i + 1 < n {
+            if s[i + 1] == 115 {
+                return (1, 2, true);
+            };
+        };
+        return (0, 0, false);
+    };
+    if b == 117 {
+        // 'u' -> us
+        if i + 1 < n {
+            if s[i + 1] == 115 {
+                return (1000, 2, true);
+            };
+        };
+        return (0, 0, false);
+    };
+    if b == 109 {
+        // 'm' -> ms or m(inute)
+        if i + 1 < n {
+            if s[i + 1] == 115 {
+                return (1000000, 2, true);
+            };
+        };
+        return (60000000000, 1, true);
+    };
+    if b == 115 {
+        return (1000000000, 1, true);
+    };
+    if b == 104 {
+        return (3600000000000, 1, true);
+    };
+    if b == 194 {
+        // C2 B5 = µs
+        if i + 2 < n + 1 {
+            if i + 1 < n {
+                if s[i + 1] == 181 {
+                    if i + 2 < n {
+                        if s[i + 2] == 115 {
+                            return (1000, 3, true);
+                        };
+                    };
+                };
+            };
+        };
+        return (0, 0, false);
+    };
+    if b == 206 {
+        // CE BC = μs (Greek small mu)
+        if i + 1 < n {
+            if s[i + 1] == 188 {
+                if i + 2 < n {
+                    if s[i + 2] == 115 {
+                        return (1000, 3, true);
+                    };
+                };
+            };
+        };
+        return (0, 0, false);
+    };
+    return (0, 0, false);
+}
+
+fn go_time_parse_duration(s: Vec<u8>) -> GoTimeDurationResult {
+    let n = len(s);
+    if n == 0 {
+        return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+    };
+    let i = 0;
+    let neg = false;
+    if s[0] == 45 {
+        neg = true;
+        i = 1;
+    } else {
+        if s[0] == 43 {
+            i = 1;
+        };
+    };
+    if i >= n {
+        return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+    };
+    // Special case: a bare "0" is a valid zero duration.
+    if n - i == 1 {
+        if s[i] == 48 {
+            return GoTimeDurationResult { v: 0, err: go_errors_nil() };
+        };
+    };
+    let total: i64 = 0;
+    while i < n {
+        // Integer part (may be empty when fraction leads).
+        let pre: i64 = 0;
+        let pre_digits = 0;
+        while i < n {
+            let c = s[i];
+            if c < 48 {
+                break;
+            };
+            if c > 57 {
+                break;
+            };
+            if pre > 922337203685477580 {
+                return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+            };
+            pre = pre * 10 + (c - 48) as i64;
+            pre_digits = pre_digits + 1;
+            i = i + 1;
+        }
+        // Fraction part.
+        let post: i64 = 0;
+        let post_digits = 0;
+        if i < n {
+            if s[i] == 46 {
+                i = i + 1;
+                while i < n {
+                    let c = s[i];
+                    if c < 48 {
+                        break;
+                    };
+                    if c > 57 {
+                        break;
+                    };
+                    if post_digits < 18 {
+                        post = post * 10 + (c - 48) as i64;
+                        post_digits = post_digits + 1;
+                    };
+                    i = i + 1;
+                }
+            };
+        };
+        if pre_digits == 0 {
+            if post_digits == 0 {
+                return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+            };
+        };
+        let (unit, used, uok) = __go_time_unit_ns(&s, i, n);
+        if uok {
+            i = i + used;
+        } else {
+            return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+        };
+        // Segment value with overflow checks.
+        if pre > 9223372036854775807 / unit {
+            return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+        };
+        let seg = pre * unit;
+        if post_digits > 0 {
+            // scale = 10^post_digits
+            let scale: i64 = 1;
+            let k = 0;
+            while k < post_digits {
+                scale = scale * 10;
+                k = k + 1;
+            }
+            // frac_ns = post * unit / scale, computed as
+            // (post / scale) * unit + (post % scale) * unit
+            // / scale to stay in range.
+            let frac_ns = (post % scale) * (unit / scale) + (post % scale) * (unit % scale) / scale + (post / scale) * unit;
+            seg = seg + frac_ns;
+            if seg < 0 {
+                return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+            };
+        };
+        total = total + seg;
+        if total < 0 {
+            return GoTimeDurationResult { v: 0, err: __go_time_invalid_duration(&s) };
+        };
+    }
+    if neg {
+        return GoTimeDurationResult { v: -total, err: go_errors_nil() };
+    };
+    return GoTimeDurationResult { v: total, err: go_errors_nil() };
+}
+
+// ================= Time =================
+
+struct GoTime {
+    unix_ns: i64,
+    mono: i64,
+    has_mono: bool,
+}
+
+fn go_time_now() -> GoTime {
+    return GoTime {
+        unix_ns: sa_time_unix_ns(),
+        mono: sa_time_instant_ns() as i64,
+        has_mono: true,
+    };
+}
+
+fn go_time_unix(sec: i64, nsec: i64) -> GoTime {
+    // Go normalises nsec outside [0, 999999999] into sec.
+    let s = sec + nsec / 1000000000;
+    let ns = nsec % 1000000000;
+    if ns < 0 {
+        ns = ns + 1000000000;
+        s = s - 1;
+    };
+    return GoTime { unix_ns: s * 1000000000 + ns, mono: 0, has_mono: false };
+}
+
+fn go_time_unix_nano(t: &GoTime) -> i64 {
+    return t.unix_ns;
+}
+
+fn go_time_unix_sec(t: &GoTime) -> i64 {
+    // Go's Unix() floors toward negative infinity via its
+    // internal representation; plain division truncates
+    // toward zero, which differs for pre-epoch times with
+    // a fractional part. gostd's unix_ns for pre-epoch
+    // values comes from go_time_unix (already normalised)
+    // or the extern (exact ns), so truncation matches on
+    // normalised values.
+    return t.unix_ns / 1000000000;
+}
+
+fn go_time_unix_milli(t: &GoTime) -> i64 {
+    return t.unix_ns / 1000000;
+}
+
+fn go_time_unix_micro(t: &GoTime) -> i64 {
+    return t.unix_ns / 1000;
+}
+
+fn go_time_add(t: &GoTime, d: i64) -> GoTime {
+    // Go strips the monotonic reading in Add results.
+    return GoTime { unix_ns: t.unix_ns + d, mono: 0, has_mono: false };
+}
+
+fn go_time_sub(t: &GoTime, u: &GoTime) -> i64 {
+    if t.has_mono {
+        if u.has_mono {
+            return t.mono - u.mono;
+        };
+    };
+    return t.unix_ns - u.unix_ns;
+}
+
+fn go_time_since(t: &GoTime) -> i64 {
+    let now = go_time_now();
+    return go_time_sub(&now, t);
+}
+
+fn go_time_until(t: &GoTime) -> i64 {
+    let now = go_time_now();
+    return go_time_sub(t, &now);
+}
+
+fn go_time_equal(t: &GoTime, u: &GoTime) -> bool {
+    return t.unix_ns == u.unix_ns;
+}
+
+fn go_time_before(t: &GoTime, u: &GoTime) -> bool {
+    return t.unix_ns < u.unix_ns;
+}
+
+fn go_time_after(t: &GoTime, u: &GoTime) -> bool {
+    return t.unix_ns > u.unix_ns;
+}
+
+// UTC field accessors, riding the sa_time ms getters.
+fn __go_time_ms(t: &GoTime) -> i64 {
+    return t.unix_ns / 1000000;
+}
+
+fn go_time_year(t: &GoTime) -> i64 {
+    return sa_time_get_full_year(__go_time_ms(t));
+}
+
+fn go_time_month(t: &GoTime) -> i64 {
+    return sa_time_get_month(__go_time_ms(t));
+}
+
+fn go_time_day(t: &GoTime) -> i64 {
+    return sa_time_get_date(__go_time_ms(t));
+}
+
+fn go_time_hour(t: &GoTime) -> i64 {
+    return sa_time_get_hours(__go_time_ms(t));
+}
+
+fn go_time_minute(t: &GoTime) -> i64 {
+    return sa_time_get_minutes(__go_time_ms(t));
+}
+
+fn go_time_second(t: &GoTime) -> i64 {
+    return sa_time_get_seconds(__go_time_ms(t));
+}
+
+fn go_time_nanosecond(t: &GoTime) -> i64 {
+    let r = t.unix_ns % 1000000000;
+    if r < 0 {
+        return r + 1000000000;
+    };
+    return r;
+}
+
+fn go_time_weekday(t: &GoTime) -> i64 {
+    // Go: Sunday == 0. sa_time_get_day's convention is the
+    // extern's own; the integration phase must confirm it
+    // matches (flagged in NOTES).
+    return sa_time_get_day(__go_time_ms(t));
+}
+
+fn go_time_add_date(t: &GoTime, years: i64, months: i64, days: i64) -> GoTime {
+    // See header: refused (77423) until the field-set
+    // extern contract is confirmed at this layer.
+    panic(77423);
+}
+
+// ================= Sleep / After / Timer / Ticker ====
+
+fn go_time_sleep(d: i64) -> void {
+    if d <= 0 {
+        return;
+    };
+    let _r = sa_time_sleep_ns(d as u64);
+    return;
+}
+
+// After returns a channel that receives the current time
+// once d has elapsed (Go: <-chan Time; gostd payload is
+// the fire time's unix ns -- the frontend wraps it into a
+// GoTime with no monotonic reading, matching Go, whose
+// After values carry wall clock only in practice).
+// R1378 ^|| rewrite: the spawned closure body lives in a named helper;
+// the closure itself is a let-bound single-expression call (the form
+// demo 27 proves parses: `thread::spawn(^|| producer(ch, done))`).
+// Direct `^|| { ... }` is rejected by the parser (non-blocking ticket).
+fn __go_time_after_body(d: i64, ch: Chan<i64>) -> void {
+    go_time_sleep(d);
+    ch.send(sa_time_unix_ns());
+}
+
+fn go_time_after(d: i64) -> Chan<i64> {
+    let ch: Chan<i64> = Chan::new(1);
+    let _f = ^|| __go_time_after_body(d, ch);
+    let _h = thread::spawn(_f);
+    return ch;
+}
+
+struct GoTimer {
+    ch: Chan<i64>,
+    mu: GoMutex,
+    stopped: bool,
+    gen: i64,
+}
+
+// R1378 ^|| rewrite (see __go_time_after_body): body extracted to a
+// named helper; the closure is a let-bound single-expression call.
+fn __go_timer_arm_body(t: &GoTimer, d: i64, gen: i64, ch: Chan<i64>) -> void {
+    go_time_sleep(d);
+    go_sync_mutex_lock(&t.mu);
+    if t.stopped {
+        go_sync_mutex_unlock(&t.mu);
+        return;
+    };
+    if t.gen != gen {
+        go_sync_mutex_unlock(&t.mu);
+        return;
+    };
+    go_sync_mutex_unlock(&t.mu);
+    ch.send(sa_time_unix_ns());
+}
+
+fn __go_timer_arm(t: &GoTimer, d: i64, gen: i64) -> void {
+    let ch = t.ch;
+    let _f = ^|| __go_timer_arm_body(t, d, gen, ch);
+    let _h = thread::spawn(_f);
+    return;
+}
+
+fn go_time_new_timer(d: i64) -> GoTimer {
+    let ch: Chan<i64> = Chan::new(1);
+    let t = GoTimer {
+        ch: ch,
+        mu: go_sync_mutex_new(),
+        stopped: false,
+        gen: 0,
+    };
+    __go_timer_arm(&t, d, 0);
+    return t;
+}
+
+// Stop reports whether the call stopped the timer from
+// firing (Go semantics: true if the timer was still
+// pending). gostd's generation counter makes a stopped
+// or superseded arm a no-op when it wakes.
+fn go_time_timer_stop(t: &GoTimer) -> bool {
+    go_sync_mutex_lock(&t.mu);
+    if t.stopped {
+        go_sync_mutex_unlock(&t.mu);
+        return false;
+    };
+    t.stopped = true;
+    t.gen = t.gen + 1;
+    go_sync_mutex_unlock(&t.mu);
+    return true;
+}
+
+fn go_time_timer_reset(t: &GoTimer, d: i64) -> bool {
+    let was_active = go_time_timer_stop(t);
+    go_sync_mutex_lock(&t.mu);
+    t.stopped = false;
+    let g = t.gen;
+    go_sync_mutex_unlock(&t.mu);
+    __go_timer_arm(t, d, g);
+    return was_active;
+}
+
+struct GoTicker {
+    ch: Chan<i64>,
+    mu: GoMutex,
+    stopped: bool,
+}
+
+// R1378 ^|| rewrite (see __go_time_after_body): body extracted to a
+// named helper; the closure is a let-bound single-expression call.
+fn __go_ticker_body(t: &GoTicker, period: i64, ch: Chan<i64>) -> void {
+    while true {
+        go_time_sleep(period);
+        go_sync_mutex_lock(&t.mu);
+        let stop = t.stopped;
+        go_sync_mutex_unlock(&t.mu);
+        if stop {
+            return;
+        };
+        // Go DROPS ticks for slow receivers (channel
+        // capacity 1, non-blocking send). gostd's send
+        // blocks when the buffer is full, so a stalled
+        // receiver delays later ticks instead of
+        // dropping them. Delivered values stay ordered
+        // and monotonic; the drop-vs-delay divergence
+        // is documented in NOTES-runtime.md.
+        ch.send(sa_time_unix_ns());
+    }
+}
+
+fn go_time_new_ticker(period: i64) -> GoTicker {
+    if period <= 0 {
+        // Go panics "non-positive interval for NewTicker";
+        // gostd uses the time block's misuse code.
+        panic(77421);
+    };
+    let ch_new: Chan<i64> = Chan::new(1);
+    let t = GoTicker {
+        ch: ch_new,
+        mu: go_sync_mutex_new(),
+        stopped: false,
+    };
+    let ch = t.ch;
+    let _f = ^|| __go_ticker_body(&t, period, ch);
+    let _h = thread::spawn(_f);
+    return t;
+}
+
+fn go_time_ticker_stop(t: &GoTicker) -> void {
+    go_sync_mutex_lock(&t.mu);
+    t.stopped = true;
+    go_sync_mutex_unlock(&t.mu);
+    return;
+}
+
+// Tick is NewTicker's channel-only form; Go returns nil
+// for period <= 0 -- gostd panics via new_ticker (77421),
+// a loud divergence from a nil channel that would hang a
+// receiver forever. Documented in NOTES.
+fn go_time_tick(period: i64) -> Chan<i64> {
+    let t = go_time_new_ticker(period);
+    return t.ch;
+}

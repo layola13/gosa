@@ -1,0 +1,1587 @@
+// gostd sync/atomic: the SLA-side model of Go's sync/atomic package.
+//
+// Oracle: Go 1.27.2 stdlib src/sync/atomic/doc.go,
+// doc_64.go, type.go, value.go (read 2026-11-27).
+// The oracle directory also contains atomic.go, which
+// is a 14-byte download stub reading "404: Not Found":
+// in Go 1.27.2 there is no sync/atomic/atomic.go; the
+// primitives live in the runtime and are re-declared
+// in doc.go / doc_64.go. Nothing is mapped from
+// atomic.go because there is nothing in it.
+// Census: CENSUS-170.md rev1 section 7.2.1, wave 1b
+// (sync/atomic, mapping design first; no new base
+// needed) and Q2. Splice position: sync_atomic goes
+// AFTER log and context, at the END of the current
+// 22-file splice order (errors, math, strconv,
+// strings, fmt, sync, time, sort, runtime, io, bytes,
+// hash, crc32, fnv, base64, hex, utf8, path, flag,
+// bufio, log, context), because it depends on sync.sla
+// only in the loose sense (no sync.sla symbol is
+// called; the dependency is conceptual -- atomics are
+// the low-level alternative to sync primitives) and on
+// the sa_std atomic face (see THE ATOMIC BINDING
+// below). It has no dependency on any other gostd
+// file, so it can also sit anywhere after sync.sla;
+// the end of the order is chosen so no later file's
+// position moves.
+//
+// Organisation follows the psa_std / gostd precedent:
+// one .sla file per Go package, public entry points
+// go_<pkg>_<name>, private helpers __go_<pkg>_<name>,
+// panic codes listed up front, loud refusals instead
+// of silent approximations. Strings and []byte are
+// Vec<u8> everywhere. Splice position and cross-file
+// calls are plain function calls.
+//
+// VALUE REPRESENTATION (gostd contract):
+//   Go int32 / int64     -> i64 (int32 values are
+//                           sign-extended into i64;
+//                           every store truncates back
+//                           to 32 bits -- see the
+//                           __go_sync_atomic_trunc_*
+//                           helpers)
+//   Go uint32            -> i64 in 0..2^32-1
+//   Go uint64            -> i64 holding the 64-bit
+//                           bit pattern (two's
+//                           complement; add/sub/and/or
+//                           are bit-identical, CAS
+//                           compares bit patterns)
+//   Go uintptr (64-bit)  -> i64 holding the 64-bit
+//                           bit pattern (same as
+//                           uint64; the 64-bit target
+//                           is assumed -- see seam (e))
+//   Go unsafe.Pointer    -> i64 address value; nil
+//                           is 0 (see seam (f))
+//   Go bool              -> bool (the cell holds 0/1
+//                           as i64, matching Go's
+//                           uint32-backed Bool)
+//   Go *T (pointer args) -> NO SLA SPELLING. A Go
+//                           *int32 / *uint64 /
+//                           *unsafe.Pointer argument is
+//                           modelled as a small handle
+//                           struct holding the value
+//                           cell (GoAtomicInt32 etc.),
+//                           held by the frontend; every
+//                           load/store goes through the
+//                           handle (see seam (a)).
+//   Go atomic.Int32 etc. -> the SAME handle struct:
+//                           Go's Int32 wraps the same
+//                           memory its top-level
+//                           functions address, so the
+//                           typed wrapper methods and
+//                           the top-level functions
+//                           share one cell type and the
+//                           wrappers delegate to the
+//                           top-level functions,
+//                           exactly like Go's type.go.
+//   Go atomic.Value      -> GoAtomicValue, a tagged
+//                           holder over the concrete
+//                           payload kinds the splice
+//                           uses (see seam (g)).
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77434  atomic.Value given a payload whose kind is
+//          not one of the supported concrete kinds
+//          (i64 / Vec<u8> / ptr) -- including a nil
+//          payload (kind 0). Go panics on Store(nil),
+//          Swap(nil) and CompareAndSwap(old, nil);
+//          the frontend must refuse nil at the
+//          mapping line, and this code is the loud
+//          backstop if a nil or otherwise unsupported
+//          kind ever reaches the SLA side.
+//   77435  atomic.Value type inconsistency: a Store /
+//          Swap / CompareAndSwap whose payload type
+//          differs from the type established by the
+//          first Store (Go panics: "store of
+//          inconsistently typed value into Value"),
+//          or a CompareAndSwap whose old and new
+//          payloads have different types (Go panics:
+//          "compare and swap of inconsistently typed
+//          values"). One meaning: inconsistent
+//          concrete type.
+// No target ids are claimed by this file: sync/atomic
+// has no error values in Go, so 900045 / 900046 (the
+// ids assigned to this line) are LEFT UNCLAIMED; no
+// error sentinel is defined here. No other code in
+// this file panics.
+//
+// THE ATOMIC BINDING -- READ FIRST. This file is NOT
+// yet atomic. The sa_std atomic face is a MACRO layer,
+// not SLA functions: sa_std/sync/atomic/atomic.sa
+// (1500 lines; canonical location, with
+// sa_std/sync/atomic.sa as a forwarding shim) defines
+// one [MACRO] per width per operation, e.g.
+//   ATOMIC_I64_LOAD %out, %atomic_ptr, %ordering
+//   ATOMIC_I64_STORE %atomic_ptr, %value, %ordering
+//   ATOMIC_I64_SWAP %out_old, %atomic_ptr, %value, %ordering
+//   ATOMIC_I64_FETCH_ADD %out_old, %atomic_ptr, %value, %ordering
+//   ATOMIC_I64_FETCH_AND / FETCH_OR (same shape)
+//   ATOMIC_I64_COMPARE_EXCHANGE %out_old, %out_ok,
+//       %atomic_ptr, %expected, %new, %success_ordering,
+//       %failure_ordering
+// for every width BOOL / U8 / I8 / U16 / I16 / U32 /
+// I32 / U64 / I64 / USIZE / ISIZE / PTR (PTR has
+// LOAD / STORE / SWAP / COMPARE_EXCHANGE only, plus
+// FETCH_BYTE_ADD / FETCH_U64_ADD; BOOL has LOAD /
+// STORE / SWAP / COMPARE_EXCHANGE only). The .sal
+// layout file gives every cell a single value slot at
+// offset +0 (AtomicI32_SIZE 4, AtomicI64_SIZE 8,
+// AtomicUsize_SIZE 8, AtomicPtr_SIZE 8,
+// AtomicBool_SIZE 1) and the ordering constants
+// RELAXED 0, RELEASE 1, ACQUIRE 2, ACQ_REL 3,
+// SEQ_CST 4. Go's atomics are sequentially
+// consistent, so every binding below uses seq_cst,
+// with acquire as the CAS failure ordering (the
+// ordering the sa_std test surface itself uses:
+// std_atomic_macro_surface.sa).
+//   The macro spellings above were read from a local
+//   copy of the file,
+//   ~/workspace/task150-work/sci/sa_std/sync/atomic/atomic.sa
+//   (md5 c7908241bcb4ed2567663acdac47c0ba, 1500 lines,
+//   byte-identical across four workspace copies:
+//   task32, audit-20261121, task137, task150),
+//   which matches the census box verification
+//   (1500 lines, AtomicBool/I64/U64/Ptr present,
+//   cmpxchg 49 hits). The mapping is still marked
+//   TO BE CONFIRMED AGAINST sa_std ON THE BOX AT
+//   INTEGRATION, because the box head may have moved
+//   since those copies were taken.
+//   No .sla file anywhere in the gostd corpus calls
+//   EXPAND or touches these macros yet, so there is
+//   no precedent for how .sla code reaches the macro
+//   layer. This file therefore does NOT invent a
+//   call spelling. Instead, every atomic operation
+//   goes through exactly one private helper per
+//   (width, op) -- __go_sync_atomic_i64_load etc. --
+//   and each helper's comment names the exact macro
+//   and ordering that replaces its body. Each helper
+//   body today is a PLAIN field access on the handle
+//   cell: correct values, NO atomicity, NO ordering.
+//   INTEGRATION MUST replace every helper body with
+//   the named macro expansion (or with a thin .sa
+//   shim exposing the macros as fns, if that is the
+//   bridge the integration line chooses) and must
+//   confirm the cell layout (see below) against the
+//   box atomic.sa + atomic.sal before this file is
+//   treated as atomic. Until then, treat every
+//   function in this file as single-threaded-correct
+//   only. The helper layer exists precisely so that
+//   the binding is a per-helper body swap, not a
+//   rewrite of the ninety-odd public functions.
+//   Layout assumption the binding relies on: every
+//   handle struct has exactly ONE field, v, at offset
+//   0, so the cell address IS the struct address and
+//   the macro's +0 value slot is the field. For the
+//   32-bit widths the macro reads/writes 4 bytes at
+//   that address and for BOOL 1 byte; on the
+//   little-endian x86_64 target those are the low
+//   bytes of the i64 field, which hold the value by
+//   construction (all stores truncate). Integration
+//   must confirm the struct layout and endianness
+//   assumptions on the box; if the .sla struct layout
+//   puts the field anywhere else, the binding -- not
+//   the public functions -- is what changes.
+//
+// THE SEAMS -- integration checks, one per item the
+// task brief names. None of these is decided silently
+// inside this file; each names the party that must
+// confirm it at integration time.
+//
+// (a) POINTER ARGS / frontend materialisation. Go's
+//     top-level functions take *int32, *uint64,
+//     *uintptr, *unsafe.Pointer. SLA has no pointer
+//     to a scalar. DECISION: the FRONTEND
+//     materialises every Go variable (or struct
+//     field, or heap cell) that is ever passed to an
+//     atomic top-level function into a handle struct
+//     (GoAtomicInt32 etc.) with
+//     go_sync_atomic_new_int32 / _uint32 / _int64 /
+//     _uint64 / _uintptr / _pointer / _bool, holds the
+//     handle for the variable's lifetime, and passes
+//     &handle to every go_sync_atomic_* call. A raw Go
+//     *int32 that reaches the mapping line without a
+//     handle is a FRONTEND refusal, not something
+//     this file can accept. The same handle is the
+//     atomic.Int32 / Uint64 / ... wrapper value: the
+//     frontend holds one GoAtomicInt32 per Go
+//     atomic.Int32 variable, and wrapper methods take
+//     &that handle. Handles must not be copied after
+//     first use (Go says the same for its typed
+//     wrappers: copying aliases the cell).
+//
+// (b) ATOMICITY until binding. See THE ATOMIC
+//     BINDING above: helper bodies are plain accesses
+//     until integration swaps in the macro face.
+//     Single-threaded behaviour is exact today;
+//     concurrent behaviour is not atomic until then.
+//
+// (c) 64-BIT ADD WRAP. Go's AddInt64 / AddUint64 /
+//     AddUintptr wrap modulo 2^64. The bound macros
+//     (ATOMIC_I64_FETCH_ADD etc.) do the add in
+//     hardware and wrap. The placeholder helper
+//     bodies use plain i64 `+`; whether SLA i64
+//     arithmetic wraps or traps on overflow is an
+//     OPEN QUESTION for the debug phase -- if it
+//     traps, the 64-bit Add helpers need a wrapping
+//     form before they are safe near the extremes.
+//     The 32-bit Adds cannot overflow i64 (both
+//     operands are 32-bit-range, the sum fits), so
+//     they are exact either way.
+//
+// (d) 64-BIT ALIGNMENT. Go's doc.go notes that on
+//     32-bit platforms the caller must arrange
+//     64-bit alignment of 64-bit words accessed
+//     atomically. The gosla target is 64-bit x86_64
+//     (doc_64.go's build tag !(386 || arm || mips
+//     || mipsle) is the 64-bit form set this file
+//     implements), where every i64 field is naturally
+//     8-byte aligned; the caveat does not apply.
+//     If the target ever becomes 32-bit, the 64-bit
+//     forms must be revisited, not silently kept.
+//
+// (e) UINTPTR IS 64-BIT. Go uintptr is 64-bit on this
+//     target, so Uintptr rides the ATOMIC_USIZE_*
+//     macros (usize == 64-bit). On a 32-bit target
+//     uintptr would be 32-bit and the binding would
+//     change to the U32 macros. The public functions
+//     take i64 either way; only the helper bodies'
+//     macro names would change.
+//
+// (f) POINTER / unsafe seam. unsafe.Pointer is
+//     modelled as an i64 address value (nil = 0);
+//     Pointer[T] is type-erased -- the frontend
+//     knows T, this file only moves the address.
+//     The ATOMIC_PTR_* macros move a native ptr, so
+//     the binding must convert between the i64
+//     address and the native ptr at the helper
+//     boundary. A Go *T that the frontend cannot
+//     reduce to an address (e.g. a pointer into a
+//     Go heap object with no stable address in the
+//     SLA runtime) is a frontend refusal.
+//
+// (g) atomic.Value payload kinds. Go's Value holds
+//     any value; gostd's tagged holder supports
+//     exactly three concrete kinds, the ones the
+//     splice uses: kind 1 = i64 (Go int/int64/uint64
+//     and any other 64-bit scalar the frontend
+//     funnels here), kind 2 = Vec<u8> (Go string and
+//     Go []byte -- both are Vec<u8> in gostd, and
+//     the holder CANNOT tell them apart), kind 3 =
+//     ptr (i64 address; Go *T / unsafe.Pointer
+//     payloads). Any other payload type (float,
+//     struct, bool, smaller ints, maps, chans...)
+//     is a FRONTEND refusal at the mapping line; the
+//     77434 backstop fires if a kind outside 1..3
+//     ever reaches Store / Swap /
+//     CompareAndSwap. The frontend builds the
+//     argument with go_sync_atomic_value_i64 /
+//     _bytes / _ptr, and reads results through the
+//     GoAtomicValueResult struct (present + kind +
+//     payload). A nil payload is kind 0
+//     (present=false); the frontend must not pass it
+//     to Store/Swap/CompareAndSwap-new (77434).
+//     First-Store type rule: the kind established by
+//     the first Store is the Value's type forever;
+//     a later different kind panics 77435, exactly
+//     like Go. The kind word itself is a
+//     GoAtomicInt64 cell, so the first-store claim
+//     (CAS 0 -> -1, store payload, publish kind)
+//     rides the atomic helpers; the payload fields
+//     are plain stores, ordered by the kind publish
+//     (Go's own protocol: data first, type word
+//     last). See DIVERGENCES for the two places
+//     this is weaker than Go.
+//
+// DIVERGENCES (all deliberate, all noted here):
+//   - Helper bodies are plain accesses, not atomic,
+//     until the integration binding lands (seam (b)).
+//     This is the one deliberate approximation in
+//     the file, and it is the whole point of the
+//     helper layer: the approximation is confined
+//     to ~50 small bodies, each naming its macro.
+//   - Value Swap / CompareAndSwap payload window:
+//     Go swaps the data pointer with one atomic
+//     SwapPointer; this file reads the old payload
+//     and then stores the new one in two steps, so
+//     two concurrent Swaps on the same Value can
+//     interleave (the kind word stays consistent,
+//     the payload may not reflect a linear order).
+//     Single-threaded programs are unaffected. A
+//     true single-word swap would need the payload
+//     boxed behind one pointer; that needs a heap
+//     allocation surface the splice does not have.
+//   - Value payload stores after the first Store
+//     are plain field stores (single-word for the
+//     i64 / ptr kinds -- atomic on x86_64, ordered
+//     by the kind word; multi-word for the Vec<u8>
+//     kind -- the handle can tear under true
+//     concurrency). Go stores one pointer atomically.
+//   - Value CompareAndSwap over a Vec<u8> payload
+//     does a deep byte comparison. Go compares with
+//     == on the concrete type: for a string payload
+//     that is the same byte comparison; for a []byte
+//     payload Go PANICS (slices are uncomparable)
+//     while gostd compares bytes and returns a
+//     boolean. The holder cannot distinguish string
+//     from []byte, so the deep comparison is the
+//     only uniform choice; the []byte panic is not
+//     reproduced.
+//   - Go's atomic.Int32 etc. must not be copied
+//     after first use; the same discipline applies
+//     to the handle structs here (seam (a)).
+//   - Go's Value must not be copied after first
+//     use; same discipline for GoAtomicValue (a copy
+//     aliases the kind cell and the payload fields).
+//
+// LOUD REFUSALS (every gap in this file panics with
+// a claimed code; nothing is a silent stub):
+//   77434  Value payload kind outside 1..3, incl. nil
+//   77435  Value type inconsistency across calls
+// All other entry points are implemented (modulo the
+// atomicity binding in seam (b)). What is NOT in this
+// file (out of the census scope for sync/atomic):
+// atomic.Int32 etc. are covered; there is no separate
+// sync/atomic sub-package. The deprecated pre-1.19
+// function spellings are the same functions (no
+// separate surface).
+//
+// Nothing in this file has been compiled or tested
+// (write-first batch; the debug phase is separate).
+
+@import "sa_std/vec.sa"
+@import "sa_std/sync/atomic.sa"
+
+// ---------- Value kind tags ----------
+
+const GO_SYNC_ATOMIC_VALUE_KIND_EMPTY: i64 = 0;
+const GO_SYNC_ATOMIC_VALUE_KIND_I64: i64 = 1;
+const GO_SYNC_ATOMIC_VALUE_KIND_BYTES: i64 = 2;
+const GO_SYNC_ATOMIC_VALUE_KIND_PTR: i64 = 3;
+const GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS: i64 = -1;
+
+// ---------- handle structs ----------
+
+// One handle per Go atomic cell. Each struct has
+// exactly ONE field, v, at offset 0: the binding
+// relies on the cell address being the struct
+// address (see THE ATOMIC BINDING). A handle is
+// created by the frontend per Go variable (seam (a))
+// and must not be copied after first use.
+
+// Go *int32 cell / atomic.Int32 value: the int32 is
+// sign-extended into i64; every store truncates.
+struct GoAtomicInt32 {
+    v: i64,
+}
+
+// Go *uint32 cell / atomic.Uint32 value: 0..2^32-1.
+struct GoAtomicUint32 {
+    v: i64,
+}
+
+// Go *int64 cell / atomic.Int64 value.
+struct GoAtomicInt64 {
+    v: i64,
+}
+
+// Go *uint64 cell / atomic.Uint64 value: the 64-bit
+// bit pattern held in i64 (two's complement).
+struct GoAtomicUint64 {
+    v: i64,
+}
+
+// Go *uintptr cell / atomic.Uintptr value (64-bit
+// target, seam (e)): the 64-bit bit pattern.
+struct GoAtomicUintptr {
+    v: i64,
+}
+
+// Go *unsafe.Pointer cell / atomic.Pointer[T] value
+// (T erased, seam (f)): the address as i64, nil = 0.
+struct GoAtomicPointer {
+    v: i64,
+}
+
+// Go atomic.Bool value: 0/1 held as i64 (Go backs
+// Bool with a uint32; the macro face has a u8 slot).
+struct GoAtomicBool {
+    v: i64,
+}
+
+// Go atomic.Value: a tagged holder. kind is itself
+// a GoAtomicInt64 cell so the first-store claim rides
+// the atomic helpers; i / b / p are the payload, of
+// which only the one named by kind is live. kind -1
+// means a first store is in progress (Go's
+// firstStoreInProgress marker).
+struct GoAtomicValue {
+    kind: GoAtomicInt64,
+    i: i64,
+    b: Vec<u8>,
+    p: i64,
+}
+
+// Go atomic.Value.Load / Swap result: the loaded (or
+// swapped-out) value in tagged form. present=false
+// (kind 0) is Go's nil return: no Store has happened
+// yet (Load) or the Value was empty (Swap).
+struct GoAtomicValueResult {
+    present: bool,
+    kind: i64,
+    i: i64,
+    b: Vec<u8>,
+    p: i64,
+}
+
+// ---------- constructors ----------
+
+// The frontend creates one handle per Go variable
+// (seam (a)); the initial value is truncated to the
+// cell width exactly like a Store.
+fn go_sync_atomic_new_int32(val: i64) -> GoAtomicInt32 {
+    return GoAtomicInt32 { v: __go_sync_atomic_trunc_i32(val) };
+}
+
+fn go_sync_atomic_new_uint32(val: i64) -> GoAtomicUint32 {
+    return GoAtomicUint32 { v: __go_sync_atomic_trunc_u32(val) };
+}
+
+fn go_sync_atomic_new_int64(val: i64) -> GoAtomicInt64 {
+    return GoAtomicInt64 { v: val };
+}
+
+fn go_sync_atomic_new_uint64(val: i64) -> GoAtomicUint64 {
+    return GoAtomicUint64 { v: val };
+}
+
+fn go_sync_atomic_new_uintptr(val: i64) -> GoAtomicUintptr {
+    return GoAtomicUintptr { v: val };
+}
+
+fn go_sync_atomic_new_pointer(val: i64) -> GoAtomicPointer {
+    return GoAtomicPointer { v: val };
+}
+
+fn go_sync_atomic_new_bool(val: bool) -> GoAtomicBool {
+    return GoAtomicBool { v: __go_sync_atomic_bool01(val) };
+}
+
+fn go_sync_atomic_new_value() -> GoAtomicValue {
+    return GoAtomicValue { kind: GoAtomicInt64 { v: 0 }, i: 0, b: Vec::new(), p: 0 };
+}
+
+// ---------- private helpers: width truncation ----------
+
+// Truncate an i64 to the int32 range, sign-extended:
+// (v mod 2^32) mapped into [-2^31, 2^31). All i64
+// arithmetic here stays in range, so no wrap question.
+fn __go_sync_atomic_trunc_i32(v: i64) -> i64 {
+    let m = v & 4294967295;
+    if m >= 2147483648 {
+        return m - 4294967296;
+    };
+    return m;
+}
+
+// Truncate an i64 to the uint32 range 0..2^32-1.
+fn __go_sync_atomic_trunc_u32(v: i64) -> i64 {
+    return v & 4294967295;
+}
+
+// bool -> 0/1 for the Bool cell.
+fn __go_sync_atomic_bool01(val: bool) -> i64 {
+    if val {
+        return 1;
+    };
+    return 0;
+}
+
+// ---------- private helpers: the atomic binding ----------
+// One helper per (width, op). Each body today is a
+// PLAIN field access (NOT atomic -- see THE ATOMIC
+// BINDING in the header); each comment names the exact
+// sa_std macro + ordering that replaces the body at
+// integration. All helpers enforce the cell width on
+// their value arguments, so callers never have to.
+
+// --- int32 (cell GoAtomicInt32) ---
+
+// BINDING: ATOMIC_I32_LOAD (cell address, seq_cst).
+fn __go_sync_atomic_i32_load(cell: &GoAtomicInt32) -> i64 {
+    return cell.v;
+}
+
+// BINDING: ATOMIC_I32_STORE (cell address, value, seq_cst).
+fn __go_sync_atomic_i32_store(cell: &GoAtomicInt32, val: i64) -> void {
+    cell.v = __go_sync_atomic_trunc_i32(val);
+    return;
+}
+
+// BINDING: ATOMIC_I32_SWAP (old, cell address, value, seq_cst).
+fn __go_sync_atomic_i32_swap(cell: &GoAtomicInt32, val: i64) -> i64 {
+    let old = cell.v;
+    cell.v = __go_sync_atomic_trunc_i32(val);
+    return old;
+}
+
+// BINDING: ATOMIC_I32_COMPARE_EXCHANGE
+// (old, ok, cell address, expected, new, seq_cst, acquire).
+// Returns (observed old, swapped).
+fn __go_sync_atomic_i32_cmpxchg(cell: &GoAtomicInt32, old: i64, new: i64) -> (i64, bool) {
+    let want = __go_sync_atomic_trunc_i32(old);
+    if cell.v == want {
+        cell.v = __go_sync_atomic_trunc_i32(new);
+        return (want, true);
+    };
+    return (cell.v, false);
+}
+
+// BINDING: ATOMIC_I32_FETCH_ADD (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Add adds delta and returns new).
+fn __go_sync_atomic_i32_fetch_add(cell: &GoAtomicInt32, delta: i64) -> i64 {
+    let old = cell.v;
+    cell.v = __go_sync_atomic_trunc_i32(old + __go_sync_atomic_trunc_i32(delta));
+    return old;
+}
+
+// BINDING: ATOMIC_I32_FETCH_AND (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's And returns old).
+fn __go_sync_atomic_i32_fetch_and(cell: &GoAtomicInt32, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old & __go_sync_atomic_trunc_i32(mask);
+    return old;
+}
+
+// BINDING: ATOMIC_I32_FETCH_OR (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Or returns old).
+fn __go_sync_atomic_i32_fetch_or(cell: &GoAtomicInt32, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old | __go_sync_atomic_trunc_i32(mask);
+    return old;
+}
+
+// --- uint32 (cell GoAtomicUint32) ---
+
+// BINDING: ATOMIC_U32_LOAD (cell address, seq_cst).
+fn __go_sync_atomic_u32_load(cell: &GoAtomicUint32) -> i64 {
+    return cell.v;
+}
+
+// BINDING: ATOMIC_U32_STORE (cell address, value, seq_cst).
+fn __go_sync_atomic_u32_store(cell: &GoAtomicUint32, val: i64) -> void {
+    cell.v = __go_sync_atomic_trunc_u32(val);
+    return;
+}
+
+// BINDING: ATOMIC_U32_SWAP (old, cell address, value, seq_cst).
+fn __go_sync_atomic_u32_swap(cell: &GoAtomicUint32, val: i64) -> i64 {
+    let old = cell.v;
+    cell.v = __go_sync_atomic_trunc_u32(val);
+    return old;
+}
+
+// BINDING: ATOMIC_U32_COMPARE_EXCHANGE
+// (old, ok, cell address, expected, new, seq_cst, acquire).
+// Returns (observed old, swapped).
+fn __go_sync_atomic_u32_cmpxchg(cell: &GoAtomicUint32, old: i64, new: i64) -> (i64, bool) {
+    let want = __go_sync_atomic_trunc_u32(old);
+    if cell.v == want {
+        cell.v = __go_sync_atomic_trunc_u32(new);
+        return (want, true);
+    };
+    return (cell.v, false);
+}
+
+// BINDING: ATOMIC_U32_FETCH_ADD (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Add adds delta and returns new).
+fn __go_sync_atomic_u32_fetch_add(cell: &GoAtomicUint32, delta: i64) -> i64 {
+    let old = cell.v;
+    cell.v = __go_sync_atomic_trunc_u32(old + __go_sync_atomic_trunc_u32(delta));
+    return old;
+}
+
+// BINDING: ATOMIC_U32_FETCH_AND (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's And returns old).
+fn __go_sync_atomic_u32_fetch_and(cell: &GoAtomicUint32, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old & __go_sync_atomic_trunc_u32(mask);
+    return old;
+}
+
+// BINDING: ATOMIC_U32_FETCH_OR (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Or returns old).
+fn __go_sync_atomic_u32_fetch_or(cell: &GoAtomicUint32, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old | __go_sync_atomic_trunc_u32(mask);
+    return old;
+}
+
+// --- int64 (cell GoAtomicInt64) ---
+// No truncation: the i64 value IS the cell. The
+// 64-bit Add wrap question is seam (c).
+
+// BINDING: ATOMIC_I64_LOAD (cell address, seq_cst).
+fn __go_sync_atomic_i64_load(cell: &GoAtomicInt64) -> i64 {
+    return cell.v;
+}
+
+// BINDING: ATOMIC_I64_STORE (cell address, value, seq_cst).
+fn __go_sync_atomic_i64_store(cell: &GoAtomicInt64, val: i64) -> void {
+    cell.v = val;
+    return;
+}
+
+// BINDING: ATOMIC_I64_SWAP (old, cell address, value, seq_cst).
+fn __go_sync_atomic_i64_swap(cell: &GoAtomicInt64, val: i64) -> i64 {
+    let old = cell.v;
+    cell.v = val;
+    return old;
+}
+
+// BINDING: ATOMIC_I64_COMPARE_EXCHANGE
+// (old, ok, cell address, expected, new, seq_cst, acquire).
+// Returns (observed old, swapped).
+fn __go_sync_atomic_i64_cmpxchg(cell: &GoAtomicInt64, old: i64, new: i64) -> (i64, bool) {
+    if cell.v == old {
+        cell.v = new;
+        return (old, true);
+    };
+    return (cell.v, false);
+}
+
+// BINDING: ATOMIC_I64_FETCH_ADD (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Add adds delta and returns new).
+fn __go_sync_atomic_i64_fetch_add(cell: &GoAtomicInt64, delta: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old + delta;
+    return old;
+}
+
+// BINDING: ATOMIC_I64_FETCH_AND (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's And returns old).
+fn __go_sync_atomic_i64_fetch_and(cell: &GoAtomicInt64, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old & mask;
+    return old;
+}
+
+// BINDING: ATOMIC_I64_FETCH_OR (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Or returns old).
+fn __go_sync_atomic_i64_fetch_or(cell: &GoAtomicInt64, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old | mask;
+    return old;
+}
+
+// --- uint64 (cell GoAtomicUint64) ---
+// Bit-identical bodies to the int64 helpers: the i64
+// holds the uint64 bit pattern, and add/and/or/CAS
+// are bit operations. Only the macro names differ.
+
+// BINDING: ATOMIC_U64_LOAD (cell address, seq_cst).
+fn __go_sync_atomic_u64_load(cell: &GoAtomicUint64) -> i64 {
+    return cell.v;
+}
+
+// BINDING: ATOMIC_U64_STORE (cell address, value, seq_cst).
+fn __go_sync_atomic_u64_store(cell: &GoAtomicUint64, val: i64) -> void {
+    cell.v = val;
+    return;
+}
+
+// BINDING: ATOMIC_U64_SWAP (old, cell address, value, seq_cst).
+fn __go_sync_atomic_u64_swap(cell: &GoAtomicUint64, val: i64) -> i64 {
+    let old = cell.v;
+    cell.v = val;
+    return old;
+}
+
+// BINDING: ATOMIC_U64_COMPARE_EXCHANGE
+// (old, ok, cell address, expected, new, seq_cst, acquire).
+// Returns (observed old, swapped). i64 equality is
+// bit-pattern equality, which is what Go compares.
+fn __go_sync_atomic_u64_cmpxchg(cell: &GoAtomicUint64, old: i64, new: i64) -> (i64, bool) {
+    if cell.v == old {
+        cell.v = new;
+        return (old, true);
+    };
+    return (cell.v, false);
+}
+
+// BINDING: ATOMIC_U64_FETCH_ADD (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Add adds delta and returns new).
+fn __go_sync_atomic_u64_fetch_add(cell: &GoAtomicUint64, delta: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old + delta;
+    return old;
+}
+
+// BINDING: ATOMIC_U64_FETCH_AND (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's And returns old).
+fn __go_sync_atomic_u64_fetch_and(cell: &GoAtomicUint64, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old & mask;
+    return old;
+}
+
+// BINDING: ATOMIC_U64_FETCH_OR (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Or returns old).
+fn __go_sync_atomic_u64_fetch_or(cell: &GoAtomicUint64, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old | mask;
+    return old;
+}
+
+// --- uintptr (cell GoAtomicUintptr) ---
+// Go uintptr is 64-bit on this target, so the binding
+// is the ATOMIC_USIZE_* face (seam (e)). Bodies are
+// bit-identical to the uint64 helpers.
+
+// BINDING: ATOMIC_USIZE_LOAD (cell address, seq_cst).
+fn __go_sync_atomic_uintptr_load(cell: &GoAtomicUintptr) -> i64 {
+    return cell.v;
+}
+
+// BINDING: ATOMIC_USIZE_STORE (cell address, value, seq_cst).
+fn __go_sync_atomic_uintptr_store(cell: &GoAtomicUintptr, val: i64) -> void {
+    cell.v = val;
+    return;
+}
+
+// BINDING: ATOMIC_USIZE_SWAP (old, cell address, value, seq_cst).
+fn __go_sync_atomic_uintptr_swap(cell: &GoAtomicUintptr, val: i64) -> i64 {
+    let old = cell.v;
+    cell.v = val;
+    return old;
+}
+
+// BINDING: ATOMIC_USIZE_COMPARE_EXCHANGE
+// (old, ok, cell address, expected, new, seq_cst, acquire).
+// Returns (observed old, swapped).
+fn __go_sync_atomic_uintptr_cmpxchg(cell: &GoAtomicUintptr, old: i64, new: i64) -> (i64, bool) {
+    if cell.v == old {
+        cell.v = new;
+        return (old, true);
+    };
+    return (cell.v, false);
+}
+
+// BINDING: ATOMIC_USIZE_FETCH_ADD (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Add adds delta and returns new).
+fn __go_sync_atomic_uintptr_fetch_add(cell: &GoAtomicUintptr, delta: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old + delta;
+    return old;
+}
+
+// BINDING: ATOMIC_USIZE_FETCH_AND (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's And returns old).
+fn __go_sync_atomic_uintptr_fetch_and(cell: &GoAtomicUintptr, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old & mask;
+    return old;
+}
+
+// BINDING: ATOMIC_USIZE_FETCH_OR (old, cell address, value, seq_cst).
+// Returns the OLD value (Go's Or returns old).
+fn __go_sync_atomic_uintptr_fetch_or(cell: &GoAtomicUintptr, mask: i64) -> i64 {
+    let old = cell.v;
+    cell.v = old | mask;
+    return old;
+}
+
+// --- pointer (cell GoAtomicPointer) ---
+// Addresses as i64, nil = 0. Go has no Add/And/Or
+// for pointers. The binding must convert the i64
+// address to/from the native ptr at the macro
+// boundary (seam (f)).
+
+// BINDING: ATOMIC_PTR_LOAD (cell address, seq_cst).
+fn __go_sync_atomic_ptr_load(cell: &GoAtomicPointer) -> i64 {
+    return cell.v;
+}
+
+// BINDING: ATOMIC_PTR_STORE (cell address, value, seq_cst).
+fn __go_sync_atomic_ptr_store(cell: &GoAtomicPointer, val: i64) -> void {
+    cell.v = val;
+    return;
+}
+
+// BINDING: ATOMIC_PTR_SWAP (old, cell address, value, seq_cst).
+fn __go_sync_atomic_ptr_swap(cell: &GoAtomicPointer, val: i64) -> i64 {
+    let old = cell.v;
+    cell.v = val;
+    return old;
+}
+
+// BINDING: ATOMIC_PTR_COMPARE_EXCHANGE
+// (old, ok, cell address, expected, new, seq_cst, acquire).
+// Returns (observed old, swapped).
+fn __go_sync_atomic_ptr_cmpxchg(cell: &GoAtomicPointer, old: i64, new: i64) -> (i64, bool) {
+    if cell.v == old {
+        cell.v = new;
+        return (old, true);
+    };
+    return (cell.v, false);
+}
+
+// --- bool (cell GoAtomicBool) ---
+// The cell holds 0/1. Go has no Add/And/Or for Bool.
+// The binding is the ATOMIC_BOOL_* face (u8 slot).
+
+// BINDING: ATOMIC_BOOL_LOAD (cell address, seq_cst).
+fn __go_sync_atomic_bool_load(cell: &GoAtomicBool) -> bool {
+    return cell.v != 0;
+}
+
+// BINDING: ATOMIC_BOOL_STORE (cell address, value, seq_cst).
+fn __go_sync_atomic_bool_store(cell: &GoAtomicBool, val: bool) -> void {
+    cell.v = __go_sync_atomic_bool01(val);
+    return;
+}
+
+// BINDING: ATOMIC_BOOL_SWAP (old, cell address, value, seq_cst).
+fn __go_sync_atomic_bool_swap(cell: &GoAtomicBool, val: bool) -> bool {
+    let old = cell.v != 0;
+    cell.v = __go_sync_atomic_bool01(val);
+    return old;
+}
+
+// BINDING: ATOMIC_BOOL_COMPARE_EXCHANGE
+// (old, ok, cell address, expected, new, seq_cst, acquire).
+// Returns (observed old, swapped).
+fn __go_sync_atomic_bool_cmpxchg(cell: &GoAtomicBool, old: bool, new: bool) -> (bool, bool) {
+    let cur = cell.v != 0;
+    if cur == old {
+        cell.v = __go_sync_atomic_bool01(new);
+        return (cur, true);
+    };
+    return (cur, false);
+}
+
+// ---------- private helpers: atomic.Value ----------
+
+// The empty (never-stored) Value result: Go's nil.
+fn __go_sync_atomic_value_empty() -> GoAtomicValueResult {
+    return GoAtomicValueResult { present: false, kind: GO_SYNC_ATOMIC_VALUE_KIND_EMPTY, i: 0, b: Vec::new(), p: 0 };
+}
+
+// Spin until a first store in progress (kind -1)
+// publishes its kind, then return the settled kind.
+// Mirrors Go value.go's active spin wait; in a
+// single-threaded program the kind is never -1 here.
+fn __go_sync_atomic_value_wait_ready(v: &GoAtomicValue) -> i64 {
+    let k = __go_sync_atomic_i64_load(&v.kind);
+    while k == GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS {
+        k = __go_sync_atomic_i64_load(&v.kind);
+    }
+    return k;
+}
+
+// Store the payload fields for a value whose kind
+// has already been checked. Which field is written
+// is decided by val.kind alone.
+fn __go_sync_atomic_value_store_payload(v: &GoAtomicValue, val: GoAtomicValueResult) -> void {
+    if val.kind == GO_SYNC_ATOMIC_VALUE_KIND_I64 {
+        v.i = val.i;
+        return;
+    };
+    if val.kind == GO_SYNC_ATOMIC_VALUE_KIND_BYTES {
+        v.b = val.b;
+        return;
+    };
+    v.p = val.p;
+    return;
+}
+
+// Go's Value.CompareAndSwap compares old against the
+// current value with == on the concrete type. The
+// i64 and ptr kinds compare by value; the Vec<u8>
+// kind compares bytes deep (see DIVERGENCES: Go would
+// panic on a []byte payload here and compare bytes
+// on a string payload -- the holder cannot tell
+// them apart).
+fn __go_sync_atomic_value_equal(a: GoAtomicValueResult, b: GoAtomicValueResult) -> bool {
+    if a.present != b.present {
+        return false;
+    };
+    if !a.present {
+        return true;
+    };
+    if a.kind != b.kind {
+        return false;
+    };
+    if a.kind == GO_SYNC_ATOMIC_VALUE_KIND_I64 {
+        return a.i == b.i;
+    };
+    if a.kind == GO_SYNC_ATOMIC_VALUE_KIND_PTR {
+        return a.p == b.p;
+    };
+    return __go_sync_atomic_bytes_equal(a.b, b.b);
+}
+
+fn __go_sync_atomic_bytes_equal(a: Vec<u8>, b: Vec<u8>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    };
+    let i = 0;
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------- public: top-level functions (doc.go) ----------
+// Go's SwapT / CompareAndSwapT / AddT / AndT / OrT /
+// LoadT / StoreT over *T cells, where T is the handle
+// struct the frontend materialised (seam (a)).
+// Add returns the NEW value; And/Or return the OLD
+// value; Swap returns the OLD value; CompareAndSwap
+// returns whether the swap happened.
+
+// --- int32 (doc.go) ---
+
+// Go atomic.SwapInt32.
+fn go_sync_atomic_swap_int32(addr: &GoAtomicInt32, new: i64) -> i64 {
+    return __go_sync_atomic_i32_swap(addr, new);
+}
+
+// Go atomic.CompareAndSwapInt32.
+fn go_sync_atomic_compare_and_swap_int32(addr: &GoAtomicInt32, old: i64, new: i64) -> bool {
+    let (_cur, ok) = __go_sync_atomic_i32_cmpxchg(addr, old, new);
+    return ok;
+}
+
+// Go atomic.AddInt32: returns the new value (wraps mod 2^32).
+fn go_sync_atomic_add_int32(addr: &GoAtomicInt32, delta: i64) -> i64 {
+    let old = __go_sync_atomic_i32_fetch_add(addr, delta);
+    return __go_sync_atomic_trunc_i32(old + __go_sync_atomic_trunc_i32(delta));
+}
+
+// Go atomic.AndInt32: returns the old value.
+fn go_sync_atomic_and_int32(addr: &GoAtomicInt32, mask: i64) -> i64 {
+    return __go_sync_atomic_i32_fetch_and(addr, mask);
+}
+
+// Go atomic.OrInt32: returns the old value.
+fn go_sync_atomic_or_int32(addr: &GoAtomicInt32, mask: i64) -> i64 {
+    return __go_sync_atomic_i32_fetch_or(addr, mask);
+}
+
+// Go atomic.LoadInt32.
+fn go_sync_atomic_load_int32(addr: &GoAtomicInt32) -> i64 {
+    return __go_sync_atomic_i32_load(addr);
+}
+
+// Go atomic.StoreInt32.
+fn go_sync_atomic_store_int32(addr: &GoAtomicInt32, val: i64) -> void {
+    __go_sync_atomic_i32_store(addr, val);
+    return;
+}
+
+// --- uint32 (doc.go) ---
+
+// Go atomic.SwapUint32.
+fn go_sync_atomic_swap_uint32(addr: &GoAtomicUint32, new: i64) -> i64 {
+    return __go_sync_atomic_u32_swap(addr, new);
+}
+
+// Go atomic.CompareAndSwapUint32.
+fn go_sync_atomic_compare_and_swap_uint32(addr: &GoAtomicUint32, old: i64, new: i64) -> bool {
+    let (_cur, ok) = __go_sync_atomic_u32_cmpxchg(addr, old, new);
+    return ok;
+}
+
+// Go atomic.AddUint32: returns the new value (wraps mod 2^32).
+// To subtract c, Go callers pass ^uint32(c-1); that
+// spelling still arrives here as an i64 in range.
+fn go_sync_atomic_add_uint32(addr: &GoAtomicUint32, delta: i64) -> i64 {
+    let old = __go_sync_atomic_u32_fetch_add(addr, delta);
+    return __go_sync_atomic_trunc_u32(old + __go_sync_atomic_trunc_u32(delta));
+}
+
+// Go atomic.AndUint32: returns the old value.
+fn go_sync_atomic_and_uint32(addr: &GoAtomicUint32, mask: i64) -> i64 {
+    return __go_sync_atomic_u32_fetch_and(addr, mask);
+}
+
+// Go atomic.OrUint32: returns the old value.
+fn go_sync_atomic_or_uint32(addr: &GoAtomicUint32, mask: i64) -> i64 {
+    return __go_sync_atomic_u32_fetch_or(addr, mask);
+}
+
+// Go atomic.LoadUint32.
+fn go_sync_atomic_load_uint32(addr: &GoAtomicUint32) -> i64 {
+    return __go_sync_atomic_u32_load(addr);
+}
+
+// Go atomic.StoreUint32.
+fn go_sync_atomic_store_uint32(addr: &GoAtomicUint32, val: i64) -> void {
+    __go_sync_atomic_u32_store(addr, val);
+    return;
+}
+
+// --- uintptr (doc.go) ---
+// 64-bit target (seam (e)).
+
+// Go atomic.SwapUintptr.
+fn go_sync_atomic_swap_uintptr(addr: &GoAtomicUintptr, new: i64) -> i64 {
+    return __go_sync_atomic_uintptr_swap(addr, new);
+}
+
+// Go atomic.CompareAndSwapUintptr.
+fn go_sync_atomic_compare_and_swap_uintptr(addr: &GoAtomicUintptr, old: i64, new: i64) -> bool {
+    let (_cur, ok) = __go_sync_atomic_uintptr_cmpxchg(addr, old, new);
+    return ok;
+}
+
+// Go atomic.AddUintptr: returns the new value (wraps mod 2^64; seam (c)).
+fn go_sync_atomic_add_uintptr(addr: &GoAtomicUintptr, delta: i64) -> i64 {
+    let old = __go_sync_atomic_uintptr_fetch_add(addr, delta);
+    return old + delta;
+}
+
+// Go atomic.AndUintptr: returns the old value.
+fn go_sync_atomic_and_uintptr(addr: &GoAtomicUintptr, mask: i64) -> i64 {
+    return __go_sync_atomic_uintptr_fetch_and(addr, mask);
+}
+
+// Go atomic.OrUintptr: returns the old value.
+fn go_sync_atomic_or_uintptr(addr: &GoAtomicUintptr, mask: i64) -> i64 {
+    return __go_sync_atomic_uintptr_fetch_or(addr, mask);
+}
+
+// Go atomic.LoadUintptr.
+fn go_sync_atomic_load_uintptr(addr: &GoAtomicUintptr) -> i64 {
+    return __go_sync_atomic_uintptr_load(addr);
+}
+
+// Go atomic.StoreUintptr.
+fn go_sync_atomic_store_uintptr(addr: &GoAtomicUintptr, val: i64) -> void {
+    __go_sync_atomic_uintptr_store(addr, val);
+    return;
+}
+
+// --- pointer (doc.go) ---
+// Addresses as i64, nil = 0 (seam (f)). No Add/And/Or.
+
+// Go atomic.SwapPointer.
+fn go_sync_atomic_swap_pointer(addr: &GoAtomicPointer, new: i64) -> i64 {
+    return __go_sync_atomic_ptr_swap(addr, new);
+}
+
+// Go atomic.CompareAndSwapPointer.
+fn go_sync_atomic_compare_and_swap_pointer(addr: &GoAtomicPointer, old: i64, new: i64) -> bool {
+    let (_cur, ok) = __go_sync_atomic_ptr_cmpxchg(addr, old, new);
+    return ok;
+}
+
+// Go atomic.LoadPointer.
+fn go_sync_atomic_load_pointer(addr: &GoAtomicPointer) -> i64 {
+    return __go_sync_atomic_ptr_load(addr);
+}
+
+// Go atomic.StorePointer.
+fn go_sync_atomic_store_pointer(addr: &GoAtomicPointer, val: i64) -> void {
+    __go_sync_atomic_ptr_store(addr, val);
+    return;
+}
+
+// --- int64 (doc_64.go, 64-bit build tag) ---
+
+// Go atomic.SwapInt64.
+fn go_sync_atomic_swap_int64(addr: &GoAtomicInt64, new: i64) -> i64 {
+    return __go_sync_atomic_i64_swap(addr, new);
+}
+
+// Go atomic.CompareAndSwapInt64.
+fn go_sync_atomic_compare_and_swap_int64(addr: &GoAtomicInt64, old: i64, new: i64) -> bool {
+    let (_cur, ok) = __go_sync_atomic_i64_cmpxchg(addr, old, new);
+    return ok;
+}
+
+// Go atomic.AddInt64: returns the new value (wraps mod 2^64; seam (c)).
+fn go_sync_atomic_add_int64(addr: &GoAtomicInt64, delta: i64) -> i64 {
+    let old = __go_sync_atomic_i64_fetch_add(addr, delta);
+    return old + delta;
+}
+
+// Go atomic.AndInt64: returns the old value.
+fn go_sync_atomic_and_int64(addr: &GoAtomicInt64, mask: i64) -> i64 {
+    return __go_sync_atomic_i64_fetch_and(addr, mask);
+}
+
+// Go atomic.OrInt64: returns the old value.
+fn go_sync_atomic_or_int64(addr: &GoAtomicInt64, mask: i64) -> i64 {
+    return __go_sync_atomic_i64_fetch_or(addr, mask);
+}
+
+// Go atomic.LoadInt64.
+fn go_sync_atomic_load_int64(addr: &GoAtomicInt64) -> i64 {
+    return __go_sync_atomic_i64_load(addr);
+}
+
+// Go atomic.StoreInt64.
+fn go_sync_atomic_store_int64(addr: &GoAtomicInt64, val: i64) -> void {
+    __go_sync_atomic_i64_store(addr, val);
+    return;
+}
+
+// --- uint64 (doc_64.go, 64-bit build tag) ---
+
+// Go atomic.SwapUint64.
+fn go_sync_atomic_swap_uint64(addr: &GoAtomicUint64, new: i64) -> i64 {
+    return __go_sync_atomic_u64_swap(addr, new);
+}
+
+// Go atomic.CompareAndSwapUint64.
+fn go_sync_atomic_compare_and_swap_uint64(addr: &GoAtomicUint64, old: i64, new: i64) -> bool {
+    let (_cur, ok) = __go_sync_atomic_u64_cmpxchg(addr, old, new);
+    return ok;
+}
+
+// Go atomic.AddUint64: returns the new value (wraps mod 2^64; seam (c)).
+// To subtract c, Go callers pass ^uint64(c-1); that
+// spelling still arrives here as an i64 bit pattern.
+fn go_sync_atomic_add_uint64(addr: &GoAtomicUint64, delta: i64) -> i64 {
+    let old = __go_sync_atomic_u64_fetch_add(addr, delta);
+    return old + delta;
+}
+
+// Go atomic.AndUint64: returns the old value.
+fn go_sync_atomic_and_uint64(addr: &GoAtomicUint64, mask: i64) -> i64 {
+    return __go_sync_atomic_u64_fetch_and(addr, mask);
+}
+
+// Go atomic.OrUint64: returns the old value.
+fn go_sync_atomic_or_uint64(addr: &GoAtomicUint64, mask: i64) -> i64 {
+    return __go_sync_atomic_u64_fetch_or(addr, mask);
+}
+
+// Go atomic.LoadUint64.
+fn go_sync_atomic_load_uint64(addr: &GoAtomicUint64) -> i64 {
+    return __go_sync_atomic_u64_load(addr);
+}
+
+// Go atomic.StoreUint64.
+fn go_sync_atomic_store_uint64(addr: &GoAtomicUint64, val: i64) -> void {
+    __go_sync_atomic_u64_store(addr, val);
+    return;
+}
+
+// ---------- public: typed wrappers (type.go) ----------
+// Go's atomic.Int32 / Int64 / Uint32 / Uint64 /
+// Uintptr / Bool / Pointer[T] methods. The int/uint
+// wrappers delegate to the top-level functions,
+// exactly like Go's type.go does; Bool and Pointer
+// call their helpers directly (Go has no top-level
+// bool functions, and Pointer[T] delegates to the
+// Pointer top-level functions above). The zero value
+// of every handle is the zero cell (Go's zero values
+// are usable), so no separate zero constructor is
+// needed beyond the go_sync_atomic_new_* family.
+
+// --- Bool (type.go; backed by uint32 in Go) ---
+
+// Go (*Bool).Load.
+fn go_sync_atomic_bool_load(x: &GoAtomicBool) -> bool {
+    return __go_sync_atomic_bool_load(x);
+}
+
+// Go (*Bool).Store.
+fn go_sync_atomic_bool_store(x: &GoAtomicBool, val: bool) -> void {
+    __go_sync_atomic_bool_store(x, val);
+    return;
+}
+
+// Go (*Bool).Swap.
+fn go_sync_atomic_bool_swap(x: &GoAtomicBool, new: bool) -> bool {
+    return __go_sync_atomic_bool_swap(x, new);
+}
+
+// Go (*Bool).CompareAndSwap.
+fn go_sync_atomic_bool_compare_and_swap(x: &GoAtomicBool, old: bool, new: bool) -> bool {
+    let (_cur, ok) = __go_sync_atomic_bool_cmpxchg(x, old, new);
+    return ok;
+}
+
+// --- Pointer[T] (type.go; T erased, seam (f)) ---
+
+// Go (*Pointer[T]).Load: the address as i64 (nil = 0).
+fn go_sync_atomic_pointer_load(x: &GoAtomicPointer) -> i64 {
+    return go_sync_atomic_load_pointer(x);
+}
+
+// Go (*Pointer[T]).Store.
+fn go_sync_atomic_pointer_store(x: &GoAtomicPointer, val: i64) -> void {
+    go_sync_atomic_store_pointer(x, val);
+    return;
+}
+
+// Go (*Pointer[T]).Swap.
+fn go_sync_atomic_pointer_swap(x: &GoAtomicPointer, new: i64) -> i64 {
+    return go_sync_atomic_swap_pointer(x, new);
+}
+
+// Go (*Pointer[T]).CompareAndSwap.
+fn go_sync_atomic_pointer_compare_and_swap(x: &GoAtomicPointer, old: i64, new: i64) -> bool {
+    return go_sync_atomic_compare_and_swap_pointer(x, old, new);
+}
+
+// --- Int32 (type.go) ---
+
+// Go (*Int32).Load.
+fn go_sync_atomic_int32_load(x: &GoAtomicInt32) -> i64 {
+    return go_sync_atomic_load_int32(x);
+}
+
+// Go (*Int32).Store.
+fn go_sync_atomic_int32_store(x: &GoAtomicInt32, val: i64) -> void {
+    go_sync_atomic_store_int32(x, val);
+    return;
+}
+
+// Go (*Int32).Swap.
+fn go_sync_atomic_int32_swap(x: &GoAtomicInt32, new: i64) -> i64 {
+    return go_sync_atomic_swap_int32(x, new);
+}
+
+// Go (*Int32).CompareAndSwap.
+fn go_sync_atomic_int32_compare_and_swap(x: &GoAtomicInt32, old: i64, new: i64) -> bool {
+    return go_sync_atomic_compare_and_swap_int32(x, old, new);
+}
+
+// Go (*Int32).Add: returns the new value.
+fn go_sync_atomic_int32_add(x: &GoAtomicInt32, delta: i64) -> i64 {
+    return go_sync_atomic_add_int32(x, delta);
+}
+
+// Go (*Int32).And: returns the old value.
+fn go_sync_atomic_int32_and(x: &GoAtomicInt32, mask: i64) -> i64 {
+    return go_sync_atomic_and_int32(x, mask);
+}
+
+// Go (*Int32).Or: returns the old value.
+fn go_sync_atomic_int32_or(x: &GoAtomicInt32, mask: i64) -> i64 {
+    return go_sync_atomic_or_int32(x, mask);
+}
+
+// --- Int64 (type.go) ---
+
+// Go (*Int64).Load.
+fn go_sync_atomic_int64_load(x: &GoAtomicInt64) -> i64 {
+    return go_sync_atomic_load_int64(x);
+}
+
+// Go (*Int64).Store.
+fn go_sync_atomic_int64_store(x: &GoAtomicInt64, val: i64) -> void {
+    go_sync_atomic_store_int64(x, val);
+    return;
+}
+
+// Go (*Int64).Swap.
+fn go_sync_atomic_int64_swap(x: &GoAtomicInt64, new: i64) -> i64 {
+    return go_sync_atomic_swap_int64(x, new);
+}
+
+// Go (*Int64).CompareAndSwap.
+fn go_sync_atomic_int64_compare_and_swap(x: &GoAtomicInt64, old: i64, new: i64) -> bool {
+    return go_sync_atomic_compare_and_swap_int64(x, old, new);
+}
+
+// Go (*Int64).Add: returns the new value.
+fn go_sync_atomic_int64_add(x: &GoAtomicInt64, delta: i64) -> i64 {
+    return go_sync_atomic_add_int64(x, delta);
+}
+
+// Go (*Int64).And: returns the old value.
+fn go_sync_atomic_int64_and(x: &GoAtomicInt64, mask: i64) -> i64 {
+    return go_sync_atomic_and_int64(x, mask);
+}
+
+// Go (*Int64).Or: returns the old value.
+fn go_sync_atomic_int64_or(x: &GoAtomicInt64, mask: i64) -> i64 {
+    return go_sync_atomic_or_int64(x, mask);
+}
+
+// --- Uint32 (type.go) ---
+
+// Go (*Uint32).Load.
+fn go_sync_atomic_uint32_load(x: &GoAtomicUint32) -> i64 {
+    return go_sync_atomic_load_uint32(x);
+}
+
+// Go (*Uint32).Store.
+fn go_sync_atomic_uint32_store(x: &GoAtomicUint32, val: i64) -> void {
+    go_sync_atomic_store_uint32(x, val);
+    return;
+}
+
+// Go (*Uint32).Swap.
+fn go_sync_atomic_uint32_swap(x: &GoAtomicUint32, new: i64) -> i64 {
+    return go_sync_atomic_swap_uint32(x, new);
+}
+
+// Go (*Uint32).CompareAndSwap.
+fn go_sync_atomic_uint32_compare_and_swap(x: &GoAtomicUint32, old: i64, new: i64) -> bool {
+    return go_sync_atomic_compare_and_swap_uint32(x, old, new);
+}
+
+// Go (*Uint32).Add: returns the new value.
+fn go_sync_atomic_uint32_add(x: &GoAtomicUint32, delta: i64) -> i64 {
+    return go_sync_atomic_add_uint32(x, delta);
+}
+
+// Go (*Uint32).And: returns the old value.
+fn go_sync_atomic_uint32_and(x: &GoAtomicUint32, mask: i64) -> i64 {
+    return go_sync_atomic_and_uint32(x, mask);
+}
+
+// Go (*Uint32).Or: returns the old value.
+fn go_sync_atomic_uint32_or(x: &GoAtomicUint32, mask: i64) -> i64 {
+    return go_sync_atomic_or_uint32(x, mask);
+}
+
+// --- Uint64 (type.go) ---
+
+// Go (*Uint64).Load.
+fn go_sync_atomic_uint64_load(x: &GoAtomicUint64) -> i64 {
+    return go_sync_atomic_load_uint64(x);
+}
+
+// Go (*Uint64).Store.
+fn go_sync_atomic_uint64_store(x: &GoAtomicUint64, val: i64) -> void {
+    go_sync_atomic_store_uint64(x, val);
+    return;
+}
+
+// Go (*Uint64).Swap.
+fn go_sync_atomic_uint64_swap(x: &GoAtomicUint64, new: i64) -> i64 {
+    return go_sync_atomic_swap_uint64(x, new);
+}
+
+// Go (*Uint64).CompareAndSwap.
+fn go_sync_atomic_uint64_compare_and_swap(x: &GoAtomicUint64, old: i64, new: i64) -> bool {
+    return go_sync_atomic_compare_and_swap_uint64(x, old, new);
+}
+
+// Go (*Uint64).Add: returns the new value.
+fn go_sync_atomic_uint64_add(x: &GoAtomicUint64, delta: i64) -> i64 {
+    return go_sync_atomic_add_uint64(x, delta);
+}
+
+// Go (*Uint64).And: returns the old value.
+fn go_sync_atomic_uint64_and(x: &GoAtomicUint64, mask: i64) -> i64 {
+    return go_sync_atomic_and_uint64(x, mask);
+}
+
+// Go (*Uint64).Or: returns the old value.
+fn go_sync_atomic_uint64_or(x: &GoAtomicUint64, mask: i64) -> i64 {
+    return go_sync_atomic_or_uint64(x, mask);
+}
+
+// --- Uintptr (type.go) ---
+
+// Go (*Uintptr).Load.
+fn go_sync_atomic_uintptr_load(x: &GoAtomicUintptr) -> i64 {
+    return go_sync_atomic_load_uintptr(x);
+}
+
+// Go (*Uintptr).Store.
+fn go_sync_atomic_uintptr_store(x: &GoAtomicUintptr, val: i64) -> void {
+    go_sync_atomic_store_uintptr(x, val);
+    return;
+}
+
+// Go (*Uintptr).Swap.
+fn go_sync_atomic_uintptr_swap(x: &GoAtomicUintptr, new: i64) -> i64 {
+    return go_sync_atomic_swap_uintptr(x, new);
+}
+
+// Go (*Uintptr).CompareAndSwap.
+fn go_sync_atomic_uintptr_compare_and_swap(x: &GoAtomicUintptr, old: i64, new: i64) -> bool {
+    return go_sync_atomic_compare_and_swap_uintptr(x, old, new);
+}
+
+// Go (*Uintptr).Add: returns the new value.
+fn go_sync_atomic_uintptr_add(x: &GoAtomicUintptr, delta: i64) -> i64 {
+    return go_sync_atomic_add_uintptr(x, delta);
+}
+
+// Go (*Uintptr).And: returns the old value.
+fn go_sync_atomic_uintptr_and(x: &GoAtomicUintptr, mask: i64) -> i64 {
+    return go_sync_atomic_and_uintptr(x, mask);
+}
+
+// Go (*Uintptr).Or: returns the old value.
+fn go_sync_atomic_uintptr_or(x: &GoAtomicUintptr, mask: i64) -> i64 {
+    return go_sync_atomic_or_uintptr(x, mask);
+}
+
+// ---------- public: atomic.Value (value.go) ----------
+// The frontend builds Store / Swap / CompareAndSwap
+// arguments with go_sync_atomic_value_i64 / _bytes /
+// _ptr below (seam (g)); a nil payload (present=false,
+// kind 0) must never be passed to Store, Swap or
+// CompareAndSwap-new -- the 77434 backstop fires if
+// it is. Load returns present=false on an empty Value,
+// exactly like Go's nil return.
+
+// Go (*Value).Load: the most recent Store, or nil
+// (present=false) if there has been no Store.
+fn go_sync_atomic_value_load(v: &GoAtomicValue) -> GoAtomicValueResult {
+    let k = __go_sync_atomic_value_wait_ready(v);
+    if k == GO_SYNC_ATOMIC_VALUE_KIND_EMPTY {
+        return __go_sync_atomic_value_empty();
+    };
+    if k == GO_SYNC_ATOMIC_VALUE_KIND_I64 {
+        return GoAtomicValueResult { present: true, kind: k, i: v.i, b: Vec::new(), p: 0 };
+    };
+    if k == GO_SYNC_ATOMIC_VALUE_KIND_BYTES {
+        return GoAtomicValueResult { present: true, kind: k, i: 0, b: v.b, p: 0 };
+    };
+    return GoAtomicValueResult { present: true, kind: k, i: 0, b: Vec::new(), p: v.p };
+}
+
+// Go (*Value).Store: sets the Value to val. All calls
+// for one Value must use the same concrete kind;
+// a different kind panics 77435, a nil or unsupported
+// kind panics 77434. Mirrors Go's first-store
+// protocol: claim the kind with CAS 0 -> -1, store
+// the payload, then publish the kind.
+fn go_sync_atomic_value_store(v: &GoAtomicValue, val: GoAtomicValueResult) -> void {
+    if val.kind != GO_SYNC_ATOMIC_VALUE_KIND_I64 && val.kind != GO_SYNC_ATOMIC_VALUE_KIND_BYTES && val.kind != GO_SYNC_ATOMIC_VALUE_KIND_PTR {
+        panic(77434);
+    };
+    let k = __go_sync_atomic_i64_load(&v.kind);
+    while true {
+        if k == GO_SYNC_ATOMIC_VALUE_KIND_EMPTY {
+            let (_old, ok) = __go_sync_atomic_i64_cmpxchg(&v.kind, 0, GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS);
+            if ok {
+                __go_sync_atomic_value_store_payload(v, val);
+                __go_sync_atomic_i64_store(&v.kind, val.kind);
+                return;
+            };
+            k = __go_sync_atomic_i64_load(&v.kind);
+        } else {
+            if k == GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS {
+                k = __go_sync_atomic_value_wait_ready(v);
+            } else {
+                if k != val.kind {
+                    panic(77435);
+                };
+                __go_sync_atomic_value_store_payload(v, val);
+                return;
+            }
+        }
+    }
+}
+
+// Go (*Value).Swap: stores new and returns the
+// previous value, or nil (present=false) if the Value
+// was empty. Same type rules as Store (77434 /
+// 77435). See DIVERGENCES for the payload window:
+// the old value is read and the new one stored in
+// two steps, not one atomic swap.
+fn go_sync_atomic_value_swap(v: &GoAtomicValue, new: GoAtomicValueResult) -> GoAtomicValueResult {
+    if new.kind != GO_SYNC_ATOMIC_VALUE_KIND_I64 && new.kind != GO_SYNC_ATOMIC_VALUE_KIND_BYTES && new.kind != GO_SYNC_ATOMIC_VALUE_KIND_PTR {
+        panic(77434);
+    };
+    let k = __go_sync_atomic_i64_load(&v.kind);
+    while true {
+        if k == GO_SYNC_ATOMIC_VALUE_KIND_EMPTY {
+            let (_old, ok) = __go_sync_atomic_i64_cmpxchg(&v.kind, 0, GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS);
+            if ok {
+                __go_sync_atomic_value_store_payload(v, new);
+                __go_sync_atomic_i64_store(&v.kind, new.kind);
+                return __go_sync_atomic_value_empty();
+            };
+            k = __go_sync_atomic_i64_load(&v.kind);
+        } else {
+            if k == GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS {
+                k = __go_sync_atomic_value_wait_ready(v);
+            } else {
+                if k != new.kind {
+                    panic(77435);
+                };
+                let old = go_sync_atomic_value_load(v);
+                __go_sync_atomic_value_store_payload(v, new);
+                return old;
+            }
+        }
+    }
+}
+
+// Go (*Value).CompareAndSwap: swaps only if the
+// current value equals old. A nil old on an empty
+// Value performs the first store (returns true); a
+// non-nil old on an empty Value returns false. A new
+// payload whose kind differs from old's kind (when
+// old is non-nil) or from the stored kind panics
+// 77435; a nil or unsupported new kind panics 77434.
+fn go_sync_atomic_value_compare_and_swap(v: &GoAtomicValue, old: GoAtomicValueResult, new: GoAtomicValueResult) -> bool {
+    if new.kind != GO_SYNC_ATOMIC_VALUE_KIND_I64 && new.kind != GO_SYNC_ATOMIC_VALUE_KIND_BYTES && new.kind != GO_SYNC_ATOMIC_VALUE_KIND_PTR {
+        panic(77434);
+    };
+    if old.present && old.kind != new.kind {
+        panic(77435);
+    };
+    let k = __go_sync_atomic_i64_load(&v.kind);
+    while true {
+        if k == GO_SYNC_ATOMIC_VALUE_KIND_EMPTY {
+            if !old.present {
+                let (_o, ok) = __go_sync_atomic_i64_cmpxchg(&v.kind, 0, GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS);
+                if ok {
+                    __go_sync_atomic_value_store_payload(v, new);
+                    __go_sync_atomic_i64_store(&v.kind, new.kind);
+                    return true;
+                };
+                k = __go_sync_atomic_i64_load(&v.kind);
+            } else {
+                return false;
+            }
+        } else {
+            if k == GO_SYNC_ATOMIC_VALUE_KIND_IN_PROGRESS {
+                k = __go_sync_atomic_value_wait_ready(v);
+            } else {
+                if k != new.kind {
+                    panic(77435);
+                };
+                let cur = go_sync_atomic_value_load(v);
+                if !__go_sync_atomic_value_equal(cur, old) {
+                    return false;
+                };
+                __go_sync_atomic_value_store_payload(v, new);
+                return true;
+            }
+        }
+    }
+}
+
+// ---------- public: Value payload constructors ----------
+// The frontend builds Value arguments with these
+// (seam (g)). There is no constructor for a nil
+// payload: present=false is spelled by the empty
+// result, which must never be passed to Store / Swap
+// / CompareAndSwap-new (77434).
+
+// An i64 payload (Go int / int64 / uint64 scalars
+// funnelled to kind 1 by the frontend).
+fn go_sync_atomic_value_i64(val: i64) -> GoAtomicValueResult {
+    return GoAtomicValueResult { present: true, kind: GO_SYNC_ATOMIC_VALUE_KIND_I64, i: val, b: Vec::new(), p: 0 };
+}
+
+// A Vec<u8> payload (Go string or []byte -- the
+// holder cannot tell them apart, seam (g)).
+fn go_sync_atomic_value_bytes(val: Vec<u8>) -> GoAtomicValueResult {
+    return GoAtomicValueResult { present: true, kind: GO_SYNC_ATOMIC_VALUE_KIND_BYTES, i: 0, b: val, p: 0 };
+}
+
+// A pointer payload (Go *T / unsafe.Pointer as an
+// i64 address, nil = 0).
+fn go_sync_atomic_value_ptr(val: i64) -> GoAtomicValueResult {
+    return GoAtomicValueResult { present: true, kind: GO_SYNC_ATOMIC_VALUE_KIND_PTR, i: 0, b: Vec::new(), p: val };
+}

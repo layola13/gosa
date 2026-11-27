@@ -1,0 +1,421 @@
+// gostd hash/fnv: the SLA-side model of Go's
+// hash/fnv package (Fowler-Noll-Vo hashes, 32/64/
+// 128 bit, FNV-1 and FNV-1a). u64 arithmetic wraps
+// mod 2^64 (probed); 32-bit state is a u64 kept
+// under the 32-bit masking invariant (SLA has no
+// u32 type). Big u64 constants are built from
+// 32-bit parts, because an integer literal may not
+// exceed i64 max.
+//
+// Constants (Go, hash/fnv/fnv.go):
+//   offset32 = 2166136261, prime32 = 16777619
+//   offset64 = 14695981039346656037
+//     = 0xcbf29ce484222325
+//   prime64  = 1099511628211 = 0x100000001b3
+//   offset128 = 0x6c62272e07bb0142 (high)
+//             + 0x62b821756295c58d (low)
+//   prime128 = 2^88 + 0x13b; the multiply below
+//     uses prime128Lower = 315 and prime128Shift
+//     = 24.
+//
+// FNV-1 multiplies then XORs the byte; FNV-1a
+// XORs then multiplies. The 128-bit multiply is
+// Go's sum128.Write exactly: s0,s1 :=
+// bits.Mul64(315, s[1]); s0 += s[1]<<24 +
+// 315*s[0] (the s[1]/s[0] on the right are the
+// OLD state words); FNV-1 XORs the byte into s[1]
+// after the multiply, FNV-1a before it.
+//
+// No panic codes in this file.
+
+struct GosFNV32 {
+    s: u64,
+    a: bool,
+}
+
+struct GosFNV64 {
+    s: u64,
+    a: bool,
+}
+
+struct GosFNV128 {
+    s0: u64,
+    s1: u64,
+    a: bool,
+}
+
+struct GoFNV128State {
+    w0: u64,
+    w1: u64,
+}
+
+struct GoFNV128Mul {
+    hi: u64,
+    lo: u64,
+}
+
+// ---------- constants ----------
+
+fn go_fnv_offset32() -> u64 {
+    return (2166136261 as u64);
+}
+
+fn go_fnv_prime32() -> u64 {
+    return (16777619 as u64);
+}
+
+fn go_fnv_offset64() -> u64 {
+    return ((3426983268 as u64) << 32) | 2216829733;
+}
+
+fn go_fnv_prime64() -> u64 {
+    return (1099511628211 as u64);
+}
+
+fn go_fnv_offset128_high() -> u64 {
+    return ((1817712430 as u64) << 32) | 129247042;
+}
+
+fn go_fnv_offset128_low() -> u64 {
+    return ((1657457013 as u64) << 32) | 1654279565;
+}
+
+// ---------- internal write steps ----------
+
+// FNV-1 32-bit: multiply (masked to 32 bits),
+// then XOR the byte. a=true selects FNV-1a
+// (XOR first, then multiply).
+fn __go_fnv32_write(s: u64, p: Vec<u8>, a: bool) -> u64 {
+    let prime = (16777619 as u64);
+    let mask = (4294967295 as u64);
+    let i = 0;
+    while i < len(p) {
+        if a {
+            s = (s ^ (p[i] as u64)) & mask;
+            s = (s * prime) & mask;
+        } else {
+            s = (s * prime) & mask;
+            s = (s ^ (p[i] as u64)) & mask;
+        };
+        i = i + 1;
+    }
+    return s & mask;
+}
+
+// FNV-1 64-bit: u64 multiply wraps (Go semantics).
+fn __go_fnv64_write(s: u64, p: Vec<u8>, a: bool) -> u64 {
+    let prime = (1099511628211 as u64);
+    let i = 0;
+    while i < len(p) {
+        if a {
+            s = s ^ (p[i] as u64);
+            s = s * prime;
+        } else {
+            s = s * prime;
+            s = s ^ (p[i] as u64);
+        };
+        i = i + 1;
+    }
+    return s;
+}
+
+// bits.Mul64(315, b): 315 is small, so split b
+// into 32-bit halves; neither partial product
+// overflows u64 (315 * (2^32 - 1) < 2^64).
+// P = 315*b = A*2^32 + B with A = 315*bhi,
+// B = 315*blo: lo = (B + (A mod 2^32)<<32) mod
+// 2^64, hi = (A >> 32) + carry, where carry is 1
+// exactly when the low add wrapped.
+fn __go_fnv_mul315(b: u64) -> GoFNV128Mul {
+    let blo = b & (4294967295 as u64);
+    let bhi = b >> 32;
+    let p_lo = (315 as u64) * blo;
+    let p_hi = (315 as u64) * bhi;
+    let lo = p_lo + (p_hi << 32);
+    let carry: u64 = 0;
+    if lo < p_lo { carry = 1; };
+    let hi = (p_hi >> 32) + carry;
+    return GoFNV128Mul { hi: hi, lo: lo };
+}
+
+// FNV-1 128-bit, Go's sum128.Write step per byte.
+// s0 is the high word, s1 the low word.
+fn __go_fnv128_write(s0: u64, s1: u64, p: Vec<u8>, a: bool) -> GoFNV128State {
+    let i = 0;
+    while i < len(p) {
+        if a {
+            s1 = s1 ^ (p[i] as u64);
+        };
+        let m = __go_fnv_mul315(s1);
+        let ns0 = m.hi + (s1 << 24) + (315 as u64) * s0;
+        let ns1 = m.lo;
+        s0 = ns0;
+        s1 = ns1;
+        if !a {
+            s1 = s1 ^ (p[i] as u64);
+        };
+        i = i + 1;
+    }
+    return GoFNV128State { w0: s0, w1: s1 };
+}
+
+// ---------- constructors ----------
+
+fn go_fnv_new32() -> GosFNV32 {
+    return GosFNV32 { s: (2166136261 as u64), a: false };
+}
+
+fn go_fnv_new32a() -> GosFNV32 {
+    return GosFNV32 { s: (2166136261 as u64), a: true };
+}
+
+fn go_fnv_new64() -> GosFNV64 {
+    return GosFNV64 { s: go_fnv_offset64(), a: false };
+}
+
+fn go_fnv_new64a() -> GosFNV64 {
+    return GosFNV64 { s: go_fnv_offset64(), a: true };
+}
+
+fn go_fnv_new128() -> GosFNV128 {
+    return GosFNV128 { s0: go_fnv_offset128_high(), s1: go_fnv_offset128_low(), a: false };
+}
+
+fn go_fnv_new128a() -> GosFNV128 {
+    return GosFNV128 { s0: go_fnv_offset128_high(), s1: go_fnv_offset128_low(), a: true };
+}
+
+// ---------- 32-bit methods ----------
+
+fn go_fnv32_size() -> i64 {
+    return 4;
+}
+
+fn go_fnv32_block_size() -> i64 {
+    return 1;
+}
+
+fn go_fnv32_write(h: &GosFNV32, p: Vec<u8>) -> i64 {
+    h.s = __go_fnv32_write(h.s, p, h.a);
+    return len(p);
+}
+
+fn go_fnv32_sum32(h: &GosFNV32) -> u64 {
+    return h.s & (4294967295 as u64);
+}
+
+fn go_fnv32_sum(h: &GosFNV32, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_fnv_append(out, dst);
+    let v = h.s & (4294967295 as u64);
+    out.push(((v >> 24) as u8));
+    out.push(((v >> 16) as u8));
+    out.push(((v >> 8) as u8));
+    out.push((v as u8));
+    return out;
+}
+
+fn go_fnv32_reset(h: &GosFNV32) -> void {
+    h.s = (2166136261 as u64);
+    return;
+}
+
+fn go_fnv32_clone(h: &GosFNV32) -> GosFNV32 {
+    return GosFNV32 { s: h.s, a: h.a };
+}
+
+// AppendBinary: "fnv\x01" (FNV-1) or "fnv\x02"
+// (FNV-1a) + 4 big-endian state bytes.
+fn go_fnv32_append_binary(h: &GosFNV32, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_fnv_append(out, dst);
+    out.push(102u8);
+    out.push(110u8);
+    out.push(118u8);
+    if h.a {
+        out.push(2u8);
+    } else {
+        out.push(1u8);
+    };
+    let v = h.s & (4294967295 as u64);
+    out.push(((v >> 24) as u8));
+    out.push(((v >> 16) as u8));
+    out.push(((v >> 8) as u8));
+    out.push((v as u8));
+    return out;
+}
+
+fn go_fnv32_marshal_binary(h: &GosFNV32) -> Vec<u8> {
+    return go_fnv32_append_binary(h, Vec::new());
+}
+
+// ---------- 64-bit methods ----------
+
+fn go_fnv64_size() -> i64 {
+    return 8;
+}
+
+fn go_fnv64_block_size() -> i64 {
+    return 1;
+}
+
+fn go_fnv64_write(h: &GosFNV64, p: Vec<u8>) -> i64 {
+    h.s = __go_fnv64_write(h.s, p, h.a);
+    return len(p);
+}
+
+fn go_fnv64_sum64(h: &GosFNV64) -> u64 {
+    return h.s;
+}
+
+fn go_fnv64_sum(h: &GosFNV64, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_fnv_append(out, dst);
+    let v = h.s;
+    out.push(((v >> 56) as u8));
+    out.push(((v >> 48) as u8));
+    out.push(((v >> 40) as u8));
+    out.push(((v >> 32) as u8));
+    out.push(((v >> 24) as u8));
+    out.push(((v >> 16) as u8));
+    out.push(((v >> 8) as u8));
+    out.push((v as u8));
+    return out;
+}
+
+fn go_fnv64_reset(h: &GosFNV64) -> void {
+    h.s = go_fnv_offset64();
+    return;
+}
+
+fn go_fnv64_clone(h: &GosFNV64) -> GosFNV64 {
+    return GosFNV64 { s: h.s, a: h.a };
+}
+
+// AppendBinary: "fnv\x03" (FNV-1) or "fnv\x04"
+// (FNV-1a) + 8 big-endian state bytes.
+fn go_fnv64_append_binary(h: &GosFNV64, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_fnv_append(out, dst);
+    out.push(102u8);
+    out.push(110u8);
+    out.push(118u8);
+    if h.a {
+        out.push(4u8);
+    } else {
+        out.push(3u8);
+    };
+    let v = h.s;
+    out.push(((v >> 56) as u8));
+    out.push(((v >> 48) as u8));
+    out.push(((v >> 40) as u8));
+    out.push(((v >> 32) as u8));
+    out.push(((v >> 24) as u8));
+    out.push(((v >> 16) as u8));
+    out.push(((v >> 8) as u8));
+    out.push((v as u8));
+    return out;
+}
+
+fn go_fnv64_marshal_binary(h: &GosFNV64) -> Vec<u8> {
+    return go_fnv64_append_binary(h, Vec::new());
+}
+
+// ---------- 128-bit methods ----------
+
+fn go_fnv128_size() -> i64 {
+    return 16;
+}
+
+fn go_fnv128_block_size() -> i64 {
+    return 1;
+}
+
+fn go_fnv128_write(h: &GosFNV128, p: Vec<u8>) -> i64 {
+    let r = __go_fnv128_write(h.s0, h.s1, p, h.a);
+    h.s0 = r.w0;
+    h.s1 = r.w1;
+    return len(p);
+}
+
+// Sum: 16 bytes, big endian, high word first.
+fn go_fnv128_sum(h: &GosFNV128, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_fnv_append(out, dst);
+    let v = h.s0;
+    out.push(((v >> 56) as u8));
+    out.push(((v >> 48) as u8));
+    out.push(((v >> 40) as u8));
+    out.push(((v >> 32) as u8));
+    out.push(((v >> 24) as u8));
+    out.push(((v >> 16) as u8));
+    out.push(((v >> 8) as u8));
+    out.push((v as u8));
+    let w = h.s1;
+    out.push(((w >> 56) as u8));
+    out.push(((w >> 48) as u8));
+    out.push(((w >> 40) as u8));
+    out.push(((w >> 32) as u8));
+    out.push(((w >> 24) as u8));
+    out.push(((w >> 16) as u8));
+    out.push(((w >> 8) as u8));
+    out.push((w as u8));
+    return out;
+}
+
+fn go_fnv128_reset(h: &GosFNV128) -> void {
+    h.s0 = go_fnv_offset128_high();
+    h.s1 = go_fnv_offset128_low();
+    return;
+}
+
+fn go_fnv128_clone(h: &GosFNV128) -> GosFNV128 {
+    return GosFNV128 { s0: h.s0, s1: h.s1, a: h.a };
+}
+
+// AppendBinary: "fnv\x05" (FNV-1) or "fnv\x06"
+// (FNV-1a) + 16 big-endian state bytes.
+fn go_fnv128_append_binary(h: &GosFNV128, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_fnv_append(out, dst);
+    out.push(102u8);
+    out.push(110u8);
+    out.push(118u8);
+    if h.a {
+        out.push(6u8);
+    } else {
+        out.push(5u8);
+    };
+    let v = h.s0;
+    out.push(((v >> 56) as u8));
+    out.push(((v >> 48) as u8));
+    out.push(((v >> 40) as u8));
+    out.push(((v >> 32) as u8));
+    out.push(((v >> 24) as u8));
+    out.push(((v >> 16) as u8));
+    out.push(((v >> 8) as u8));
+    out.push((v as u8));
+    let w = h.s1;
+    out.push(((w >> 56) as u8));
+    out.push(((w >> 48) as u8));
+    out.push(((w >> 40) as u8));
+    out.push(((w >> 32) as u8));
+    out.push(((w >> 24) as u8));
+    out.push(((w >> 16) as u8));
+    out.push(((w >> 8) as u8));
+    out.push((w as u8));
+    return out;
+}
+
+fn go_fnv128_marshal_binary(h: &GosFNV128) -> Vec<u8> {
+    return go_fnv128_append_binary(h, Vec::new());
+}
+
+fn __go_fnv_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}

@@ -1,0 +1,279 @@
+// gostd hash: the SLA-side model of Go's hash
+// package. Go's hash package is interfaces only --
+// Hash, Hash32, Hash64, Cloner, XOF -- with no
+// concrete type of its own. gostd therefore models
+// it in two parts:
+//
+//   (1) this file documents the interface method
+//       sets, which the frontend uses for interface
+//       resolution (which concrete functions satisfy
+//       which interface method);
+//   (2) GosHashBox, a uniform value box that carries
+//       any wave-1a concrete hash (crc32, fnv32/64/
+//       128) through an interface-typed variable, so
+//       the frontend can emit Write / Sum / Reset /
+//       Size / BlockSize / Clone on a hash.Hash value
+//       without knowing its concrete type.
+//
+// INTERFACE METHOD SETS (Go, hash/hash.go):
+//   Hash   = Write(p []byte) (n int, err error)
+//            + Sum(b []byte) []byte
+//            + Reset() + Size() int + BlockSize() int
+//   Hash32 = Hash + Sum32() uint32
+//   Hash64 = Hash + Sum64() uint64
+//   Cloner = Clone() Hash
+//   XOF    = Hash + Read(p []byte) (n int, err error)
+// XOF has no concrete type in wave 1a (no SHAKE /
+// extendable-output hash is in scope): the
+// frontend must refuse an XOF-typed value. Cloner
+// is satisfied by every concrete hash below
+// (Clone copies the box -- all wave-1a hash state
+// is value state, so Clone is a plain copy).
+//
+// KIND TAGS (GosHashBox.kind):
+//   1  crc32 IEEE (poly 0xedb88320)
+//   2  crc32 Castagnoli (poly 0x82f63b78)
+//   3  crc32 Koopman (poly 0xeb31d82e)
+//   10 fnv32   (New32)
+//   11 fnv32a  (New32a)
+//   12 fnv64   (New64)
+//   13 fnv64a  (New64a)
+//   14 fnv128  (New128)
+//   15 fnv128a (New128a)
+// The crc32 box carries its table in tab (built
+// once at box creation); fnv boxes leave tab empty.
+// w0/w1 hold the hash state: crc32 -> crc (w0);
+// fnv32/64 -> s (w0); fnv128 -> s[0] (w0), s[1]
+// (w1), where s[1] is the low word.
+//
+// No panic codes in this file.
+
+struct GosHashBox {
+    kind: i64,
+    w0: u64,
+    w1: u64,
+    tab: Vec<u64>,
+}
+
+// ---------- constructors ----------
+
+fn go_hash_new_box_crc32(kind: i64, crc: u64) -> GosHashBox {
+    // kind must be 1 (IEEE), 2 (Castagnoli) or 3
+    // (Koopman); the caller supplies the poly tag.
+    let poly = (3988292384 as u64);
+    if kind == 2 { poly = (2197175160 as u64); };
+    if kind == 3 { poly = (3949012510 as u64); };
+    return GosHashBox { kind: kind, w0: crc, w1: (0 as u64), tab: go_crc32_make_table(poly) };
+}
+
+fn go_hash_new_box_fnv(kind: i64, w0: u64, w1: u64) -> GosHashBox {
+    return GosHashBox { kind: kind, w0: w0, w1: w1, tab: Vec::new() };
+}
+
+// ---------- Hash method set on the box ----------
+
+fn go_hash_box_size(b: &GosHashBox) -> i64 {
+    if b.kind >= 1 {
+        if b.kind <= 3 { return 4; };
+    };
+    if b.kind == 10 { return 4; };
+    if b.kind == 11 { return 4; };
+    if b.kind == 12 { return 8; };
+    if b.kind == 13 { return 8; };
+    if b.kind == 14 { return 16; };
+    if b.kind == 15 { return 16; };
+    return 0;
+}
+
+fn go_hash_box_block_size(b: &GosHashBox) -> i64 {
+    // crc32 and fnv both report BlockSize 1 in Go.
+    return 1;
+}
+
+fn go_hash_box_reset(b: &GosHashBox) -> void {
+    if b.kind >= 1 {
+        if b.kind <= 3 {
+            b.w0 = (4294967295 as u64);
+            return;
+        };
+    };
+    if b.kind == 10 { b.w0 = (2166136261 as u64); return; };
+    if b.kind == 11 { b.w0 = (2166136261 as u64); return; };
+    if b.kind == 12 { b.w0 = ((3426983268 as u64) << 32) | 2216829733; return; };
+    if b.kind == 13 { b.w0 = ((3426983268 as u64) << 32) | 2216829733; return; };
+    if b.kind == 14 {
+        // offset128 = 0x6c62272e07bb0142 (high) +
+        // 0x62b821756295c58d (low), built from parts:
+        // u64 literals may not exceed i64 max.
+        b.w0 = ((1817712430 as u64) << 32) | 129247042;
+        b.w1 = ((1657457013 as u64) << 32) | 1654279565;
+        return;
+    };
+    if b.kind == 15 {
+        b.w0 = ((1817712430 as u64) << 32) | 129247042;
+        b.w1 = ((1657457013 as u64) << 32) | 1654279565;
+        return;
+    };
+    return;
+}
+
+fn go_hash_box_write(b: &GosHashBox, p: Vec<u8>) -> i64 {
+    if b.kind >= 1 {
+        if b.kind <= 3 {
+            b.w0 = go_crc32_update(b.w0, b.tab, p);
+            return len(p);
+        };
+    };
+    if b.kind == 10 {
+        b.w0 = __go_fnv32_write(b.w0, p, false);
+        return len(p);
+    };
+    if b.kind == 11 {
+        b.w0 = __go_fnv32_write(b.w0, p, true);
+        return len(p);
+    };
+    if b.kind == 12 {
+        b.w0 = __go_fnv64_write(b.w0, p, false);
+        return len(p);
+    };
+    if b.kind == 13 {
+        b.w0 = __go_fnv64_write(b.w0, p, true);
+        return len(p);
+    };
+    if b.kind == 14 {
+        let r = __go_fnv128_write(b.w0, b.w1, p, false);
+        b.w0 = r.w0;
+        b.w1 = r.w1;
+        return len(p);
+    };
+    if b.kind == 15 {
+        let r = __go_fnv128_write(b.w0, b.w1, p, true);
+        b.w0 = r.w0;
+        b.w1 = r.w1;
+        return len(p);
+    };
+    return len(p);
+}
+
+// Sum(b): the digest bytes appended to b (big
+// endian), without mutating the box state.
+fn go_hash_box_sum(b: &GosHashBox, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_hash_append(out, dst);
+    if b.kind >= 1 {
+        if b.kind <= 3 {
+            // The box stores the finalised crc (Go's
+            // digest.crc), so Sum32 is the value.
+            let v = b.w0;
+            out.push(((v >> 24) as u8));
+            out.push(((v >> 16) as u8));
+            out.push(((v >> 8) as u8));
+            out.push((v as u8));
+            return out;
+        };
+    };
+    if b.kind == 10 {
+        let v = b.w0;
+        out.push(((v >> 24) as u8));
+        out.push(((v >> 16) as u8));
+        out.push(((v >> 8) as u8));
+        out.push((v as u8));
+        return out;
+    };
+    if b.kind == 11 {
+        let v = b.w0;
+        out.push(((v >> 24) as u8));
+        out.push(((v >> 16) as u8));
+        out.push(((v >> 8) as u8));
+        out.push((v as u8));
+        return out;
+    };
+    if b.kind == 12 {
+        let v = b.w0;
+        out.push(((v >> 56) as u8));
+        out.push(((v >> 48) as u8));
+        out.push(((v >> 40) as u8));
+        out.push(((v >> 32) as u8));
+        out.push(((v >> 24) as u8));
+        out.push(((v >> 16) as u8));
+        out.push(((v >> 8) as u8));
+        out.push((v as u8));
+        return out;
+    };
+    if b.kind == 13 {
+        let v = b.w0;
+        out.push(((v >> 56) as u8));
+        out.push(((v >> 48) as u8));
+        out.push(((v >> 40) as u8));
+        out.push(((v >> 32) as u8));
+        out.push(((v >> 24) as u8));
+        out.push(((v >> 16) as u8));
+        out.push(((v >> 8) as u8));
+        out.push((v as u8));
+        return out;
+    };
+    if b.kind == 14 {
+        let v = b.w0;
+        out.push(((v >> 56) as u8));
+        out.push(((v >> 48) as u8));
+        out.push(((v >> 40) as u8));
+        out.push(((v >> 32) as u8));
+        out.push(((v >> 24) as u8));
+        out.push(((v >> 16) as u8));
+        out.push(((v >> 8) as u8));
+        out.push((v as u8));
+        let w = b.w1;
+        out.push(((w >> 56) as u8));
+        out.push(((w >> 48) as u8));
+        out.push(((w >> 40) as u8));
+        out.push(((w >> 32) as u8));
+        out.push(((w >> 24) as u8));
+        out.push(((w >> 16) as u8));
+        out.push(((w >> 8) as u8));
+        out.push((w as u8));
+        return out;
+    };
+    if b.kind == 15 {
+        let v = b.w0;
+        out.push(((v >> 56) as u8));
+        out.push(((v >> 48) as u8));
+        out.push(((v >> 40) as u8));
+        out.push(((v >> 32) as u8));
+        out.push(((v >> 24) as u8));
+        out.push(((v >> 16) as u8));
+        out.push(((v >> 8) as u8));
+        out.push((v as u8));
+        let w = b.w1;
+        out.push(((w >> 56) as u8));
+        out.push(((w >> 48) as u8));
+        out.push(((w >> 40) as u8));
+        out.push(((w >> 32) as u8));
+        out.push(((w >> 24) as u8));
+        out.push(((w >> 16) as u8));
+        out.push(((w >> 8) as u8));
+        out.push((w as u8));
+        return out;
+    };
+    return out;
+}
+
+// Clone: all wave-1a hash state is value state, so
+// a clone is a plain copy of the box.
+fn go_hash_box_clone(b: &GosHashBox) -> GosHashBox {
+    let tab = Vec::new();
+    let i = 0;
+    while i < len(b.tab) {
+        tab.push(b.tab[i]);
+        i = i + 1;
+    }
+    return GosHashBox { kind: b.kind, w0: b.w0, w1: b.w1, tab: tab };
+}
+
+fn __go_hash_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}

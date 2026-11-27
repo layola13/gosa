@@ -1,0 +1,936 @@
+// gostd flag: the SLA-side model of Go's flag
+// package. A FlagSet is a value struct holding
+// the defined flags (in registration order), the
+// set values, the remaining args, and the
+// set-before-defined names. Values are stored in
+// kind-tagged slots (i64 / u64 / f64 / Vec<u8>):
+// a flag's live value is read through the getters
+// below; Go's *bool / *int / ... pointers are the
+// (FlagSet, name) handle in the frontend.
+//
+// Flag kinds: 1 bool, 2 int, 3 int64, 4 uint,
+// 5 uint64, 6 float64, 7 string, 8 duration.
+// ErrorHandling: 0 ContinueOnError, 1 ExitOnError,
+// 2 PanicOnError.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77408  registration panics (Go panics the same
+//          way): a name beginning with "-" or
+//          containing "=", a redefined flag, or a
+//          flag defined after it was set.
+//   77409  registration that needs a Go value
+//          gostd cannot represent: Func, BoolFunc,
+//          TextVar (a func value or an
+//          encoding.TextUnmarshaler). Loud refusal:
+//          the frontend must refuse these at the
+//          call site.
+//
+// ErrHelp sentinel (target id; errors.sla
+// reserves the 900000-999999 range):
+//   900030 "flag: help requested"
+//
+// DIVERGENCES (documented, no silent degradation):
+//   - usage() printing (failf calls it, -h calls
+//     it) has no output surface in gostd: it is a
+//     no-op. PrintDefaults text is available as a
+//     pure function (go_flag_print_defaults).
+//   - ExitOnError / PanicOnError: Parse returns
+//     the error; the frontend (which owns main)
+//     must exit(2) / panic per errorHandling.
+//   - The set-before-defined panic message in Go
+//     carries the file:line where Set was called;
+//     gostd records only the name, so the panic
+//     code (77408) is the observable, not the
+//     position.
+//   - Visit / VisitAll take a Go func value: use
+//     go_flag_visit_names / visit_all_names
+//     (lexicographical order) + Lookup instead.
+//
+// VALUE REPRESENTATION (gostd contract):
+//   Go string -> Vec<u8>; Go error -> GosError ptr
+//   duration  -> i64 nanoseconds
+
+struct GosFlagDef {
+    name: Vec<u8>,
+    kind: i64,
+    usage: Vec<u8>,
+    def_i: i64,
+    def_u: u64,
+    def_f: f64,
+    def_s: Vec<u8>,
+}
+
+struct GosFlagValue {
+    name: Vec<u8>,
+    v_i: i64,
+    v_u: u64,
+    v_f: f64,
+    v_s: Vec<u8>,
+}
+
+struct GosFlagSet {
+    name: Vec<u8>,
+    error_handling: i64,
+    defs: Vec<GosFlagDef>,
+    vals: Vec<GosFlagValue>,
+    args: Vec<Vec<u8>>,
+    parsed: bool,
+    undef: Vec<Vec<u8>>,
+}
+
+struct GoFlagLookup {
+    found: bool,
+    kind: i64,
+    usage: Vec<u8>,
+    def_value: Vec<u8>,
+    v_i: i64,
+    v_u: u64,
+    v_f: f64,
+    v_s: Vec<u8>,
+    is_set: bool,
+}
+
+struct GoFlagBool {
+    v: bool,
+    ok: bool,
+}
+
+struct GoFlagI64 {
+    v: i64,
+    ok: bool,
+}
+
+struct GoFlagU64 {
+    v: u64,
+    ok: bool,
+}
+
+struct GoFlagF64 {
+    v: f64,
+    ok: bool,
+}
+
+struct GoFlagBytes {
+    v: Vec<u8>,
+    ok: bool,
+}
+
+struct GoFlagParse {
+    rest: Vec<Vec<u8>>,
+    err: ptr,
+}
+
+struct GoFlagUsage {
+    name: Vec<u8>,
+    usage: Vec<u8>,
+}
+
+// ---------- ErrHelp ----------
+
+fn go_flag_err_help() -> ptr {
+    let m = Vec::new();
+    m.push(102u8); m.push(108u8); m.push(97u8); m.push(103u8); m.push(58u8); m.push(32u8); m.push(104u8); m.push(101u8); m.push(108u8); m.push(112u8);
+    m.push(32u8); m.push(114u8); m.push(101u8); m.push(113u8); m.push(117u8); m.push(101u8); m.push(115u8); m.push(116u8); m.push(101u8); m.push(100u8);
+    return go_errors_new_with_id(m, 900030);
+}
+
+// ---------- constructors ----------
+
+fn go_flag_new_flag_set(name: Vec<u8>, error_handling: i64) -> GosFlagSet {
+    return GosFlagSet { name: name, error_handling: error_handling, defs: Vec::new(), vals: Vec::new(), args: Vec::new(), parsed: false, undef: Vec::new() };
+}
+
+// The global CommandLine: name is the program name
+// (Go uses os.Args[0]); error handling ExitOnError.
+fn go_flag_new_command_line(name: Vec<u8>) -> GosFlagSet {
+    return go_flag_new_flag_set(name, 1);
+}
+
+// ---------- helpers ----------
+
+fn __go_flag_eq(a: Vec<u8>, b: Vec<u8>) -> bool {
+    if len(a) != len(b) { return false; };
+    let i = 0;
+    while i < len(a) {
+        if a[i] != b[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn __go_flag_find_def(fs: &GosFlagSet, name: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(fs.defs) {
+        if __go_flag_eq(fs.defs[i].name, name) { return i; };
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn __go_flag_find_val(fs: &GosFlagSet, name: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(fs.vals) {
+        if __go_flag_eq(fs.vals[i].name, name) { return i; };
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn __go_flag_in_names(names: Vec<Vec<u8>>, name: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(names) {
+        if __go_flag_eq(names[i], name) { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn __go_flag_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_flag_copy(b: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_flag_append(out, b);
+    return out;
+}
+
+// Byte-wise less (for lexicographical order).
+fn __go_flag_less(a: Vec<u8>, b: Vec<u8>) -> bool {
+    let n = len(a);
+    if len(b) < n { n = len(b); };
+    let i = 0;
+    while i < n {
+        if a[i] != b[i] { return a[i] < b[i]; };
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+
+// The DefValue string of a definition (Go's
+// Flag.DefValue: the default formatted per kind).
+fn __go_flag_def_value(d: &GosFlagDef) -> Vec<u8> {
+    if d.kind == 1 {
+        if d.def_i != 0 {
+            return go_strconv_format_bool(true);
+        };
+        return go_strconv_format_bool(false);
+    };
+    if d.kind == 2 { return go_strconv_format_int(d.def_i, 10); };
+    if d.kind == 3 { return go_strconv_format_int(d.def_i, 10); };
+    if d.kind == 4 { return go_strconv_format_uint(d.def_u, 10); };
+    if d.kind == 5 { return go_strconv_format_uint(d.def_u, 10); };
+    if d.kind == 6 { return go_strconv_format_float(d.def_f, 103, -1, 64); };
+    if d.kind == 7 { return __go_flag_copy(d.def_s); };
+    if d.kind == 8 { return go_time_duration_string(d.def_i); };
+    return Vec::new();
+}
+
+// The zero-value string of a kind (for
+// isZeroValue in PrintDefaults).
+fn __go_flag_zero_value(kind: i64) -> Vec<u8> {
+    if kind == 1 { return go_strconv_format_bool(false); };
+    if kind == 2 { return go_strconv_format_int(0, 10); };
+    if kind == 3 { return go_strconv_format_int(0, 10); };
+    if kind == 4 { return go_strconv_format_uint(0 as u64, 10); };
+    if kind == 5 { return go_strconv_format_uint(0 as u64, 10); };
+    if kind == 6 { return go_strconv_format_float(0.0, 103, -1, 64); };
+    if kind == 7 { return Vec::new(); };
+    if kind == 8 { return go_time_duration_string(0); };
+    return Vec::new();
+}
+
+// ---------- registration ----------
+
+fn __go_flag_register(fs: &GosFlagSet, name: Vec<u8>, kind: i64, usage: Vec<u8>, def_i: i64, def_u: u64, def_f: f64, def_s: Vec<u8>) -> void {
+    // A name must not begin with "-" or contain "=".
+    if len(name) > 0 {
+        if name[0] == 45u8 { panic(77408); };
+    };
+    let i = 0;
+    while i < len(name) {
+        if name[i] == 61u8 { panic(77408); };
+        i = i + 1;
+    }
+    if __go_flag_find_def(fs, name) >= 0 { panic(77408); };
+    if __go_flag_in_names(fs.undef, name) { panic(77408); };
+    fs.defs.push(GosFlagDef { name: __go_flag_copy(name), kind: kind, usage: __go_flag_copy(usage), def_i: def_i, def_u: def_u, def_f: def_f, def_s: __go_flag_copy(def_s) });
+    return;
+}
+
+fn go_flag_bool_var(fs: &GosFlagSet, name: Vec<u8>, def: bool, usage: Vec<u8>) -> void {
+    let d = 0;
+    if def { d = 1; };
+    __go_flag_register(fs, name, 1, usage, d, 0 as u64, 0.0, Vec::new());
+    return;
+}
+
+fn go_flag_int_var(fs: &GosFlagSet, name: Vec<u8>, def: i64, usage: Vec<u8>) -> void {
+    __go_flag_register(fs, name, 2, usage, def, 0 as u64, 0.0, Vec::new());
+    return;
+}
+
+fn go_flag_int64_var(fs: &GosFlagSet, name: Vec<u8>, def: i64, usage: Vec<u8>) -> void {
+    __go_flag_register(fs, name, 3, usage, def, 0 as u64, 0.0, Vec::new());
+    return;
+}
+
+fn go_flag_uint_var(fs: &GosFlagSet, name: Vec<u8>, def: u64, usage: Vec<u8>) -> void {
+    __go_flag_register(fs, name, 4, usage, 0, def, 0.0, Vec::new());
+    return;
+}
+
+fn go_flag_uint64_var(fs: &GosFlagSet, name: Vec<u8>, def: u64, usage: Vec<u8>) -> void {
+    __go_flag_register(fs, name, 5, usage, 0, def, 0.0, Vec::new());
+    return;
+}
+
+fn go_flag_float64_var(fs: &GosFlagSet, name: Vec<u8>, def: f64, usage: Vec<u8>) -> void {
+    __go_flag_register(fs, name, 6, usage, 0, 0 as u64, def, Vec::new());
+    return;
+}
+
+fn go_flag_string_var(fs: &GosFlagSet, name: Vec<u8>, def: Vec<u8>, usage: Vec<u8>) -> void {
+    __go_flag_register(fs, name, 7, usage, 0, 0 as u64, 0.0, def);
+    return;
+}
+
+fn go_flag_duration_var(fs: &GosFlagSet, name: Vec<u8>, def: i64, usage: Vec<u8>) -> void {
+    __go_flag_register(fs, name, 8, usage, def, 0 as u64, 0.0, Vec::new());
+    return;
+}
+
+// The value forms (Bool, Int, ...) register the
+// same way; Go returns a pointer to the value,
+// which in gostd is the (FlagSet, name) handle --
+// the live value is read through the getters.
+// These return the default (initial) value.
+fn go_flag_bool(fs: &GosFlagSet, name: Vec<u8>, def: bool, usage: Vec<u8>) -> bool {
+    go_flag_bool_var(fs, name, def, usage);
+    return def;
+}
+
+fn go_flag_int(fs: &GosFlagSet, name: Vec<u8>, def: i64, usage: Vec<u8>) -> i64 {
+    go_flag_int_var(fs, name, def, usage);
+    return def;
+}
+
+fn go_flag_int64(fs: &GosFlagSet, name: Vec<u8>, def: i64, usage: Vec<u8>) -> i64 {
+    go_flag_int64_var(fs, name, def, usage);
+    return def;
+}
+
+fn go_flag_uint(fs: &GosFlagSet, name: Vec<u8>, def: u64, usage: Vec<u8>) -> u64 {
+    go_flag_uint_var(fs, name, def, usage);
+    return def;
+}
+
+fn go_flag_uint64(fs: &GosFlagSet, name: Vec<u8>, def: u64, usage: Vec<u8>) -> u64 {
+    go_flag_uint64_var(fs, name, def, usage);
+    return def;
+}
+
+fn go_flag_float64(fs: &GosFlagSet, name: Vec<u8>, def: f64, usage: Vec<u8>) -> f64 {
+    go_flag_float64_var(fs, name, def, usage);
+    return def;
+}
+
+fn go_flag_string(fs: &GosFlagSet, name: Vec<u8>, def: Vec<u8>, usage: Vec<u8>) -> Vec<u8> {
+    go_flag_string_var(fs, name, def, usage);
+    return __go_flag_copy(def);
+}
+
+fn go_flag_duration(fs: &GosFlagSet, name: Vec<u8>, def: i64, usage: Vec<u8>) -> i64 {
+    go_flag_duration_var(fs, name, def, usage);
+    return def;
+}
+
+// Func / BoolFunc / TextVar need a Go func value
+// or an encoding.TextUnmarshaler -- loud refusal.
+fn go_flag_func(fs: &GosFlagSet, name: Vec<u8>, usage: Vec<u8>) -> void {
+    panic(77409);
+}
+
+fn go_flag_bool_func(fs: &GosFlagSet, name: Vec<u8>, usage: Vec<u8>) -> void {
+    panic(77409);
+}
+
+fn go_flag_text_var(fs: &GosFlagSet, name: Vec<u8>, usage: Vec<u8>) -> void {
+    panic(77409);
+}
+
+// ---------- lookup & getters ----------
+
+fn go_flag_lookup(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagLookup {
+    let di = __go_flag_find_def(fs, name);
+    if di < 0 {
+        return GoFlagLookup { found: false, kind: 0, usage: Vec::new(), def_value: Vec::new(), v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), is_set: false };
+    };
+    let d = fs.defs[di];
+    let vi = __go_flag_find_val(fs, name);
+    let is_set = vi >= 0;
+    let v_i = d.def_i;
+    let v_u = d.def_u;
+    let v_f = d.def_f;
+    let v_s = __go_flag_copy(d.def_s);
+    if is_set {
+        let vv = fs.vals[vi];
+        v_i = vv.v_i;
+        v_u = vv.v_u;
+        v_f = vv.v_f;
+        v_s = __go_flag_copy(vv.v_s);
+    };
+    return GoFlagLookup { found: true, kind: d.kind, usage: __go_flag_copy(d.usage), def_value: __go_flag_def_value(&d), v_i: v_i, v_u: v_u, v_f: v_f, v_s: v_s, is_set: is_set };
+}
+
+fn go_flag_get_bool(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagBool {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagBool { v: false, ok: false }; };
+    if lk.kind != 1 { return GoFlagBool { v: false, ok: false }; };
+    return GoFlagBool { v: lk.v_i != 0, ok: true };
+}
+
+fn go_flag_get_int(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagI64 {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagI64 { v: 0, ok: false }; };
+    if lk.kind != 2 { return GoFlagI64 { v: 0, ok: false }; };
+    return GoFlagI64 { v: lk.v_i, ok: true };
+}
+
+fn go_flag_get_int64(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagI64 {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagI64 { v: 0, ok: false }; };
+    if lk.kind != 3 { return GoFlagI64 { v: 0, ok: false }; };
+    return GoFlagI64 { v: lk.v_i, ok: true };
+}
+
+fn go_flag_get_uint(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagU64 {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagU64 { v: 0 as u64, ok: false }; };
+    if lk.kind != 4 { return GoFlagU64 { v: 0 as u64, ok: false }; };
+    return GoFlagU64 { v: lk.v_u, ok: true };
+}
+
+fn go_flag_get_uint64(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagU64 {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagU64 { v: 0 as u64, ok: false }; };
+    if lk.kind != 5 { return GoFlagU64 { v: 0 as u64, ok: false }; };
+    return GoFlagU64 { v: lk.v_u, ok: true };
+}
+
+fn go_flag_get_float64(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagF64 {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagF64 { v: 0.0, ok: false }; };
+    if lk.kind != 6 { return GoFlagF64 { v: 0.0, ok: false }; };
+    return GoFlagF64 { v: lk.v_f, ok: true };
+}
+
+fn go_flag_get_string(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagBytes {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagBytes { v: Vec::new(), ok: false }; };
+    if lk.kind != 7 { return GoFlagBytes { v: Vec::new(), ok: false }; };
+    return GoFlagBytes { v: lk.v_s, ok: true };
+}
+
+fn go_flag_get_duration(fs: &GosFlagSet, name: Vec<u8>) -> GoFlagI64 {
+    let lk = go_flag_lookup(fs, name);
+    if !lk.found { return GoFlagI64 { v: 0, ok: false }; };
+    if lk.kind != 8 { return GoFlagI64 { v: 0, ok: false }; };
+    return GoFlagI64 { v: lk.v_i, ok: true };
+}
+
+// ---------- Set ----------
+
+// Set(name, value): parses value per the flag's
+// kind and records it. An undefined name is
+// recorded in undef and returns "no such flag
+// -%s". A parse error is returned unwrapped (Go's
+// f.set returns the Value.Set error as-is).
+fn go_flag_set(fs: &GosFlagSet, name: Vec<u8>, value: Vec<u8>) -> ptr {
+    let di = __go_flag_find_def(fs, name);
+    if di < 0 {
+        if !__go_flag_in_names(fs.undef, name) {
+            fs.undef.push(__go_flag_copy(name));
+        };
+        let m = Vec::new();
+        m.push(110u8); m.push(111u8); m.push(32u8); m.push(115u8); m.push(117u8); m.push(99u8); m.push(104u8); m.push(32u8); m.push(102u8); m.push(108u8);
+        m.push(97u8); m.push(103u8); m.push(32u8); m.push(45u8);
+        __go_flag_append(m, name);
+        return go_errors_new(m);
+    };
+    let d = fs.defs[di];
+    let r = __go_flag_set_value(d.kind, value);
+    if r.err != go_errors_nil() { return r.err; };
+    __go_flag_store(fs, name, d.kind, &r);
+    return go_errors_nil();
+}
+
+struct GoFlagSetValue {
+    v_i: i64,
+    v_u: u64,
+    v_f: f64,
+    v_s: Vec<u8>,
+    err: ptr,
+}
+
+fn __go_flag_set_value(kind: i64, value: Vec<u8>) -> GoFlagSetValue {
+    if kind == 1 {
+        let b = go_strconv_parse_bool(value);
+        if b.err != go_errors_nil() {
+            return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: b.err };
+        };
+        let v = 0;
+        if b.v { v = 1; };
+        return GoFlagSetValue { v_i: v, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+    };
+    if kind == 2 {
+        let c = go_strconv_parse_int(value, 0, 64);
+        if c.err != go_errors_nil() {
+            return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: c.err };
+        };
+        return GoFlagSetValue { v_i: c.v, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+    };
+    if kind == 3 {
+        let c = go_strconv_parse_int(value, 0, 64);
+        if c.err != go_errors_nil() {
+            return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: c.err };
+        };
+        return GoFlagSetValue { v_i: c.v, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+    };
+    if kind == 4 {
+        let c = go_strconv_parse_uint(value, 0, 64);
+        if c.err != go_errors_nil() {
+            return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: c.err };
+        };
+        return GoFlagSetValue { v_i: 0, v_u: c.v, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+    };
+    if kind == 5 {
+        let c = go_strconv_parse_uint(value, 0, 64);
+        if c.err != go_errors_nil() {
+            return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: c.err };
+        };
+        return GoFlagSetValue { v_i: 0, v_u: c.v, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+    };
+    if kind == 6 {
+        let c = go_strconv_parse_float(value, 64);
+        if c.err != go_errors_nil() {
+            return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: c.err };
+        };
+        return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: c.v, v_s: Vec::new(), err: go_errors_nil() };
+    };
+    if kind == 7 {
+        return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: __go_flag_copy(value), err: go_errors_nil() };
+    };
+    if kind == 8 {
+        let c = go_time_parse_duration(value);
+        if c.err != go_errors_nil() {
+            return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: c.err };
+        };
+        return GoFlagSetValue { v_i: c.v, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+    };
+    return GoFlagSetValue { v_i: 0, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+}
+
+fn __go_flag_store(fs: &GosFlagSet, name: Vec<u8>, kind: i64, r: &GoFlagSetValue) -> void {
+    let vi = __go_flag_find_val(fs, name);
+    if vi >= 0 {
+        fs.vals[vi].v_i = r.v_i;
+        fs.vals[vi].v_u = r.v_u;
+        fs.vals[vi].v_f = r.v_f;
+        fs.vals[vi].v_s = __go_flag_copy(r.v_s);
+        return;
+    };
+    fs.vals.push(GosFlagValue { name: __go_flag_copy(name), v_i: r.v_i, v_u: r.v_u, v_f: r.v_f, v_s: __go_flag_copy(r.v_s) });
+    return;
+}
+
+// ---------- Parse ----------
+
+// failf: builds the error message. Go also calls
+// usage() here; gostd has no output surface, so
+// that call is a no-op (see the header).
+fn __go_flag_failf(msg: Vec<u8>) -> ptr {
+    return go_errors_new(msg);
+}
+
+struct GoFlagParseOne {
+    seen: bool,
+    rest: Vec<Vec<u8>>,
+    err: ptr,
+}
+
+// parseOne: parses one flag from fs.args (which
+// this function consumes). Returns (seen, rest,
+// err): seen=false means parsing stops here (no
+// more args, a non-flag arg, "--", or an error).
+fn __go_flag_parse_one(fs: &GosFlagSet) -> GoFlagParseOne {
+    if len(fs.args) == 0 {
+        return GoFlagParseOne { seen: false, rest: Vec::new(), err: go_errors_nil() };
+    };
+    let s = fs.args[0];
+    if len(s) < 2 {
+        return GoFlagParseOne { seen: false, rest: fs.args, err: go_errors_nil() };
+    };
+    if s[0] != 45u8 {
+        return GoFlagParseOne { seen: false, rest: fs.args, err: go_errors_nil() };
+    };
+    let num_minuses = 1;
+    if s[1] == 45u8 {
+        num_minuses = 2;
+        if len(s) == 2 {
+            // "--" terminates the flags.
+            fs.args = __go_flag_args_slice(fs.args, 1, len(fs.args));
+            return GoFlagParseOne { seen: false, rest: fs.args, err: go_errors_nil() };
+        };
+    };
+    let name = __go_flag_copy_range(s, num_minuses, len(s));
+    if len(name) == 0 {
+        return __go_flag_parse_one_bad(fs, s);
+    };
+    if name[0] == 45u8 {
+        return __go_flag_parse_one_bad(fs, s);
+    };
+    if name[0] == 61u8 {
+        return __go_flag_parse_one_bad(fs, s);
+    };
+    // Consume the flag arg.
+    fs.args = __go_flag_args_slice(fs.args, 1, len(fs.args));
+    // Split name=value on the first '=' (i >= 1).
+    let has_value = false;
+    let value = Vec::new();
+    let i = 1;
+    while i < len(name) {
+        if name[i] == 61u8 {
+            value = __go_flag_copy_range(name, i + 1, len(name));
+            name = __go_flag_copy_range(name, 0, i);
+            has_value = true;
+            break;
+        };
+        i = i + 1;
+    }
+    let di = __go_flag_find_def(fs, name);
+    if di < 0 {
+        // "help" / "h" are the special help case.
+        let help = Vec::new();
+        help.push(104u8); help.push(101u8); help.push(108u8); help.push(112u8);
+        if __go_flag_eq(name, help) {
+            return GoFlagParseOne { seen: false, rest: fs.args, err: go_flag_err_help() };
+        };
+        let h = Vec::new();
+        h.push(104u8);
+        if __go_flag_eq(name, h) {
+            return GoFlagParseOne { seen: false, rest: fs.args, err: go_flag_err_help() };
+        };
+        let m = Vec::new();
+        m.push(102u8); m.push(108u8); m.push(97u8); m.push(103u8); m.push(32u8); m.push(112u8); m.push(114u8); m.push(111u8); m.push(118u8); m.push(105u8);
+        m.push(100u8); m.push(101u8); m.push(100u8); m.push(32u8); m.push(98u8); m.push(117u8); m.push(116u8); m.push(32u8); m.push(110u8); m.push(111u8);
+        m.push(116u8); m.push(32u8); m.push(100u8); m.push(101u8); m.push(102u8); m.push(105u8); m.push(110u8); m.push(101u8); m.push(100u8); m.push(58u8);
+        m.push(32u8); m.push(45u8);
+        __go_flag_append(m, name);
+        return GoFlagParseOne { seen: false, rest: fs.args, err: __go_flag_failf(m) };
+    };
+    let d = fs.defs[di];
+    if d.kind == 1 {
+        // Bool flag: no separate arg is consumed.
+        if has_value {
+            let b = go_strconv_parse_bool(value);
+            if b.err != go_errors_nil() {
+                let m = Vec::new();
+                m.push(105u8); m.push(110u8); m.push(118u8); m.push(97u8); m.push(108u8); m.push(105u8); m.push(100u8); m.push(32u8); m.push(98u8); m.push(111u8);
+                m.push(111u8); m.push(108u8); m.push(101u8); m.push(97u8); m.push(110u8); m.push(32u8); m.push(118u8); m.push(97u8); m.push(108u8); m.push(117u8);
+                m.push(101u8); m.push(32u8);
+                __go_flag_append(m, go_strconv_quote(value));
+                m.push(32u8); m.push(102u8); m.push(111u8); m.push(114u8); m.push(32u8); m.push(45u8);
+                __go_flag_append(m, name);
+                m.push(58u8); m.push(32u8);
+                __go_flag_append(m, go_errors_error_string(b.err));
+                return GoFlagParseOne { seen: false, rest: fs.args, err: __go_flag_failf(m) };
+            };
+            let v = 0;
+            if b.v { v = 1; };
+            let sv = GoFlagSetValue { v_i: v, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+            __go_flag_store(fs, name, 1, &sv);
+        } else {
+            let sv = GoFlagSetValue { v_i: 1, v_u: 0 as u64, v_f: 0.0, v_s: Vec::new(), err: go_errors_nil() };
+            __go_flag_store(fs, name, 1, &sv);
+        };
+        return GoFlagParseOne { seen: true, rest: fs.args, err: go_errors_nil() };
+    };
+    // Non-bool: the value may be the next arg.
+    if !has_value {
+        if len(fs.args) > 0 {
+            has_value = true;
+            value = __go_flag_copy(fs.args[0]);
+            fs.args = __go_flag_args_slice(fs.args, 1, len(fs.args));
+        };
+    };
+    if !has_value {
+        let m = Vec::new();
+        m.push(102u8); m.push(108u8); m.push(97u8); m.push(103u8); m.push(32u8); m.push(110u8); m.push(101u8); m.push(101u8); m.push(100u8); m.push(115u8);
+        m.push(32u8); m.push(97u8); m.push(110u8); m.push(32u8); m.push(97u8); m.push(114u8); m.push(103u8); m.push(117u8); m.push(109u8); m.push(101u8);
+        m.push(110u8); m.push(116u8); m.push(58u8); m.push(32u8); m.push(45u8);
+        __go_flag_append(m, name);
+        return GoFlagParseOne { seen: false, rest: fs.args, err: __go_flag_failf(m) };
+    };
+    let r = __go_flag_set_value(d.kind, value);
+    if r.err != go_errors_nil() {
+        let m = Vec::new();
+        m.push(105u8); m.push(110u8); m.push(118u8); m.push(97u8); m.push(108u8); m.push(105u8); m.push(100u8); m.push(32u8); m.push(118u8); m.push(97u8);
+        m.push(108u8); m.push(117u8); m.push(101u8); m.push(32u8);
+        __go_flag_append(m, go_strconv_quote(value));
+        m.push(32u8); m.push(102u8); m.push(111u8); m.push(114u8); m.push(32u8); m.push(102u8); m.push(108u8); m.push(97u8); m.push(103u8); m.push(32u8);
+        m.push(45u8);
+        __go_flag_append(m, name);
+        m.push(58u8); m.push(32u8);
+        __go_flag_append(m, go_errors_error_string(r.err));
+        return GoFlagParseOne { seen: false, rest: fs.args, err: __go_flag_failf(m) };
+    };
+    __go_flag_store(fs, name, d.kind, &r);
+    return GoFlagParseOne { seen: true, rest: fs.args, err: go_errors_nil() };
+}
+
+fn __go_flag_parse_one_bad(fs: &GosFlagSet, s: Vec<u8>) -> GoFlagParseOne {
+    let m = Vec::new();
+    m.push(98u8); m.push(97u8); m.push(100u8); m.push(32u8); m.push(102u8); m.push(108u8); m.push(97u8); m.push(103u8); m.push(32u8); m.push(115u8);
+    m.push(121u8); m.push(110u8); m.push(116u8); m.push(97u8); m.push(120u8); m.push(58u8); m.push(32u8);
+    __go_flag_append(m, s);
+    return GoFlagParseOne { seen: false, rest: fs.args, err: __go_flag_failf(m) };
+}
+
+fn __go_flag_copy_range(b: Vec<u8>, lo: i64, hi: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __go_flag_args_slice(args: Vec<Vec<u8>>, lo: i64, hi: i64) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(args[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Parse(arguments): runs parseOne until it stops.
+// Returns the remaining args and the error (nil
+// on success). parsed is set before parsing (Go).
+// For ExitOnError / PanicOnError the frontend
+// must exit(2) / panic on a non-nil error.
+fn go_flag_parse(fs: &GosFlagSet, args: Vec<Vec<u8>>) -> GoFlagParse {
+    fs.parsed = true;
+    fs.args = args;
+    while true {
+        let one = __go_flag_parse_one(fs);
+        if one.err != go_errors_nil() {
+            return GoFlagParse { rest: one.rest, err: one.err };
+        };
+        if !one.seen {
+            return GoFlagParse { rest: one.rest, err: go_errors_nil() };
+        };
+    }
+}
+
+// ---------- Args / NArg / NFlag / Parsed ----------
+
+fn go_flag_args(fs: &GosFlagSet) -> Vec<Vec<u8>> {
+    return fs.args;
+}
+
+fn go_flag_n_arg(fs: &GosFlagSet) -> i64 {
+    return len(fs.args);
+}
+
+fn go_flag_n_flag(fs: &GosFlagSet) -> i64 {
+    return len(fs.vals);
+}
+
+fn go_flag_arg(fs: &GosFlagSet, i: i64) -> Vec<u8> {
+    if i < 0 { return Vec::new(); };
+    if i >= len(fs.args) { return Vec::new(); };
+    return __go_flag_copy(fs.args[i]);
+}
+
+fn go_flag_parsed(fs: &GosFlagSet) -> bool {
+    return fs.parsed;
+}
+
+// ---------- Visit names ----------
+
+// Visit visits set flags in lexicographical
+// order; VisitAll visits all defined flags. Both
+// take a Go func value, so gostd exposes the
+// NAME lists instead; the frontend loops with
+// Lookup.
+fn go_flag_visit_names(fs: &GosFlagSet) -> Vec<Vec<u8>> {
+    let names = Vec::new();
+    let i = 0;
+    while i < len(fs.vals) {
+        names.push(__go_flag_copy(fs.vals[i].name));
+        i = i + 1;
+    }
+    return __go_flag_sorted(names);
+}
+
+fn go_flag_visit_all_names(fs: &GosFlagSet) -> Vec<Vec<u8>> {
+    let names = Vec::new();
+    let i = 0;
+    while i < len(fs.defs) {
+        names.push(__go_flag_copy(fs.defs[i].name));
+        i = i + 1;
+    }
+    return __go_flag_sorted(names);
+}
+
+fn __go_flag_sorted(names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    // Insertion sort, byte-wise.
+    let out = Vec::new();
+    let i = 0;
+    while i < len(names) {
+        out.push(names[i]);
+        i = i + 1;
+    }
+    let j = 1;
+    while j < len(out) {
+        let key = out[j];
+        let k = j - 1;
+        while k >= 0 {
+            if !__go_flag_less(key, out[k]) { break; };
+            out[k + 1] = out[k];
+            k = k - 1;
+        }
+        out[k + 1] = key;
+        j = j + 1;
+    }
+    return out;
+}
+
+// ---------- UnquoteUsage & PrintDefaults ----------
+
+// UnquoteUsage: the name from backquotes in the
+// usage string (backquotes removed from the
+// usage), or the type placeholder when there is
+// none (bool has no placeholder).
+fn go_flag_unquote_usage(usage: Vec<u8>, kind: i64) -> GoFlagUsage {
+    let name = Vec::new();
+    let out = Vec::new();
+    let i = 0;
+    let found = false;
+    while i < len(usage) {
+        if usage[i] == 96u8 {
+            let j = i + 1;
+            while j < len(usage) {
+                if usage[j] == 96u8 {
+                    name = __go_flag_copy_range(usage, i + 1, j);
+                    found = true;
+                    break;
+                };
+                j = j + 1;
+            }
+            if found {
+                // usage = usage[:i] + name + usage[j+1:]
+                let k = 0;
+                while k < i {
+                    out.push(usage[k]);
+                    k = k + 1;
+                }
+                __go_flag_append(out, name);
+                let m = j + 1;
+                while m < len(usage) {
+                    out.push(usage[m]);
+                    m = m + 1;
+                }
+                break;
+            };
+            // An unclosed backquote: Go stops at the
+            // first backquote either way.
+            break;
+        };
+        i = i + 1;
+    }
+    if !found {
+        // No backquotes: copy the usage as-is.
+        let k = 0;
+        while k < len(usage) {
+            out.push(usage[k]);
+            k = k + 1;
+        }
+    };
+    if len(name) == 0 {
+        if kind == 1 { name = Vec::new(); };
+        if kind == 2 { name.push(105u8); name.push(110u8); name.push(116u8); };
+        if kind == 3 { name.push(105u8); name.push(110u8); name.push(116u8); };
+        if kind == 4 { name.push(117u8); name.push(105u8); name.push(110u8); name.push(116u8); };
+        if kind == 5 { name.push(117u8); name.push(105u8); name.push(110u8); name.push(116u8); };
+        if kind == 6 { name.push(102u8); name.push(108u8); name.push(111u8); name.push(97u8); name.push(116u8); };
+        if kind == 7 { name.push(115u8); name.push(116u8); name.push(114u8); name.push(105u8); name.push(110u8); name.push(103u8); };
+        if kind == 8 { name.push(100u8); name.push(117u8); name.push(114u8); name.push(97u8); name.push(116u8); name.push(105u8); name.push(111u8); name.push(110u8); };
+        if kind == 0 { name.push(118u8); name.push(97u8); name.push(108u8); name.push(117u8); name.push(101u8); };
+    };
+    return GoFlagUsage { name: name, usage: out };
+}
+
+// PrintDefaults: the exact text Go's
+// FlagSet.PrintDefaults writes (one line per
+// defined flag, lexicographical order). The
+// caller writes it to the output; gostd only
+// produces the text.
+fn go_flag_print_defaults(fs: &GosFlagSet) -> Vec<u8> {
+    let out = Vec::new();
+    let names = go_flag_visit_all_names(fs);
+    let i = 0;
+    while i < len(names) {
+        let di = __go_flag_find_def(fs, names[i]);
+        let d = fs.defs[di];
+        let line = Vec::new();
+        line.push(32u8); line.push(45u8);
+        __go_flag_append(line, d.name);
+        let uu = go_flag_unquote_usage(d.usage, d.kind);
+        if len(uu.name) > 0 {
+            line.push(32u8);
+            __go_flag_append(line, uu.name);
+        };
+        if len(line) <= 4 {
+            line.push(9u8);
+        } else {
+            line.push(10u8); line.push(32u8); line.push(32u8); line.push(32u8); line.push(32u8); line.push(9u8);
+        };
+        // Usage with newlines replaced by "\n    \t".
+        let j = 0;
+        while j < len(uu.usage) {
+            if uu.usage[j] == 10u8 {
+                line.push(10u8); line.push(32u8); line.push(32u8); line.push(32u8); line.push(32u8); line.push(9u8);
+            } else {
+                line.push(uu.usage[j]);
+            };
+            j = j + 1;
+        }
+        let dv = __go_flag_def_value(&d);
+        let zv = __go_flag_zero_value(d.kind);
+        if !__go_flag_eq(dv, zv) {
+            if d.kind == 7 {
+                line.push(32u8); line.push(40u8); line.push(100u8); line.push(101u8); line.push(102u8); line.push(97u8); line.push(117u8); line.push(108u8); line.push(116u8); line.push(32u8);
+                __go_flag_append(line, go_strconv_quote(dv));
+                line.push(41u8);
+            } else {
+                line.push(32u8); line.push(40u8); line.push(100u8); line.push(101u8); line.push(102u8); line.push(97u8); line.push(117u8); line.push(108u8); line.push(116u8); line.push(32u8);
+                __go_flag_append(line, dv);
+                line.push(41u8);
+            };
+        };
+        line.push(10u8);
+        __go_flag_append(out, line);
+        i = i + 1;
+    }
+    return out;
+}

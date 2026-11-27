@@ -1,0 +1,771 @@
+// gostd log: the SLA-side model of Go's log package.
+//
+// Oracle: Go 1.27.2 stdlib src/log/log.go (483 lines), read
+// 2026-11-26. Census: CENSUS-170.md rev1 section 7.2.1,
+// wave 1a, no-prerequisite package; needs io (written in
+// parallel by Sunny -- this file writes against the io
+// contract below, it does not wait for her file).
+//
+// Organisation follows the psa_std / gostd precedent: one
+// .sla file per Go package, public entry points
+// go_<pkg>_<name>, private helpers __go_<pkg>_<name>,
+// panic codes listed up front, loud refusals instead of
+// silent approximations. Strings are Vec<u8> everywhere.
+// Splice position: log sits after fmt in the library
+// order (errors -> runtime -> sync -> time -> sort ->
+// math -> strconv -> strings -> fmt -> log); cross-file
+// calls are plain function calls.
+//
+// Cross-file dependencies (all in earlier splice files):
+//   errors.sla  go_errors_nil (Output's nil error)
+//   sync.sla    GoMutex + go_sync_mutex_new/lock/unlock
+//               (the Logger's mutex, same Chan<i64>
+//               binary-semaphore shape as sync.sla)
+//   time.sla    go_time_now + go_time_year/month/day/
+//               hour/minute/second/nanosecond (header
+//               date/time fields)
+//   strings.sla GosBuilder + go_strings_builder_new /
+//               go_strings_builder_write_string (the
+//               io.Writer model at this surface)
+//   fmt.sla     GosVal + go_fmt_sprint / go_fmt_sprintf /
+//               go_fmt_sprintln (Print/Printf/Println
+//               formatting; the Printf verbs ride fmt's
+//               __go_fmt_dofmt engine)
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77422  log Fatal path (see seam (b) below -- Go's
+//          Fatal calls os.Exit(1); no exit surface
+//          exists in gostd, so Fatal panics after
+//          writing the log line)
+//   77424  log Panic path (see seam (c) below -- Go's
+//          Panic panics with the message string; SLA
+//          panic() takes only a code, so the message
+//          is written to the log first and the code
+//          panics after)
+// No other code in this file panics. (77401 errors,
+// 77410-77413 sync, 77416/77417 strings, 77420/77421
+// + 77423 time, 77430-77439 sort reserved, 77440-77442
+// runtime, 77446/77447 fmt, 77451/77452 math are all
+// other files' -- no collision.)
+//
+// THE SEAMS -- integration checks, one per item the
+// task brief names. None of these is decided silently
+// inside this file; each names the party that must
+// confirm it at integration time.
+//
+// (a) OUTPUT / io.Writer. A Logger's io.Writer is
+//     modelled as a &GosBuilder (strings.sla's growable
+//     byte buffer), the fmt precedent (fmt.Fprintf takes
+//     &GosBuilder). go_log_new / go_log_logger_set_output
+//     take &GosBuilder and keep the shared buffer
+//     handle, so writes land in the caller's builder.
+//     The default (std) logger writes to stderr, which
+//     has no gostd sink yet: a Logger with to_stderr set
+//     writes through the frontend-emitted hook
+//         fn go_host_write_stderr(b: Vec<u8>) -> void
+//     mirroring fmt's go_host_write_stdout (which the
+//     frontend emits once per program). The hook is
+//     CALLED by this file and must be DEFINED by the
+//     frontend; it is deliberately not defined here.
+//     The hook returns void, so a failing stderr write
+//     cannot be reported back: Output always returns a
+//     nil error (see "Output errors" below). If the host
+//     needs write-error reporting, the hook signature
+//     must change to return a GosError ptr -- an
+//     integration decision, not something this file
+//     assumes.
+//
+// (b) FATAL / os.Exit. Go's Fatal/Fatalf/Fatalln print
+//     and then call os.Exit(1). No exit surface exists
+//     in gostd (os is a base-gap package, CENSUS-170
+//     section 7.3.1). DECISION, named here so it is not
+//     silent: Fatal formats and writes the line exactly
+//     like Print, then panics 77422. The process still
+//     stops (a panic is process-fatal in the gostd
+//     runtime), but it stops with a panic code, not
+//     with exit status 1, and deferred functions do not
+//     run in either case. If an exit surface ever lands,
+//     replace the panic(77422) with the exit call; the
+//     write-before-exit ordering must stay.
+//
+// (c) PANIC / panic value. Go's Panic/Panicf/Panicln
+//     print and then panic WITH THE MESSAGE STRING as
+//     the panic value. SLA panic() takes only a code:
+//     there is no GosError-style payload channel for a
+//     panic value in the dialect (every panic in the
+//     gostd corpus is panic(CODE)). DECISION: Panic
+//     formats the message, writes the full log line
+//     (so the message is observable in the log), then
+//     panics 77424. The message string itself is NOT
+//     recoverable by a recover() call -- recover does
+//     not exist in the frontend yet (CENSUS-170 section
+//     8) and no payload surface exists to carry it.
+//
+// (d) CALLER INFO / Lshortfile + Llongfile. Go recovers
+//     the caller's file:line with runtime.Caller; gostd
+//     cannot know it. The frontend must emit the hook
+//         fn go_log_caller() -> Vec<u8>
+//     returning "file:line" (full path, as Go's
+//     runtime.Caller reports it; Lshortfile strips it
+//     to the basename here, exactly like Go's
+//     formatHeader). The hook takes NO calldepth: the
+//     calldepth argument of Output is accepted and
+//     IGNORED by this file -- the hook implementation
+//     determines which frame is reported, and the
+//     mapping line must arrange for Output call sites
+//     to report the Output caller's caller (e.g. by a
+//     fixed-depth walk in the hook, or a distinct hook
+//     body at Output sites). NEVER invent a fake
+//     location: if the hook returns an empty Vec, the
+//     file part is OMITTED from the header entirely
+//     (this differs from Go, which prints "???:0" when
+//     runtime.Caller fails -- the empty-means-omit
+//     contract is the brief's, and it is recorded here
+//     so the mapping line does not "fix" it back).
+//     If the hook returns a string with no ':', the
+//     whole string is taken as the file and the line as
+//     0. The hook is called only when the flag has a
+//     file bit set, and only once per log event, before
+//     the write lock is taken (Go's ordering).
+//
+// THE STD LOGGER -- ownership. Go keeps a package-level
+// `std` Logger that the package-level functions write
+// to and that SetOutput/SetPrefix/SetFlags mutate. SLA
+// has NO mutable globals: no top-level static/let
+// exists anywhere in sa_std or in the gostd corpus
+// (verified 2026-11-26), so a shared std logger cannot
+// live inside this file. DECISION: the FRONTEND owns
+// the std logger. It creates exactly one per program
+// with go_log_new_std() (stderr, empty prefix,
+// LstdFlags), holds it, and passes &std as the first
+// argument of every package-level go_log_* call.
+// go_log_set_output / go_log_set_prefix /
+// go_log_set_flags mutate that held value in place, so
+// settings persist across calls exactly as in Go.
+// log.Default() maps to the held value itself, NOT to
+// a call: there is deliberately NO go_log_default()
+// accessor, because a fresh-each-call constructor under
+// that name would silently hand out a different logger
+// from the one the package-level functions write to.
+//
+// DIVERGENCES (all deliberate, all noted here):
+//   - Date/time are UTC, not local time. Go's log
+//     prints the LOCAL date/time unless LUTC is set.
+//     gostd's only field getters are time.sla's
+//     go_time_year/month/... which ride the sa_time
+//     ms externs, documented in time.sla as UTC field
+//     getters; no local-time surface exists. So a
+//     non-LUTC header prints UTC, and LUTC is accepted
+//     but changes nothing (same values). Fixing this
+//     needs a local-time extern; until then the header
+//     is honest about what it prints, not about Go's
+//     local-time rule.
+//   - Output's error is always nil. The builder write
+//     cannot fail and the stderr hook returns void
+//     (seam (a)), so there is no failure to report.
+//     A Write error in Go would surface here; gostd
+//     cannot observe one through these two sinks.
+//   - io.Discard has no direct spelling: the writer is
+//     always a &GosBuilder, and there is no nil
+//     io.Writer in gostd. Discard is modelled by
+//     go_log_new_discard /
+//     go_log_logger_set_output_discard, which the
+//     mapping line calls for a log.New(io.Discard, ...)
+//     or log.SetOutput(io.Discard) source form. While
+//     discarded, Output returns nil without formatting
+//     or calling the caller hook, exactly like Go's
+//     isDiscard fast path.
+//   - A nil io.Writer argument has no gostd spelling
+//     either: the mapping line must refuse it (a
+//     frontend refusal) rather than pass a dummy.
+//   - Logger zero values are NOT usable. Go's Logger
+//     works at its zero value except for the output;
+//     gostd's carries a GoMutex whose token channel
+//     must exist, so loggers must come from go_log_new
+//     / go_log_new_discard / go_log_new_std (same
+//     discipline as sync.sla's zero-value rule).
+//   - A Logger must not be copied after first use (Go
+//     says the same: it contains a mutex). Copying a
+//     GoLogger aliases the same token channel and the
+//     same output buffer, exactly like copying a Go
+//     mutex aliases its state.
+//   - Header byte format follows Go's formatHeader
+//     exactly (order: prefix, date/time, file:line,
+//     msgprefix; "2009/01/23 01:23:23.123123 " with
+//     zero-padded fields; file segment "file:line: "
+//     with colon-space; trailing newline added iff
+//     the line does not already end in one). The one
+//     deliberate deviation is the empty-caller rule in
+//     seam (d) above.
+//   - Cross-file struct-field read: go_log_new and
+//     go_log_logger_writer build a GosBuilder value
+//     from a &GosBuilder with `GosBuilder { buf:
+//     out.buf }` (field access through a borrow, the
+//     same shape sync.sla uses for &m.mu / c.waiters).
+//     If the debug phase finds the dialect wants a
+//     strings.sla accessor for this instead, the fix
+//     is one helper in strings.sla; the semantics
+//     (shared buffer handle) do not change.
+//
+// LOUD REFUSALS (every gap in this file panics with a
+// claimed code; nothing is a silent stub):
+//   77422  Fatal/Fatalf/Fatalln (no os.Exit surface)
+//   77424  Panic/Panicf/Panicln (no panic-value surface)
+// All other entry points are implemented. What is NOT
+// in this file (out of the census scope for log): the
+// log/slog structured-logging package (separate wave
+// 1b+ package, CENSUS-170 section 7.2.2) and log/syslog
+// (base gap, section 7.3.1 -- loud refusal at the
+// frontend, not here).
+//
+// Nothing in this file has been compiled or tested
+// (write-first batch; the debug phase is separate).
+
+@import "sa_std/vec.sa"
+
+// ---------- flag constants (Go log.Ldate ...) ----------
+
+const GO_LOG_LDATE: i64 = 1;
+const GO_LOG_LTIME: i64 = 2;
+const GO_LOG_LMICROSECONDS: i64 = 4;
+const GO_LOG_LLONGFILE: i64 = 8;
+const GO_LOG_LSHORTFILE: i64 = 16;
+const GO_LOG_LUTC: i64 = 32;
+const GO_LOG_LMSGPREFIX: i64 = 64;
+const GO_LOG_LSTD_FLAGS: i64 = 3;
+
+// ---------- Logger ----------
+
+// Go's log.Logger: a mutex, an output writer, a prefix
+// and a flag word. out is the GosBuilder the frontend
+// passed in (shared buffer handle); to_stderr selects
+// the go_host_write_stderr hook instead of the builder
+// (the std logger's shape -- Go's New(os.Stderr, ...)).
+// is_discard is Go's io.Discard fast path.
+struct GoLogger {
+    mu: GoMutex,
+    out: GosBuilder,
+    to_stderr: bool,
+    prefix: Vec<u8>,
+    flag: i64,
+    is_discard: bool,
+}
+
+// Go's log.Writer() return: the writer plus whether it
+// is the stderr hook. Go returns io.Writer; gostd cannot
+// return "stderr" as a GosBuilder (there is no builder
+// for it), so the answer is a small result struct -- the
+// multi-value convention from NOTES-text.md -- instead of
+// a silent empty builder.
+struct GoLogWriterResult {
+    w: GosBuilder,
+    to_stderr: bool,
+}
+
+// ---------- byte helpers ----------
+
+fn __go_log_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+// Go's log.itoa: decimal digits of v, zero-padded on
+// the left to wid (wid <= 0 means no padding, which is
+// how Go prints the line number with wid -1). v must be
+// >= 0 at every call site (year/month/day/h:m:s/micros
+// and the caller line number are all non-negative).
+fn __go_log_itoa_fixed(dst: Vec<u8>, v: i64, wid: i64) -> void {
+    let rev = Vec::new();
+    let n = v;
+    if n == 0 {
+        rev.push(48u8);
+    };
+    while n > 0 {
+        rev.push((48 + (n % 10)) as u8);
+        n = n / 10;
+    }
+    let ndigits = len(rev);
+    let pad = wid - ndigits;
+    while pad > 0 {
+        dst.push(48u8);
+        pad = pad - 1;
+    }
+    let i = ndigits - 1;
+    while i >= 0 {
+        dst.push(rev[i]);
+        i = i - 1;
+    }
+    return;
+}
+
+// Split a go_log_caller() result "file:line" at the
+// LAST ':'. No ':' present: the whole string is the
+// file and the line is 0 (documented in the header).
+// Non-digit bytes after the ':' are skipped, so a
+// malformed tail degrades to the digits that parse
+// rather than inventing a line number.
+fn __go_log_parse_caller(s: Vec<u8>) -> (Vec<u8>, i64) {
+    let n = len(s);
+    let i = n - 1;
+    while i >= 0 {
+        if s[i] == 58u8 {
+            let file = Vec::new();
+            let k = 0;
+            while k < i {
+                file.push(s[k]);
+                k = k + 1;
+            }
+            let line = 0;
+            let j = i + 1;
+            while j < n {
+                let d = (s[j] as i64) - 48;
+                if d >= 0 {
+                    if d <= 9 {
+                        line = line * 10 + d;
+                    };
+                };
+                j = j + 1;
+            }
+            return (file, line);
+        };
+        i = i - 1;
+    }
+    return (s, 0);
+}
+
+// Go's formatHeader short-file rule: the final element
+// after the last '/'. The scan stops at i > 0, exactly
+// like Go's loop, so a leading '/' at index 0 is not
+// treated as a separator.
+fn __go_log_short_file(file: Vec<u8>) -> Vec<u8> {
+    let n = len(file);
+    let i = n - 1;
+    while i > 0 {
+        if file[i] == 47u8 {
+            let out = Vec::new();
+            let k = i + 1;
+            while k < n {
+                out.push(file[k]);
+                k = k + 1;
+            }
+            return out;
+        };
+        i = i - 1;
+    }
+    return file;
+}
+
+// Go's log.formatHeader, in its exact order:
+//   prefix (unless Lmsgprefix), date and/or time,
+//   file and line (if either file flag is set),
+//   prefix (if Lmsgprefix is set).
+// LUTC is accepted and ignored here: the time.sla
+// field getters already return UTC fields (see the
+// header divergence note). has_file false means the
+// caller hook returned empty -- the file segment is
+// omitted entirely (seam (d)), never faked.
+fn __go_log_format_header(buf: Vec<u8>, t: &GoTime, prefix: Vec<u8>, flag: i64, has_file: bool, file: Vec<u8>, line: i64) -> void {
+    if (flag & GO_LOG_LMSGPREFIX) == 0 {
+        __go_log_append(buf, prefix);
+    };
+    if (flag & (GO_LOG_LDATE + GO_LOG_LTIME + GO_LOG_LMICROSECONDS)) != 0 {
+        if (flag & GO_LOG_LDATE) != 0 {
+            __go_log_itoa_fixed(buf, go_time_year(t), 4);
+            buf.push(47u8);
+            __go_log_itoa_fixed(buf, go_time_month(t), 2);
+            buf.push(47u8);
+            __go_log_itoa_fixed(buf, go_time_day(t), 2);
+            buf.push(32u8);
+        };
+        if (flag & (GO_LOG_LTIME + GO_LOG_LMICROSECONDS)) != 0 {
+            __go_log_itoa_fixed(buf, go_time_hour(t), 2);
+            buf.push(58u8);
+            __go_log_itoa_fixed(buf, go_time_minute(t), 2);
+            buf.push(58u8);
+            __go_log_itoa_fixed(buf, go_time_second(t), 2);
+            if (flag & GO_LOG_LMICROSECONDS) != 0 {
+                buf.push(46u8);
+                __go_log_itoa_fixed(buf, go_time_nanosecond(t) / 1000, 6);
+            };
+            buf.push(32u8);
+        };
+    };
+    if (flag & (GO_LOG_LSHORTFILE + GO_LOG_LLONGFILE)) != 0 {
+        if has_file {
+            let shown = file;
+            if (flag & GO_LOG_LSHORTFILE) != 0 {
+                shown = __go_log_short_file(file);
+            };
+            __go_log_append(buf, shown);
+            buf.push(58u8);
+            __go_log_itoa_fixed(buf, line, -1);
+            buf.push(58u8);
+            buf.push(32u8);
+        };
+    };
+    if (flag & GO_LOG_LMSGPREFIX) != 0 {
+        __go_log_append(buf, prefix);
+    };
+    return;
+}
+
+// The single write of one log event, under the logger
+// mutex (Go's output() holds outMu across the Write so
+// each event is one Writer call). The caller hook is
+// NOT called here: the caller is resolved in
+// __go_log_emit before the lock, Go's ordering.
+fn __go_log_write(l: &GoLogger, buf: Vec<u8>) -> void {
+    go_sync_mutex_lock(&l.mu);
+    if l.to_stderr {
+        go_host_write_stderr(buf);
+    } else {
+        let _n = go_strings_builder_write_string(&l.out, buf);
+    };
+    go_sync_mutex_unlock(&l.mu);
+    return;
+}
+
+// Go's Logger.output: the discard fast path, one load
+// of prefix/flag so their values are consistent within
+// the call, the timestamp taken early, the caller hook
+// only when a file flag is set, the header, the body,
+// and a trailing newline iff the line does not already
+// end in one (Go's rule, including the empty-message
+// case: an empty buf still gets its newline).
+fn __go_log_emit(l: &GoLogger, body: Vec<u8>) -> ptr {
+    go_sync_mutex_lock(&l.mu);
+    let discard = l.is_discard;
+    let prefix = l.prefix;
+    let flag = l.flag;
+    go_sync_mutex_unlock(&l.mu);
+    if discard {
+        return go_errors_nil();
+    };
+    let now = go_time_now();
+    let has_file = false;
+    let file = Vec::new();
+    let line = 0;
+    if (flag & (GO_LOG_LSHORTFILE + GO_LOG_LLONGFILE)) != 0 {
+        let raw = go_log_caller();
+        if len(raw) > 0 {
+            let (f, ln) = __go_log_parse_caller(raw);
+            file = f;
+            line = ln;
+            has_file = true;
+        };
+    };
+    let buf = Vec::new();
+    __go_log_format_header(buf, &now, prefix, flag, has_file, file, line);
+    __go_log_append(buf, body);
+    if len(buf) == 0 {
+        buf.push(10u8);
+    } else {
+        if buf[len(buf) - 1] != 10u8 {
+            buf.push(10u8);
+        };
+    };
+    __go_log_write(l, buf);
+    return go_errors_nil();
+}
+
+// ---------- constructors ----------
+
+// log.New(out, prefix, flag). out is the io.Writer
+// model at this surface: a &GosBuilder whose buffer
+// the logger writes into (shared handle -- writes land
+// in the caller's builder).
+fn go_log_new(out: &GosBuilder, prefix: Vec<u8>, flag: i64) -> GoLogger {
+    return GoLogger {
+        mu: go_sync_mutex_new(),
+        out: GosBuilder { buf: out.buf },
+        to_stderr: false,
+        prefix: prefix,
+        flag: flag,
+        is_discard: false,
+    };
+}
+
+// log.New(io.Discard, prefix, flag). The mapping line
+// calls this for a Discard writer argument (see the
+// header divergence note); there is no nil-writer
+// spelling in gostd.
+fn go_log_new_discard(prefix: Vec<u8>, flag: i64) -> GoLogger {
+    return GoLogger {
+        mu: go_sync_mutex_new(),
+        out: go_strings_builder_new(),
+        to_stderr: false,
+        prefix: prefix,
+        flag: flag,
+        is_discard: true,
+    };
+}
+
+// The standard logger's shape: log.New(os.Stderr, "",
+// LstdFlags). The frontend creates exactly ONE of these
+// per program, holds it, and passes &std to every
+// package-level go_log_* call (see the header note on
+// std ownership -- there is no go_log_default()
+// accessor because SLA has no mutable globals).
+fn go_log_new_std() -> GoLogger {
+    return GoLogger {
+        mu: go_sync_mutex_new(),
+        out: go_strings_builder_new(),
+        to_stderr: true,
+        prefix: Vec::new(),
+        flag: GO_LOG_LSTD_FLAGS,
+        is_discard: false,
+    };
+}
+
+// ---------- Logger methods ----------
+
+// log.(*Logger).SetOutput. Mirrors Go: the writer
+// replaces the old one, stderr routing is cleared, and
+// a later SetOutput clears a discard set by
+// go_log_logger_set_output_discard.
+fn go_log_logger_set_output(l: &GoLogger, w: &GosBuilder) -> void {
+    go_sync_mutex_lock(&l.mu);
+    l.out = GosBuilder { buf: w.buf };
+    l.to_stderr = false;
+    l.is_discard = false;
+    go_sync_mutex_unlock(&l.mu);
+    return;
+}
+
+// log.SetOutput(io.Discard) on a Logger: the mapping
+// line calls this for a Discard writer argument.
+fn go_log_logger_set_output_discard(l: &GoLogger) -> void {
+    go_sync_mutex_lock(&l.mu);
+    l.to_stderr = false;
+    l.is_discard = true;
+    go_sync_mutex_unlock(&l.mu);
+    return;
+}
+
+// log.(*Logger).Flags
+fn go_log_logger_flags(l: &GoLogger) -> i64 {
+    go_sync_mutex_lock(&l.mu);
+    let f = l.flag;
+    go_sync_mutex_unlock(&l.mu);
+    return f;
+}
+
+// log.(*Logger).SetFlags
+fn go_log_logger_set_flags(l: &GoLogger, flag: i64) -> void {
+    go_sync_mutex_lock(&l.mu);
+    l.flag = flag;
+    go_sync_mutex_unlock(&l.mu);
+    return;
+}
+
+// log.(*Logger).Prefix
+fn go_log_logger_prefix(l: &GoLogger) -> Vec<u8> {
+    go_sync_mutex_lock(&l.mu);
+    let p = l.prefix;
+    go_sync_mutex_unlock(&l.mu);
+    return p;
+}
+
+// log.(*Logger).SetPrefix
+fn go_log_logger_set_prefix(l: &GoLogger, prefix: Vec<u8>) -> void {
+    go_sync_mutex_lock(&l.mu);
+    l.prefix = prefix;
+    go_sync_mutex_unlock(&l.mu);
+    return;
+}
+
+// log.(*Logger).Writer. Go returns the io.Writer; the
+// stderr shape has no builder, so the answer carries
+// the to_stderr bit (GoLogWriterResult) instead of a
+// silent empty builder.
+fn go_log_logger_writer(l: &GoLogger) -> GoLogWriterResult {
+    go_sync_mutex_lock(&l.mu);
+    let r = GoLogWriterResult { w: GosBuilder { buf: l.out.buf }, to_stderr: l.to_stderr };
+    go_sync_mutex_unlock(&l.mu);
+    return r;
+}
+
+// log.(*Logger).Output(calldepth, s). calldepth is
+// accepted and IGNORED: the go_log_caller hook takes
+// no depth (seam (d) in the header), so the mapping
+// line must arrange the hook's frame. The error is
+// always nil (see the header note on Output errors).
+fn go_log_logger_output(l: &GoLogger, calldepth: i64, s: Vec<u8>) -> ptr {
+    let _depth = calldepth;
+    return __go_log_emit(l, s);
+}
+
+// log.(*Logger).Print: fmt.Sprint semantics via fmt.
+fn go_log_logger_print(l: &GoLogger, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprint(args);
+    let _e = __go_log_emit(l, s);
+    return;
+}
+
+// log.(*Logger).Printf: fmt.Sprintf semantics via fmt.
+fn go_log_logger_printf(l: &GoLogger, format: Vec<u8>, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprintf(format, args);
+    let _e = __go_log_emit(l, s);
+    return;
+}
+
+// log.(*Logger).Println: fmt.Sprintln semantics via fmt.
+fn go_log_logger_println(l: &GoLogger, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprintln(args);
+    let _e = __go_log_emit(l, s);
+    return;
+}
+
+// log.(*Logger).Fatal: Print, then panic 77422. Go
+// calls os.Exit(1) here; no exit surface exists in
+// gostd (seam (b) in the header). The line is written
+// BEFORE the panic, exactly like Go's write-before-
+// exit ordering.
+fn go_log_logger_fatal(l: &GoLogger, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprint(args);
+    let _e = __go_log_emit(l, s);
+    panic(77422);
+}
+
+// log.(*Logger).Fatalf
+fn go_log_logger_fatalf(l: &GoLogger, format: Vec<u8>, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprintf(format, args);
+    let _e = __go_log_emit(l, s);
+    panic(77422);
+}
+
+// log.(*Logger).Fatalln
+fn go_log_logger_fatalln(l: &GoLogger, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprintln(args);
+    let _e = __go_log_emit(l, s);
+    panic(77422);
+}
+
+// log.(*Logger).Panic: Print, then panic 77424. Go
+// panics with the message string as the panic value;
+// SLA panic() takes only a code, so the message is
+// preserved in the written log line and the code
+// panics after (seam (c) in the header).
+fn go_log_logger_panic(l: &GoLogger, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprint(args);
+    let _e = __go_log_emit(l, s);
+    panic(77424);
+}
+
+// log.(*Logger).Panicf
+fn go_log_logger_panicf(l: &GoLogger, format: Vec<u8>, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprintf(format, args);
+    let _e = __go_log_emit(l, s);
+    panic(77424);
+}
+
+// log.(*Logger).Panicln
+fn go_log_logger_panicln(l: &GoLogger, args: Vec<GosVal>) -> void {
+    let s = go_fmt_sprintln(args);
+    let _e = __go_log_emit(l, s);
+    panic(77424);
+}
+
+// ---------- package-level functions ----------
+//
+// Every function takes the frontend-held std logger as
+// its first argument (see the header note on std
+// ownership). log.Default() maps to that held value,
+// not to a call.
+
+// log.Print
+fn go_log_print(std: &GoLogger, args: Vec<GosVal>) -> void {
+    go_log_logger_print(std, args);
+    return;
+}
+
+// log.Printf
+fn go_log_printf(std: &GoLogger, format: Vec<u8>, args: Vec<GosVal>) -> void {
+    go_log_logger_printf(std, format, args);
+    return;
+}
+
+// log.Println
+fn go_log_println(std: &GoLogger, args: Vec<GosVal>) -> void {
+    go_log_logger_println(std, args);
+    return;
+}
+
+// log.Fatal: Print, then panic 77422 (seam (b)).
+fn go_log_fatal(std: &GoLogger, args: Vec<GosVal>) -> void {
+    go_log_logger_fatal(std, args);
+    return;
+}
+
+// log.Fatalf
+fn go_log_fatalf(std: &GoLogger, format: Vec<u8>, args: Vec<GosVal>) -> void {
+    go_log_logger_fatalf(std, format, args);
+    return;
+}
+
+// log.Fatalln
+fn go_log_fatalln(std: &GoLogger, args: Vec<GosVal>) -> void {
+    go_log_logger_fatalln(std, args);
+    return;
+}
+
+// log.Panic: Print, then panic 77424 (seam (c)).
+fn go_log_panic(std: &GoLogger, args: Vec<GosVal>) -> void {
+    go_log_logger_panic(std, args);
+    return;
+}
+
+// log.Panicf
+fn go_log_panicf(std: &GoLogger, format: Vec<u8>, args: Vec<GosVal>) -> void {
+    go_log_logger_panicf(std, format, args);
+    return;
+}
+
+// log.Panicln
+fn go_log_panicln(std: &GoLogger, args: Vec<GosVal>) -> void {
+    go_log_logger_panicln(std, args);
+    return;
+}
+
+// log.SetOutput
+fn go_log_set_output(std: &GoLogger, w: &GosBuilder) -> void {
+    go_log_logger_set_output(std, w);
+    return;
+}
+
+// log.Flags
+fn go_log_flags(std: &GoLogger) -> i64 {
+    return go_log_logger_flags(std);
+}
+
+// log.SetFlags
+fn go_log_set_flags(std: &GoLogger, flag: i64) -> void {
+    go_log_logger_set_flags(std, flag);
+    return;
+}
+
+// log.Prefix
+fn go_log_prefix(std: &GoLogger) -> Vec<u8> {
+    return go_log_logger_prefix(std);
+}
+
+// log.SetPrefix
+fn go_log_set_prefix(std: &GoLogger, prefix: Vec<u8>) -> void {
+    go_log_logger_set_prefix(std, prefix);
+    return;
+}
+
+// log.Writer
+fn go_log_writer(std: &GoLogger) -> GoLogWriterResult {
+    return go_log_logger_writer(std);
+}
+
+// log.Output(calldepth, s). calldepth is accepted and
+// ignored (seam (d)); the error is always nil.
+fn go_log_output(std: &GoLogger, calldepth: i64, s: Vec<u8>) -> ptr {
+    return go_log_logger_output(std, calldepth, s);
+}

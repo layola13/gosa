@@ -1,0 +1,1766 @@
+// gostd strconv: the SLA-side model of Go's strconv
+// package (number/bool/string-literal conversions).
+// Organisation follows the psa_std precedent: public
+// entry points go_<pkg>_<name>, private helpers
+// __go_<pkg>_<name>, panic codes listed up front.
+//
+// Panic codes (gostd block 77400-77499):
+//   77411  invalid base passed to a Parse/Format
+//          function (Go panics: "invalid base")
+//   77412  invalid bitSize (Go panics likewise)
+//
+// Go's multi-value returns (value, error) are modelled
+// as small result structs; err is a GosError ptr and
+// nil (go_errors_nil()) means success. Parse errors are
+// *strconv.NumError in Go: a wrap node whose message is
+//   strconv.<Fn>: parsing "<input>": <cause>
+// and whose cause is the ErrSyntax / ErrRange sentinel.
+// gostd stamps those causes with the reserved target
+// ids 900001 (ErrSyntax) and 900002 (ErrRange) from
+// errors.sla, so go_errors_is finds them.
+//
+// All gostd strings are Vec<u8> byte strings (see
+// NOTES-text.md for the value contract).
+
+struct GoConvI64 {
+    v: i64,
+    err: ptr,
+}
+
+struct GoConvU64 {
+    v: u64,
+    err: ptr,
+}
+
+struct GoConvF64 {
+    v: f64,
+    err: ptr,
+}
+
+struct GoConvBool {
+    v: bool,
+    err: ptr,
+}
+
+struct GoConvBytes {
+    v: Vec<u8>,
+    err: ptr,
+}
+
+struct GoRune {
+    r: i64,
+    size: i64,
+    ok: bool,
+}
+
+// ---------- shared byte helpers ----------
+
+fn __go_sc_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_sc_lit(s: Vec<u8>, b: u8) -> Vec<u8> {
+    s.push(b);
+    return s;
+}
+
+// "strconv."
+fn __go_sc_lit_prefix() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(115u8); s.push(116u8); s.push(114u8); s.push(99u8); s.push(111u8);
+    s.push(110u8); s.push(118u8); s.push(46u8);
+    return s;
+}
+
+// ": parsing "
+fn __go_sc_lit_parsing() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(58u8); s.push(32u8); s.push(112u8); s.push(97u8); s.push(114u8);
+    s.push(115u8); s.push(105u8); s.push(110u8); s.push(103u8); s.push(32u8);
+    return s;
+}
+
+// "invalid syntax"
+fn __go_sc_lit_syntax() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(105u8); s.push(110u8); s.push(118u8); s.push(97u8); s.push(108u8);
+    s.push(105u8); s.push(100u8); s.push(32u8); s.push(115u8); s.push(121u8);
+    s.push(110u8); s.push(116u8); s.push(97u8); s.push(120u8);
+    return s;
+}
+
+// "value out of range"
+fn __go_sc_lit_range() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(118u8); s.push(97u8); s.push(108u8); s.push(117u8); s.push(101u8);
+    s.push(32u8); s.push(111u8); s.push(117u8); s.push(116u8); s.push(32u8);
+    s.push(111u8); s.push(102u8); s.push(32u8); s.push(114u8); s.push(97u8);
+    s.push(110u8); s.push(103u8); s.push(101u8);
+    return s;
+}
+
+// Build a NumError-shaped GosError:
+//   strconv.<fn>: parsing "<s>": invalid syntax
+// kind 0 = ErrSyntax (id 900001), kind 1 = ErrRange
+// (id 900002). The cause is a sentinel carrying the id.
+fn __go_sc_num_error(fn_name: Vec<u8>, s: Vec<u8>, kind: i64) -> ptr {
+    let tid = 900001;
+    let cause_text = __go_sc_lit_syntax();
+    if kind == 1 {
+        tid = 900002;
+        cause_text = __go_sc_lit_range();
+    };
+    let cause = go_errors_new_with_id(cause_text, tid);
+    let msg = __go_sc_lit_prefix();
+    __go_sc_append(msg, fn_name);
+    __go_sc_append(msg, __go_sc_lit_parsing());
+    __go_sc_append(msg, go_strconv_quote(s));
+    let outer = go_errors_new_wrap(msg, cause);
+    go_errors_set_target(outer, tid);
+    return outer;
+}
+
+fn __go_sc_fn_parse_int() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(80u8); s.push(97u8); s.push(114u8); s.push(115u8); s.push(101u8);
+    s.push(73u8); s.push(110u8); s.push(116u8);
+    return s;
+}
+
+fn __go_sc_fn_parse_uint() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(80u8); s.push(97u8); s.push(114u8); s.push(115u8); s.push(101u8);
+    s.push(85u8); s.push(105u8); s.push(110u8); s.push(116u8);
+    return s;
+}
+
+fn __go_sc_fn_parse_float() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(80u8); s.push(97u8); s.push(114u8); s.push(115u8); s.push(101u8);
+    s.push(70u8); s.push(108u8); s.push(111u8); s.push(97u8); s.push(116u8);
+    return s;
+}
+
+fn __go_sc_fn_parse_bool() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(80u8); s.push(97u8); s.push(114u8); s.push(115u8); s.push(101u8);
+    s.push(66u8); s.push(111u8); s.push(111u8); s.push(108u8);
+    return s;
+}
+
+fn __go_sc_fn_atoi() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(65u8); s.push(116u8); s.push(111u8); s.push(105u8);
+    return s;
+}
+
+// ---------- UTF-8 ----------
+
+// Decode the rune starting at byte i of b. Invalid
+// bytes decode as U+FFFD with size 1 (Go semantics).
+fn __go_utf8_decode(b: Vec<u8>, i: i64) -> GoRune {
+    let b0 = b[i] as i64;
+    if b0 < 128 { return GoRune { r: b0, size: 1, ok: true }; };
+    if b0 < 194 { return GoRune { r: 65533, size: 1, ok: false }; };
+    if b0 < 224 {
+        if i + 1 >= len(b) { return GoRune { r: 65533, size: 1, ok: false }; };
+        let b1 = b[i + 1] as i64;
+        if b1 < 128 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b1 > 191 { return GoRune { r: 65533, size: 1, ok: false }; };
+        let r = ((b0 & 31) << 6) | (b1 & 63);
+        if r < 128 { return GoRune { r: 65533, size: 1, ok: false }; };
+        return GoRune { r: r, size: 2, ok: true };
+    };
+    if b0 < 240 {
+        if i + 2 >= len(b) { return GoRune { r: 65533, size: 1, ok: false }; };
+        let b1 = b[i + 1] as i64;
+        let b2 = b[i + 2] as i64;
+        if b1 < 128 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b1 > 191 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b2 < 128 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b2 > 191 { return GoRune { r: 65533, size: 1, ok: false }; };
+        let r = ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63);
+        if r < 2048 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if r >= 55296 {
+            if r <= 57343 { return GoRune { r: 65533, size: 1, ok: false }; };
+        };
+        return GoRune { r: r, size: 3, ok: true };
+    };
+    if b0 < 245 {
+        if i + 3 >= len(b) { return GoRune { r: 65533, size: 1, ok: false }; };
+        let b1 = b[i + 1] as i64;
+        let b2 = b[i + 2] as i64;
+        let b3 = b[i + 3] as i64;
+        if b1 < 128 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b1 > 191 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b2 < 128 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b2 > 191 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b3 < 128 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if b3 > 191 { return GoRune { r: 65533, size: 1, ok: false }; };
+        let r = ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
+        if r < 65536 { return GoRune { r: 65533, size: 1, ok: false }; };
+        if r > 1114111 { return GoRune { r: 65533, size: 1, ok: false }; };
+        return GoRune { r: r, size: 4, ok: true };
+    };
+    return GoRune { r: 65533, size: 1, ok: false };
+}
+
+// Append the UTF-8 encoding of rune r to out. Runes
+// outside the valid range encode as U+FFFD (Go's
+// utf8.EncodeRune behaviour for invalid runes).
+fn __go_utf8_append(out: Vec<u8>, r: i64) -> void {
+    let v = r;
+    if v < 0 { v = 65533; };
+    if v > 1114111 { v = 65533; };
+    if v >= 55296 {
+        if v <= 57343 { v = 65533; };
+    };
+    if v < 128 {
+        out.push(v as u8);
+        return;
+    };
+    if v < 2048 {
+        out.push((192 | (v >> 6)) as u8);
+        out.push((128 | (v & 63)) as u8);
+        return;
+    };
+    if v < 65536 {
+        out.push((224 | (v >> 12)) as u8);
+        out.push((128 | ((v >> 6) & 63)) as u8);
+        out.push((128 | (v & 63)) as u8);
+        return;
+    };
+    out.push((240 | (v >> 18)) as u8);
+    out.push((128 | ((v >> 12) & 63)) as u8);
+    out.push((128 | ((v >> 6) & 63)) as u8);
+    out.push((128 | (v & 63)) as u8);
+    return;
+}
+
+fn __go_utf8_rune_count(b: Vec<u8>) -> i64 {
+    let n = 0;
+    let i = 0;
+    while i < len(b) {
+        let d = __go_utf8_decode(b, i);
+        i = i + d.size;
+        n = n + 1;
+    }
+    return n;
+}
+
+// ---------- integer formatting ----------
+
+fn __go_sc_digit_char(d: u64) -> u8 {
+    if d < 10 { return (48 + d) as u8; };
+    return (87 + d) as u8;
+}
+
+// strconv.FormatUint(i uint64, base int) string
+fn go_strconv_format_uint(v: u64, base: i64) -> Vec<u8> {
+    if base < 2 { panic(77411); };
+    if base > 36 { panic(77411); };
+    let out = Vec::new();
+    if v == 0 {
+        out.push(48u8);
+        return out;
+    };
+    let rev = Vec::new();
+    let x = v;
+    let b = base as u64;
+    while x > 0 {
+        rev.push(__go_sc_digit_char(x % b));
+        x = x / b;
+    }
+    let i = len(rev) - 1;
+    while i >= 0 {
+        out.push(rev[i]);
+        i = i - 1;
+    }
+    return out;
+}
+
+// strconv.FormatInt(i int64, base int) string
+fn go_strconv_format_int(v: i64, base: i64) -> Vec<u8> {
+    if v >= 0 { return go_strconv_format_uint(v as u64, base); };
+    let mag = (~(v as u64)) + 1;
+    let out = Vec::new();
+    out.push(45u8);
+    __go_sc_append(out, go_strconv_format_uint(mag, base));
+    return out;
+}
+
+// strconv.AppendUint(dst []byte, i uint64, base int)
+fn go_strconv_append_uint(dst: Vec<u8>, v: u64, base: i64) -> Vec<u8> {
+    __go_sc_append(dst, go_strconv_format_uint(v, base));
+    return dst;
+}
+
+// strconv.AppendInt(dst []byte, i int64, base int)
+fn go_strconv_append_int(dst: Vec<u8>, v: i64, base: i64) -> Vec<u8> {
+    __go_sc_append(dst, go_strconv_format_int(v, base));
+    return dst;
+}
+
+// strconv.Itoa(i int) string
+fn go_strconv_itoa(v: i64) -> Vec<u8> {
+    return go_strconv_format_int(v, 10);
+}
+
+// ---------- integer parsing ----------
+
+fn __go_sc_digit_val(c: i64) -> i64 {
+    if c >= 48 {
+        if c <= 57 { return c - 48; };
+    };
+    if c >= 97 {
+        if c <= 122 { return c - 87; };
+    };
+    if c >= 65 {
+        if c <= 90 { return c - 55; };
+    };
+    return -1;
+}
+
+// Go's underscoreOK over the digit part s[lo..hi]:
+// an underscore must sit between digits, or right
+// after a 0x/0o/0b prefix, and the string may neither
+// start nor end with one (start = after the prefix).
+fn __go_sc_underscore_ok(s: Vec<u8>, lo: i64, hi: i64) -> bool {
+    let i = lo;
+    let prev_digit = false;
+    if lo > 0 {
+        // a base prefix counts as a digit-side anchor
+        prev_digit = true;
+    };
+    while i < hi {
+        let c = s[i] as i64;
+        if c == 95 {
+            if !prev_digit { return false; };
+            if i + 1 >= hi { return false; };
+            let nx = __go_sc_digit_val(s[i + 1] as i64);
+            if nx < 0 { return false; };
+            prev_digit = false;
+        } else {
+            if __go_sc_digit_val(c) < 0 { return false; };
+            prev_digit = true;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Shared unsigned parse. s is the whole input (with
+// any sign still on it for error messages); the digit
+// scan runs over s[dlo..dhi]. base is already resolved
+// (2..36). Returns (value, kind): kind 0 ok, 1 syntax,
+// 2 range (value is then the clamped bitsize max).
+fn __go_sc_parse_uint_digits(s: Vec<u8>, dlo: i64, dhi: i64, base: i64, bit_size: i64) -> GoConvU64 {
+    if dlo >= dhi {
+        return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
+    };
+    let maxv = 18446744073709551615 as u64;
+    if bit_size < 64 {
+        maxv = ((1 as u64) << (bit_size as u64)) - 1;
+    };
+    let b = base as u64;
+    let cutoff = maxv / b + 1;
+    let un = 0 as u64;
+    let overflow = false;
+    let any = false;
+    let i = dlo;
+    while i < dhi {
+        let c = s[i] as i64;
+        if c == 95 {
+            // underscores were validated by the caller
+            i = i + 1;
+            continue;
+        };
+        let d = __go_sc_digit_val(c);
+        if d < 0 {
+            return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
+        };
+        if d >= base {
+            return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
+        };
+        any = true;
+        if !overflow {
+            if un >= cutoff {
+                overflow = true;
+            } else {
+                let nu = un * b + (d as u64);
+                if nu < un { overflow = true; };
+                if nu > maxv { overflow = true; };
+                un = nu;
+            };
+        };
+        i = i + 1;
+    }
+    if !any {
+        return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
+    };
+    if overflow {
+        return GoConvU64 { v: maxv, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 1) };
+    };
+    return GoConvU64 { v: un, err: go_errors_nil() };
+}
+
+// Resolve sign and base prefix. Returns (neg, dlo,
+// base, ok_syntax_shape). bit_size handling lives in
+// the callers.
+fn __go_sc_scan_prefix(s: Vec<u8>, base: i64, allow_minus: bool) -> GoConvU64 {
+    // reuses GoConvU64 as a scratch record:
+    //   v bits: neg in bit 0, ok in bit 1
+    //   err unused here
+    let n = len(s);
+    let i = 0;
+    let neg = false;
+    if i < n {
+        let c = s[i] as i64;
+        if c == 43 { i = i + 1; };
+        if c == 45 {
+            if allow_minus {
+                neg = true;
+                i = i + 1;
+            };
+        };
+    };
+    let b = base;
+    if b == 0 {
+        b = 10;
+        if i + 1 < n {
+            if s[i] as i64 == 48 {
+                let c1 = s[i + 1] as i64;
+                if c1 == 120 || c1 == 88 {
+                    b = 16;
+                    i = i + 2;
+                } else {
+                    if c1 == 111 || c1 == 79 {
+                        b = 8;
+                        i = i + 2;
+                    } else {
+                        if c1 == 98 || c1 == 66 {
+                            b = 2;
+                            i = i + 2;
+                        } else {
+                            b = 8;
+                        };
+                    };
+                };
+            };
+        } else {
+            if i < n {
+                if s[i] as i64 == 48 { b = 8; };
+            };
+        };
+    };
+    let bits = 0 as u64;
+    if neg { bits = bits + 1; };
+    bits = bits + ((i as u64) << 8);
+    bits = bits + ((b as u64) << 32);
+    return GoConvU64 { v: bits, err: go_errors_nil() };
+}
+
+// strconv.ParseUint(s string, base int, bitSize int)
+fn go_strconv_parse_uint(s: Vec<u8>, base: i64, bit_size: i64) -> GoConvU64 {
+    if base < 0 { panic(77411); };
+    if base == 1 { panic(77411); };
+    if base > 36 { panic(77411); };
+    let bs = bit_size;
+    if bs == 0 { bs = 64; };
+    if bs < 0 { panic(77412); };
+    if bs > 64 { panic(77412); };
+    if len(s) == 0 {
+        return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
+    };
+    // a leading '-' is a syntax error for ParseUint
+    if s[0] as i64 == 45 {
+        return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
+    };
+    let pre = __go_sc_scan_prefix(s, base, false);
+    let dlo = ((pre.v >> 8) & 255) as i64;
+    let b = ((pre.v >> 32) & 255) as i64;
+    if base == 0 {
+        if !__go_sc_underscore_ok(s, dlo, len(s)) {
+            return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
+        };
+    };
+    let r = __go_sc_parse_uint_digits(s, dlo, len(s), b, bs);
+    if r.err != go_errors_nil() {
+        // re-stamp with the ParseUint fn name (the digit
+        // scanner already used it) and clamp semantics
+        return r;
+    };
+    return r;
+}
+
+// strconv.ParseInt(s string, base int, bitSize int)
+fn go_strconv_parse_int(s: Vec<u8>, base: i64, bit_size: i64) -> GoConvI64 {
+    if base < 0 { panic(77411); };
+    if base == 1 { panic(77411); };
+    if base > 36 { panic(77411); };
+    let bs = bit_size;
+    if bs == 0 { bs = 64; };
+    if bs < 0 { panic(77412); };
+    if bs > 64 { panic(77412); };
+    if len(s) == 0 {
+        return GoConvI64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_int(), s, 0) };
+    };
+    let pre = __go_sc_scan_prefix(s, base, true);
+    let neg = (pre.v & 1) == 1;
+    let dlo = ((pre.v >> 8) & 255) as i64;
+    let b = ((pre.v >> 32) & 255) as i64;
+    if base == 0 {
+        if !__go_sc_underscore_ok(s, dlo, len(s)) {
+            return GoConvI64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_int(), s, 0) };
+        };
+    };
+    let ur = __go_sc_parse_uint_digits(s, dlo, len(s), b, 64);
+    if ur.err != go_errors_nil() {
+        // distinguish syntax from range by target id
+        if go_errors_target_id(ur.err) == 900001 {
+            return GoConvI64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_int(), s, 0) };
+        };
+        // unsigned range overflow: clamp to the signed
+        // bitsize extreme on the sign's side
+        if neg {
+            return GoConvI64 { v: __go_sc_int_min(bs), err: __go_sc_num_error(__go_sc_fn_parse_int(), s, 1) };
+        };
+        return GoConvI64 { v: __go_sc_int_max(bs), err: __go_sc_num_error(__go_sc_fn_parse_int(), s, 1) };
+    };
+    let un = ur.v;
+    let max_pos = __go_sc_int_max(bs) as u64;
+    let max_neg = max_pos + 1;
+    if neg {
+        if un > max_neg {
+            return GoConvI64 { v: __go_sc_int_min(bs), err: __go_sc_num_error(__go_sc_fn_parse_int(), s, 1) };
+        };
+        if un == max_neg {
+            return GoConvI64 { v: __go_sc_int_min(bs), err: go_errors_nil() };
+        };
+        return GoConvI64 { v: 0 - (un as i64), err: go_errors_nil() };
+    };
+    if un > max_pos {
+        return GoConvI64 { v: __go_sc_int_max(bs), err: __go_sc_num_error(__go_sc_fn_parse_int(), s, 1) };
+    };
+    return GoConvI64 { v: un as i64, err: go_errors_nil() };
+}
+
+fn __go_sc_int_max(bs: i64) -> i64 {
+    if bs >= 64 { return 9223372036854775807; };
+    return ((1 as i64) << ((bs - 1) as i64)) - 1;
+}
+
+fn __go_sc_int_min(bs: i64) -> i64 {
+    if bs >= 64 { return 0 - 9223372036854775807 - 1; };
+    return 0 - ((1 as i64) << ((bs - 1) as i64));
+}
+
+// strconv.Atoi(s string) (int, error)
+fn go_strconv_atoi(s: Vec<u8>) -> GoConvI64 {
+    let r = go_strconv_parse_int(s, 10, 64);
+    if r.err != go_errors_nil() {
+        if go_errors_target_id(r.err) == 900001 {
+            return GoConvI64 { v: r.v, err: __go_sc_num_error(__go_sc_fn_atoi(), s, 0) };
+        };
+        return GoConvI64 { v: r.v, err: __go_sc_num_error(__go_sc_fn_atoi(), s, 1) };
+    };
+    return r;
+}
+
+// ---------- bool ----------
+
+// strconv.FormatBool(b bool) string
+fn go_strconv_format_bool(v: bool) -> Vec<u8> {
+    let s = Vec::new();
+    if v {
+        s.push(116u8); s.push(114u8); s.push(117u8); s.push(101u8);
+        return s;
+    };
+    s.push(102u8); s.push(97u8); s.push(108u8); s.push(115u8); s.push(101u8);
+    return s;
+}
+
+fn __go_sc_bytes_eq(a: Vec<u8>, b: Vec<u8>) -> bool {
+    if len(a) != len(b) { return false; };
+    let i = 0;
+    while i < len(a) {
+        if a[i] != b[i] { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn __go_sc_lit_word(w1: u8, w2: u8, w3: u8, w4: u8, w5: u8, n: i64) -> Vec<u8> {
+    let s = Vec::new();
+    if n > 0 { s.push(w1); };
+    if n > 1 { s.push(w2); };
+    if n > 2 { s.push(w3); };
+    if n > 3 { s.push(w4); };
+    if n > 4 { s.push(w5); };
+    return s;
+}
+
+// strconv.ParseBool(str string) (bool, error):
+// accepts 1, t, T, TRUE, true, True, 0, f, F, FALSE,
+// false, False -- nothing else.
+fn go_strconv_parse_bool(s: Vec<u8>) -> GoConvBool {
+    if len(s) == 1 {
+        let c = s[0] as i64;
+        if c == 49 { return GoConvBool { v: true, err: go_errors_nil() }; };
+        if c == 48 { return GoConvBool { v: false, err: go_errors_nil() }; };
+        if c == 116 || c == 84 { return GoConvBool { v: true, err: go_errors_nil() }; };
+        if c == 102 || c == 70 { return GoConvBool { v: false, err: go_errors_nil() }; };
+    };
+    if __go_sc_bytes_eq(s, __go_sc_lit_word(116u8, 114u8, 117u8, 101u8, 0u8, 4)) {
+        return GoConvBool { v: true, err: go_errors_nil() };
+    };
+    if __go_sc_bytes_eq(s, __go_sc_lit_word(84u8, 82u8, 85u8, 69u8, 0u8, 4)) {
+        return GoConvBool { v: true, err: go_errors_nil() };
+    };
+    if __go_sc_bytes_eq(s, __go_sc_lit_word(84u8, 114u8, 117u8, 101u8, 0u8, 4)) {
+        return GoConvBool { v: true, err: go_errors_nil() };
+    };
+    if __go_sc_bytes_eq(s, __go_sc_lit_word(102u8, 97u8, 108u8, 115u8, 101u8, 5)) {
+        return GoConvBool { v: false, err: go_errors_nil() };
+    };
+    if __go_sc_bytes_eq(s, __go_sc_lit_word(70u8, 65u8, 76u8, 83u8, 69u8, 5)) {
+        return GoConvBool { v: false, err: go_errors_nil() };
+    };
+    if __go_sc_bytes_eq(s, __go_sc_lit_word(70u8, 97u8, 108u8, 115u8, 101u8, 5)) {
+        return GoConvBool { v: false, err: go_errors_nil() };
+    };
+    return GoConvBool { v: false, err: __go_sc_num_error(__go_sc_fn_parse_bool(), s, 0) };
+}
+
+// strconv.AppendBool(dst []byte, b bool) []byte
+fn go_strconv_append_bool(dst: Vec<u8>, v: bool) -> Vec<u8> {
+    __go_sc_append(dst, go_strconv_format_bool(v));
+    return dst;
+}
+
+// ---------- quoting ----------
+
+fn __go_sc_hex_lower(d: i64) -> u8 {
+    if d < 10 { return (48 + d) as u8; };
+    return (87 + d) as u8;
+}
+
+// Append \xHH for one byte.
+fn __go_sc_append_hex_escape(out: Vec<u8>, b: i64) -> void {
+    out.push(92u8);
+    out.push(120u8);
+    out.push(__go_sc_hex_lower((b >> 4) & 15));
+    out.push(__go_sc_hex_lower(b & 15));
+    return;
+}
+
+// Append \uXXXX (exactly 4 digits).
+fn __go_sc_append_u_escape(out: Vec<u8>, r: i64) -> void {
+    out.push(92u8);
+    out.push(117u8);
+    out.push(__go_sc_hex_lower((r >> 12) & 15));
+    out.push(__go_sc_hex_lower((r >> 8) & 15));
+    out.push(__go_sc_hex_lower((r >> 4) & 15));
+    out.push(__go_sc_hex_lower(r & 15));
+    return;
+}
+
+// Append \UXXXXXXXX (exactly 8 digits).
+fn __go_sc_append_big_u_escape(out: Vec<u8>, r: i64) -> void {
+    out.push(92u8);
+    out.push(85u8);
+    out.push(__go_sc_hex_lower((r >> 28) & 15));
+    out.push(__go_sc_hex_lower((r >> 24) & 15));
+    out.push(__go_sc_hex_lower((r >> 20) & 15));
+    out.push(__go_sc_hex_lower((r >> 16) & 15));
+    out.push(__go_sc_hex_lower((r >> 12) & 15));
+    out.push(__go_sc_hex_lower((r >> 8) & 15));
+    out.push(__go_sc_hex_lower((r >> 4) & 15));
+    out.push(__go_sc_hex_lower(r & 15));
+    return;
+}
+
+// Go's strconv.IsPrint, approximated: ASCII printable
+// plus any non-ASCII rune that is not a control. The
+// exact Unicode category tables are data gostd does
+// not carry; see NOTES-text.md.
+fn __go_sc_is_print(r: i64) -> bool {
+    if r < 32 { return false; };
+    if r == 127 { return false; };
+    if r < 160 {
+        if r >= 128 { return false; };
+        return true;
+    };
+    if r == 8232 { return false; };
+    if r == 8233 { return false; };
+    return true;
+}
+
+// Append the escaped form of the rune at b[i]
+// (already decoded as d) inside a quoted string.
+// Returns nothing; appends to out.
+fn __go_sc_append_quoted_rune(out: Vec<u8>, d: GoRune, ascii_only: bool) -> void {
+    let r = d.r;
+    if !d.ok {
+        // invalid byte: \xHH of the raw byte is emitted
+        // by the caller path (size-1, ok=false carries
+        // the byte value in r when < 256 only for the
+        // ASCII case; decode marks r=65533, so the
+        // caller handles invalid bytes separately)
+        __go_sc_append_u_escape(out, 65533);
+        return;
+    };
+    if r == 34 { out.push(92u8); out.push(34u8); return; };
+    if r == 92 { out.push(92u8); out.push(92u8); return; };
+    if r == 7 { out.push(92u8); out.push(97u8); return; };
+    if r == 8 { out.push(92u8); out.push(98u8); return; };
+    if r == 12 { out.push(92u8); out.push(102u8); return; };
+    if r == 10 { out.push(92u8); out.push(110u8); return; };
+    if r == 13 { out.push(92u8); out.push(114u8); return; };
+    if r == 9 { out.push(92u8); out.push(116u8); return; };
+    if r == 11 { out.push(92u8); out.push(118u8); return; };
+    if __go_sc_is_print(r) {
+        if ascii_only {
+            if r > 126 {
+                if r < 65536 {
+                    __go_sc_append_u_escape(out, r);
+                } else {
+                    __go_sc_append_big_u_escape(out, r);
+                };
+                return;
+            };
+        };
+        __go_utf8_append(out, r);
+        return;
+    };
+    if r < 256 {
+        if r < 128 {
+            __go_sc_append_hex_escape(out, r);
+            return;
+        };
+    };
+    if r < 65536 {
+        __go_sc_append_u_escape(out, r);
+        return;
+    };
+    __go_sc_append_big_u_escape(out, r);
+    return;
+}
+
+fn __go_sc_quote_impl(s: Vec<u8>, ascii_only: bool) -> Vec<u8> {
+    let out = Vec::new();
+    out.push(34u8);
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if !d.ok {
+            __go_sc_append_hex_escape(out, s[i] as i64);
+            i = i + 1;
+            continue;
+        };
+        __go_sc_append_quoted_rune(out, d, ascii_only);
+        i = i + d.size;
+    }
+    out.push(34u8);
+    return out;
+}
+
+// strconv.Quote(s string) string
+fn go_strconv_quote(s: Vec<u8>) -> Vec<u8> {
+    return __go_sc_quote_impl(s, false);
+}
+
+// strconv.QuoteToASCII(s string) string
+fn go_strconv_quote_to_ascii(s: Vec<u8>) -> Vec<u8> {
+    return __go_sc_quote_impl(s, true);
+}
+
+// AppendQuote / AppendQuoteToASCII
+fn go_strconv_append_quote(dst: Vec<u8>, s: Vec<u8>) -> Vec<u8> {
+    __go_sc_append(dst, go_strconv_quote(s));
+    return dst;
+}
+
+fn go_strconv_append_quote_to_ascii(dst: Vec<u8>, s: Vec<u8>) -> Vec<u8> {
+    __go_sc_append(dst, go_strconv_quote_to_ascii(s));
+    return dst;
+}
+
+// strconv.QuoteRune(r rune) string: single-quoted.
+fn go_strconv_quote_rune(r: i64) -> Vec<u8> {
+    let out = Vec::new();
+    out.push(39u8);
+    if r == 39 { out.push(92u8); out.push(39u8); out.push(39u8); return out; };
+    let d = GoRune { r: r, size: 1, ok: true };
+    if r == 34 {
+        // '"' inside single quotes stays raw in Go
+        out.push(34u8);
+        out.push(39u8);
+        return out;
+    };
+    __go_sc_append_quoted_rune(out, d, false);
+    out.push(39u8);
+    return out;
+}
+
+// ---------- unquoting ----------
+
+fn __go_sc_unquote_err() -> ptr {
+    return go_errors_new_with_id(__go_sc_lit_syntax(), 900001);
+}
+
+// Parse the escape after a backslash at s[i]
+// (s[i] == '\\'). Appends the decoded bytes to out
+// and returns the index just past the escape, or -1
+// on a syntax error.
+fn __go_sc_unquote_escape(s: Vec<u8>, i: i64, out: Vec<u8>) -> i64 {
+    let j = i + 1;
+    if j >= len(s) { return -1; };
+    let c = s[j] as i64;
+    if c == 97 { out.push(7u8); return j + 1; };
+    if c == 98 { out.push(8u8); return j + 1; };
+    if c == 102 { out.push(12u8); return j + 1; };
+    if c == 110 { out.push(10u8); return j + 1; };
+    if c == 114 { out.push(13u8); return j + 1; };
+    if c == 116 { out.push(9u8); return j + 1; };
+    if c == 118 { out.push(11u8); return j + 1; };
+    if c == 92 { out.push(92u8); return j + 1; };
+    if c == 39 { out.push(39u8); return j + 1; };
+    if c == 34 { out.push(34u8); return j + 1; };
+    if c == 120 {
+        // \xHH
+        if j + 2 >= len(s) { return -1; };
+        let h1 = __go_sc_digit_val(s[j + 1] as i64);
+        let h2 = __go_sc_digit_val(s[j + 2] as i64);
+        if h1 < 0 { return -1; };
+        if h2 < 0 { return -1; };
+        if h1 > 15 { return -1; };
+        if h2 > 15 { return -1; };
+        out.push(((h1 << 4) | h2) as u8);
+        return j + 3;
+    };
+    if c == 117 || c == 85 {
+        // \uXXXX / \UXXXXXXXX
+        let ndig = 4;
+        if c == 85 { ndig = 8; };
+        if j + ndig >= len(s) { return -1; };
+        let v = 0;
+        let k = 0;
+        while k < ndig {
+            let h = __go_sc_digit_val(s[j + 1 + k] as i64);
+            if h < 0 { return -1; };
+            if h > 15 { return -1; };
+            v = (v << 4) | h;
+            k = k + 1;
+        }
+        if v > 1114111 { return -1; };
+        if v >= 55296 {
+            if v <= 57343 { return -1; };
+        };
+        __go_utf8_append(out, v);
+        return j + 1 + ndig;
+    };
+    if c >= 48 {
+        if c <= 55 {
+            // \ooo: exactly three octal digits, value
+            // must fit in a byte
+            if j + 2 >= len(s) { return -1; };
+            let o1 = __go_sc_digit_val(s[j + 1] as i64);
+            let o2 = __go_sc_digit_val(s[j + 2] as i64);
+            if o1 < 0 { return -1; };
+            if o2 < 0 { return -1; };
+            if o1 > 7 { return -1; };
+            if o2 > 7 { return -1; };
+            let v = ((c - 48) << 6) | (o1 << 3) | o2;
+            if v > 255 { return -1; };
+            out.push(v as u8);
+            return j + 3;
+        };
+    };
+    return -1;
+}
+
+// strconv.Unquote(s string) (string, error): s must
+// be a complete Go string literal (interpreted "...",
+// raw `...`, or char '...').
+fn go_strconv_unquote(s: Vec<u8>) -> GoConvBytes {
+    let bad = GoConvBytes { v: Vec::new(), err: __go_sc_unquote_err() };
+    if len(s) < 2 { return bad; };
+    let q = s[0] as i64;
+    if q == 96 {
+        // raw string: ends at the next backquote,
+        // carriage returns are stripped (Go spec)
+        if s[len(s) - 1] as i64 != 96 { return bad; };
+        let out = Vec::new();
+        let i = 1;
+        while i < len(s) - 1 {
+            if s[i] as i64 == 96 { return bad; };
+            if s[i] as i64 != 13 { out.push(s[i]); };
+            i = i + 1;
+        }
+        return GoConvBytes { v: out, err: go_errors_nil() };
+    };
+    if q == 34 || q == 39 {
+        if s[len(s) - 1] as i64 != q { return bad; };
+        let out = Vec::new();
+        let i = 1;
+        let end = len(s) - 1;
+        while i < end {
+            let c = s[i] as i64;
+            if c == 10 { return bad; };
+            if c == q { return bad; };
+            if c == 92 {
+                let ni = __go_sc_unquote_escape(s, i, out);
+                if ni < 0 { return bad; };
+                i = ni;
+                continue;
+            };
+            let d = __go_utf8_decode(s, i);
+            if !d.ok {
+                out.push(s[i]);
+                i = i + 1;
+                continue;
+            };
+            let k = 0;
+            while k < d.size {
+                out.push(s[i + k]);
+                k = k + 1;
+            }
+            i = i + d.size;
+        }
+        if q == 39 {
+            // a char literal holds exactly one rune
+            if __go_utf8_rune_count(out) != 1 { return bad; };
+        };
+        return GoConvBytes { v: out, err: go_errors_nil() };
+    };
+    return bad;
+}
+
+// ---------- floats ----------
+//
+// Digit generation is arithmetic (normalise, extract,
+// round at the cut) and the shortest form is found by
+// a precision scan with a parse-back round-trip check
+// -- the same strategy early Go used before exact
+// shortest algorithms. The last digit can differ from
+// Go's exact Ryu/Grisu result on adversarial inputs;
+// NOTES-text.md flags this and names the hardening
+// path (sla_std's f64_repr exact expansion).
+
+fn __go_sc_is_inf(v: f64) -> bool {
+    if v == 0.0 { return false; };
+    return v * 2.0 == v;
+}
+
+fn __go_sc_is_nan(v: f64) -> bool {
+    return v != v;
+}
+
+// 10^e for e in [-308, 308] by binary squaring;
+// saturates outside the f64 range.
+fn __go_sc_pow10f(e: i64) -> f64 {
+    let neg = e < 0;
+    let n = e;
+    if neg { n = 0 - e; };
+    let result = 1.0;
+    let base = 10.0;
+    let k = n;
+    while k > 0 {
+        if (k & 1) == 1 { result = result * base; };
+        base = base * base;
+        k = k >> 1;
+        if base > 1.7976931348623157e307 {
+            // further squaring would overflow; the
+            // remaining factors saturate the result
+            if k > 0 { result = result * base; };
+            k = 0;
+        };
+    }
+    if neg {
+        if result == 0.0 { return 0.0; };
+        return 1.0 / result;
+    };
+    return result;
+}
+
+// Normalise v > 0 to x in [1, 10) with value =
+// x * 10^e, using exact power-of-ten ladder factors.
+struct GoNorm10 {
+    x: f64,
+    e: i64,
+}
+
+fn __go_sc_norm10_full(v: f64) -> GoNorm10 {
+    let x = v;
+    let e = 0;
+    while x >= 1e16 { x = x / 1e16; e = e + 16; }
+    while x >= 1e8 { x = x / 1e8; e = e + 8; }
+    while x >= 1e4 { x = x / 1e4; e = e + 4; }
+    while x >= 1e2 { x = x / 100.0; e = e + 2; }
+    while x >= 10.0 { x = x / 10.0; e = e + 1; }
+    while x < 1e-15 { x = x * 1e16; e = e - 16; }
+    while x < 1e-7 { x = x * 1e8; e = e - 8; }
+    while x < 1e-3 { x = x * 1e4; e = e - 4; }
+    while x < 1e-1 { x = x * 100.0; e = e - 2; }
+    while x < 1.0 { x = x * 10.0; e = e - 1; }
+    return GoNorm10 { x: x, e: e };
+}
+
+// Extract p significant decimal digits of x in
+// [1, 10), rounded at the cut (half-even on the
+// extracted stream). Returns digit bytes; a rounding
+// carry out of the top digit yields p+1 digits
+// starting with '1' followed by zeros, and the
+// caller must bump the exponent.
+fn __go_sc_extract_digits(x0: f64, p: i64) -> Vec<u8> {
+    let digits = Vec::new();
+    let x = x0;
+    let k = 0;
+    while k < p {
+        let d = x as i64;
+        digits.push((48 + d) as u8);
+        x = (x - (d as f64)) * 10.0;
+        k = k + 1;
+    }
+    // rounding digit and sticky remainder
+    let nd = x as i64;
+    let rem = x - (nd as f64);
+    let up = false;
+    if nd > 5 { up = true; };
+    if nd == 5 {
+        if rem > 0.0 {
+            up = true;
+        } else {
+            let last = (digits[p - 1] as i64) - 48;
+            if (last & 1) == 1 { up = true; };
+        };
+    };
+    if up {
+        let i = p - 1;
+        let carry = true;
+        while carry {
+            if i < 0 {
+                // 999.. -> 1000.. (p+1 digits)
+                let nd2 = Vec::new();
+                nd2.push(49u8);
+                let z = 0;
+                while z < p {
+                    nd2.push(48u8);
+                    z = z + 1;
+                }
+                return nd2;
+            };
+            let d = (digits[i] as i64) - 48;
+            if d == 9 {
+                digits[i] = 48u8;
+                i = i - 1;
+            } else {
+                digits[i] = (48 + d + 1) as u8;
+                carry = false;
+            };
+        }
+    };
+    return digits;
+}
+
+struct GoShortest {
+    neg: bool,
+    digits: Vec<u8>,
+    exp: i64,
+}
+
+// Shortest decimal that parses back to exactly v
+// (v finite, nonzero). digits has no trailing zeros;
+// value = 0.digits * 10^exp.
+fn __go_sc_shortest(v: f64) -> GoShortest {
+    let neg = v < 0.0;
+    let a = v;
+    if neg { a = 0.0 - v; };
+    let nm = __go_sc_norm10_full(a);
+    let p = 1;
+    while p <= 17 {
+        let digits = __go_sc_extract_digits(nm.x, p);
+        let e = nm.e;
+        if len(digits) > p { e = e + 1; };
+        // rebuild: digits as integer * 10^(e+1-len)
+        let m = 0 as u64;
+        let i = 0;
+        while i < len(digits) {
+            m = m * 10 + ((digits[i] as i64 - 48) as u64);
+            i = i + 1;
+        }
+        let scale = e + 1 - len(digits);
+        let cand = m as f64;
+        if scale >= 0 {
+            cand = cand * __go_sc_pow10f(scale);
+        } else {
+            cand = cand / __go_sc_pow10f(0 - scale);
+        };
+        if cand == a {
+            // strip trailing zeros (keep at least 1)
+            let last = len(digits) - 1;
+            while last > 0 {
+                if digits[last] as i64 != 48 { break; };
+                last = last - 1;
+            }
+            let trimmed = Vec::new();
+            let j = 0;
+            while j <= last {
+                trimmed.push(digits[j]);
+                j = j + 1;
+            }
+            return GoShortest { neg: neg, digits: trimmed, exp: e + 1 };
+        };
+        p = p + 1;
+    }
+    // fall back to 17 digits
+    let digits = __go_sc_extract_digits(nm.x, 17);
+    let e = nm.e;
+    if len(digits) > 17 { e = e + 1; };
+    return GoShortest { neg: neg, digits: digits, exp: e + 1 };
+}
+
+// Render digits (0.D x 10^exp form) in 'e' style
+// with prec digits after the point; prec < 0 means
+// "all of them, trailing zeros trimmed".
+fn __go_sc_render_e(out: Vec<u8>, neg: bool, digits: Vec<u8>, exp: i64, prec: i64) -> void {
+    if neg { out.push(45u8); };
+    let digs = digits;
+    if prec >= 0 {
+        // caller supplies exactly prec+1 digits
+    };
+    out.push(digs[0]);
+    let frac = len(digs) - 1;
+    if prec >= 0 { frac = prec; };
+    if frac > 0 {
+        out.push(46u8);
+        let i = 1;
+        while i <= frac {
+            if i < len(digs) {
+                out.push(digs[i]);
+            } else {
+                out.push(48u8);
+            };
+            i = i + 1;
+        }
+    };
+    out.push(101u8);
+    let e = exp - 1;
+    if e < 0 {
+        out.push(45u8);
+        e = 0 - e;
+    } else {
+        out.push(43u8);
+    };
+    if e < 10 { out.push(48u8); };
+    __go_sc_append(out, go_strconv_format_int(e, 10));
+    return;
+}
+
+// Render in 'f' style with prec digits after the
+// point; prec < 0 renders the shortest digits with
+// no trailing-zero padding.
+fn __go_sc_render_f(out: Vec<u8>, neg: bool, digits: Vec<u8>, exp: i64, prec: i64) -> void {
+    if neg { out.push(45u8); };
+    // integer part: digits with index < exp
+    if exp <= 0 {
+        out.push(48u8);
+    } else {
+        let i = 0;
+        while i < exp {
+            if i < len(digits) {
+                out.push(digits[i]);
+            } else {
+                out.push(48u8);
+            };
+            i = i + 1;
+        }
+    };
+    let frac_n = prec;
+    if frac_n < 0 {
+        frac_n = len(digits) - exp;
+        if frac_n < 0 { frac_n = 0; };
+    };
+    if frac_n > 0 {
+        out.push(46u8);
+        let i = 0;
+        while i < frac_n {
+            let idx = exp + i;
+            if idx < 0 {
+                out.push(48u8);
+            } else {
+                if idx < len(digits) {
+                    out.push(digits[idx]);
+                } else {
+                    out.push(48u8);
+                };
+            };
+            i = i + 1;
+        }
+    };
+    return;
+}
+
+// Generate rounded digits for a fixed significant
+// count from a positive finite a. Returns digits and
+// the 0.D x 10^exp exponent.
+struct GoDigitsExp {
+    digits: Vec<u8>,
+    exp: i64,
+}
+
+fn __go_sc_digits_at(a: f64, sig: i64) -> GoDigitsExp {
+    let nm = __go_sc_norm10_full(a);
+    let digits = __go_sc_extract_digits(nm.x, sig);
+    let e = nm.e;
+    if len(digits) > sig { e = e + 1; };
+    return GoDigitsExp { digits: digits, exp: e + 1 };
+}
+
+// strconv.FormatFloat(f, fmt, prec, bitSize)
+fn go_strconv_format_float(v: f64, fmt_c: i64, prec: i64, bit_size: i64) -> Vec<u8> {
+    let out = Vec::new();
+    if __go_sc_is_nan(v) {
+        out.push(78u8); out.push(97u8); out.push(78u8);
+        return out;
+    };
+    if __go_sc_is_inf(v) {
+        if v < 0.0 { out.push(45u8); } else { out.push(43u8); };
+        out.push(73u8); out.push(110u8); out.push(102u8);
+        return out;
+    };
+    if v == 0.0 {
+        // Go prints -0 for negative zero; the sign of
+        // a zero is observable via 1/v
+        let neg = false;
+        if 1.0 / v < 0.0 { neg = true; };
+        if fmt_c == 101 {
+            // 'e'
+            if neg { out.push(45u8); };
+            out.push(48u8);
+            let pn = prec;
+            if pn < 0 { pn = 6; };
+            if pn > 0 {
+                out.push(46u8);
+                let i = 0;
+                while i < pn { out.push(48u8); i = i + 1; }
+            };
+            out.push(101u8); out.push(43u8); out.push(48u8); out.push(48u8);
+            return out;
+        };
+        if fmt_c == 103 {
+            // 'g'
+            if neg { out.push(45u8); };
+            out.push(48u8);
+            return out;
+        };
+        if fmt_c == 98 || fmt_c == 120 {
+            // 'b' / 'x': Go prints 0p-1022 / 0x0p-1022
+            if neg { out.push(45u8); };
+            if fmt_c == 120 { out.push(48u8); out.push(120u8); };
+            out.push(48u8);
+            out.push(112u8); out.push(45u8);
+            __go_sc_append(out, go_strconv_format_int(1022, 10));
+            return out;
+        };
+        // 'f'
+        if neg { out.push(45u8); };
+        out.push(48u8);
+        let pn = prec;
+        if pn < 0 { pn = 6; };
+        if pn > 0 {
+            out.push(46u8);
+            let i = 0;
+            while i < pn { out.push(48u8); i = i + 1; }
+        };
+        return out;
+    };
+    let neg = v < 0.0;
+    let a = v;
+    if neg { a = 0.0 - v; };
+    if fmt_c == 98 { return __go_sc_format_b(a, neg); };
+    if fmt_c == 120 { return __go_sc_format_x(a, neg, prec); };
+    if fmt_c == 101 {
+        // 'e'
+        if prec < 0 {
+            let sh = __go_sc_shortest(v);
+            __go_sc_render_e(out, sh.neg, sh.digits, sh.exp, -1);
+            return out;
+        };
+        let de = __go_sc_digits_at(a, prec + 1);
+        __go_sc_render_e(out, neg, de.digits, de.exp, prec);
+        return out;
+    };
+    if fmt_c == 102 {
+        // 'f'
+        if prec < 0 {
+            let sh = __go_sc_shortest(v);
+            __go_sc_render_f(out, sh.neg, sh.digits, sh.exp, -1);
+            return out;
+        };
+        // digits needed: integer digits + prec
+        let nm = __go_sc_norm10_full(a);
+        let int_digits = nm.e + 1;
+        if int_digits < 0 { int_digits = 0; };
+        let sig = int_digits + prec;
+        if sig <= 0 {
+            // rounds to 0.000...
+            if neg { out.push(45u8); };
+            out.push(48u8);
+            if prec > 0 {
+                out.push(46u8);
+                let i = 0;
+                while i < prec { out.push(48u8); i = i + 1; }
+            };
+            return out;
+        };
+        let de = __go_sc_digits_at(a, sig);
+        __go_sc_render_f(out, neg, de.digits, de.exp, prec);
+        return out;
+    };
+    // 'g' (and any other verb falls back to 'g',
+    // as Go's FormatFloat treats unknown fmt as 'g'
+    // only via explicit callers; gostd keeps 'g')
+    let sh = __go_sc_shortest(v);
+    let eprec = prec;
+    if eprec < 0 {
+        // shortest: %e form for exp < -4 or >= 21
+        let e = sh.exp - 1;
+        if e < -4 || e >= 21 {
+            __go_sc_render_e(out, sh.neg, sh.digits, sh.exp, -1);
+        } else {
+            __go_sc_render_f(out, sh.neg, sh.digits, sh.exp, -1);
+        };
+        return out;
+    };
+    if eprec == 0 { eprec = 1; };
+    let de = __go_sc_digits_at(a, eprec);
+    // strip trailing zeros for 'g'
+    let last = len(de.digits) - 1;
+    while last > 0 {
+        if de.digits[last] as i64 != 48 { break; };
+        last = last - 1;
+    }
+    let trimmed = Vec::new();
+    let j = 0;
+    while j <= last {
+        trimmed.push(de.digits[j]);
+        j = j + 1;
+    }
+    let e = de.exp - 1;
+    if e < -4 || e >= eprec {
+        __go_sc_render_e(out, neg, trimmed, de.exp, -1);
+    } else {
+        __go_sc_render_f(out, neg, trimmed, de.exp, -1);
+    };
+    return out;
+}
+
+// 'b' form: <mantissa integer>p<binary exponent>,
+// mantissa scaled so the value is mant * 2^(e-52).
+fn __go_sc_format_b(a: f64, neg: bool) -> Vec<u8> {
+    let out = Vec::new();
+    if neg { out.push(45u8); };
+    let x = a;
+    let e = 0;
+    while x >= 2.0 { x = x / 2.0; e = e + 1; }
+    while x < 1.0 { x = x * 2.0; e = e - 1; }
+    let mant = (x * 4503599627370496.0) as u64;
+    __go_sc_append(out, go_strconv_format_uint(mant, 10));
+    out.push(112u8);
+    let be = e - 52;
+    if be < 0 {
+        out.push(45u8);
+        __go_sc_append(out, go_strconv_format_int(0 - be, 10));
+    } else {
+        out.push(43u8);
+        __go_sc_append(out, go_strconv_format_int(be, 10));
+    };
+    return out;
+}
+
+// 'x' form: hexadecimal floating point 0x1.fffp+12.
+// Hex digit extraction on a binary fraction is
+// exact in f64 arithmetic.
+fn __go_sc_format_x(a: f64, neg: bool, prec: i64) -> Vec<u8> {
+    let out = Vec::new();
+    if neg { out.push(45u8); };
+    out.push(48u8);
+    out.push(120u8);
+    let x = a;
+    let e = 0;
+    while x >= 2.0 { x = x / 2.0; e = e + 1; }
+    while x < 1.0 { x = x * 2.0; e = e - 1; }
+    out.push(49u8);
+    // fractional hex digits
+    let frac = x - 1.0;
+    let digs = Vec::new();
+    let maxd = 13;
+    if prec >= 0 { maxd = prec; };
+    let k = 0;
+    while k < maxd {
+        frac = frac * 16.0;
+        let d = frac as i64;
+        digs.push(__go_sc_hex_lower(d));
+        frac = frac - (d as f64);
+        k = k + 1;
+    }
+    if prec < 0 {
+        // trim trailing zero digits
+        let last = len(digs) - 1;
+        while last >= 0 {
+            if digs[last] as i64 != 48 { break; };
+            last = last - 1;
+        }
+        if last >= 0 {
+            out.push(46u8);
+            let i = 0;
+            while i <= last {
+                out.push(digs[i]);
+                i = i + 1;
+            }
+        };
+    } else {
+        if prec > 0 {
+            out.push(46u8);
+            let i = 0;
+            while i < prec {
+                out.push(digs[i]);
+                i = i + 1;
+            }
+        };
+    };
+    out.push(112u8);
+    if e < 0 {
+        out.push(45u8);
+        __go_sc_append(out, go_strconv_format_int(0 - e, 10));
+    } else {
+        out.push(43u8);
+        __go_sc_append(out, go_strconv_format_int(e, 10));
+    };
+    return out;
+}
+
+// strconv.AppendFloat(dst, f, fmt, prec, bitSize)
+fn go_strconv_append_float(dst: Vec<u8>, v: f64, fmt_c: i64, prec: i64, bit_size: i64) -> Vec<u8> {
+    __go_sc_append(dst, go_strconv_format_float(v, fmt_c, prec, bit_size));
+    return dst;
+}
+
+// ---------- float parsing ----------
+
+fn __go_sc_lower_byte(c: i64) -> i64 {
+    if c >= 65 {
+        if c <= 90 { return c + 32; };
+    };
+    return c;
+}
+
+// Case-insensitive match of s[lo..] against the
+// lowercase word w (given as bytes). Returns the end
+// index or -1.
+fn __go_sc_match_word(s: Vec<u8>, lo: i64, w: Vec<u8>) -> i64 {
+    if lo + len(w) > len(s) { return -1; };
+    let i = 0;
+    while i < len(w) {
+        if __go_sc_lower_byte(s[lo + i] as i64) != w[i] as i64 { return -1; };
+        i = i + 1;
+    }
+    return lo + len(w);
+}
+
+fn __go_sc_lit_inf() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(105u8); s.push(110u8); s.push(102u8);
+    return s;
+}
+
+fn __go_sc_lit_infinity() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(105u8); s.push(110u8); s.push(102u8); s.push(105u8);
+    s.push(110u8); s.push(105u8); s.push(116u8); s.push(121u8);
+    return s;
+}
+
+fn __go_sc_lit_nan() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(110u8); s.push(97u8); s.push(110u8);
+    return s;
+}
+
+fn __go_sc_nan_value() -> f64 {
+    let z = 0.0;
+    return z / z;
+}
+
+fn __go_sc_inf_value(neg: bool) -> f64 {
+    let big = __go_sc_pow10f(308) * 10.0;
+    if neg { return 0.0 - big; };
+    return big;
+}
+
+// Scale m (an integer mantissa) by 10^e10 with range
+// reporting: returns (value, range_err).
+struct GoScaled {
+    v: f64,
+    range_err: bool,
+}
+
+fn __go_sc_scale10(m: u64, e10: i64) -> GoScaled {
+    if m == 0 { return GoScaled { v: 0.0, range_err: false }; };
+    let v = m as f64;
+    if e10 >= 0 {
+        if e10 > 308 {
+            return GoScaled { v: __go_sc_inf_value(false), range_err: true };
+        };
+        v = v * __go_sc_pow10f(e10);
+        if __go_sc_is_inf(v) {
+            return GoScaled { v: v, range_err: true };
+        };
+        return GoScaled { v: v, range_err: false };
+    };
+    let ae = 0 - e10;
+    if ae > 308 {
+        // split the division to stay in range
+        v = v / __go_sc_pow10f(308);
+        let rest = ae - 308;
+        if rest > 308 {
+            return GoScaled { v: 0.0, range_err: true };
+        };
+        v = v / __go_sc_pow10f(rest);
+        if v == 0.0 {
+            return GoScaled { v: 0.0, range_err: true };
+        };
+        return GoScaled { v: v, range_err: false };
+    };
+    v = v / __go_sc_pow10f(ae);
+    if v == 0.0 {
+        return GoScaled { v: 0.0, range_err: true };
+    };
+    return GoScaled { v: v, range_err: false };
+}
+
+// strconv.ParseFloat(s string, bitSize int)
+fn go_strconv_parse_float(s: Vec<u8>, bit_size: i64) -> GoConvF64 {
+    let syn = GoConvF64 { v: 0.0, err: __go_sc_num_error(__go_sc_fn_parse_float(), s, 0) };
+    if len(s) == 0 { return syn; };
+    let i = 0;
+    let neg = false;
+    let c0 = s[0] as i64;
+    if c0 == 43 { i = 1; };
+    if c0 == 45 { i = 1; neg = true; };
+    // inf / nan spellings
+    let e1 = __go_sc_match_word(s, i, __go_sc_lit_infinity());
+    if e1 == len(s) {
+        return GoConvF64 { v: __go_sc_inf_value(neg), err: go_errors_nil() };
+    };
+    let e2 = __go_sc_match_word(s, i, __go_sc_lit_inf());
+    if e2 == len(s) {
+        return GoConvF64 { v: __go_sc_inf_value(neg), err: go_errors_nil() };
+    };
+    let e3 = __go_sc_match_word(s, i, __go_sc_lit_nan());
+    if e3 == len(s) {
+        return GoConvF64 { v: __go_sc_nan_value(), err: go_errors_nil() };
+    };
+    // hexadecimal floating point
+    if i + 1 < len(s) {
+        if s[i] as i64 == 48 {
+            let cx = s[i + 1] as i64;
+            if cx == 120 || cx == 88 {
+                return __go_sc_parse_hex_float(s, i + 2, neg);
+            };
+        };
+    };
+    // decimal: collect mantissa digits
+    let mant = 0 as u64;
+    let kept = 0;
+    let dropped = 0;
+    let frac_digits = 0;
+    let seen_digit = false;
+    let seen_dot = false;
+    let j = i;
+    while j < len(s) {
+        let c = s[j] as i64;
+        if c == 46 {
+            if seen_dot { break; };
+            seen_dot = true;
+            j = j + 1;
+            continue;
+        };
+        if c == 95 {
+            // underscore: validated after the scan
+            j = j + 1;
+            continue;
+        };
+        let d = __go_sc_digit_val(c);
+        if d < 0 { break; };
+        if d > 9 { break; };
+        seen_digit = true;
+        if seen_dot { frac_digits = frac_digits + 1; };
+        if mant == 0 {
+            if d == 0 {
+                // leading zero: contributes only via
+                // the fraction-digit accounting
+                j = j + 1;
+                continue;
+            };
+        };
+        if kept < 19 {
+            mant = mant * 10 + (d as u64);
+            kept = kept + 1;
+        } else {
+            dropped = dropped + 1;
+        };
+        j = j + 1;
+    }
+    if !seen_digit { return syn; };
+    // exponent
+    let exp_part = 0;
+    if j < len(s) {
+        let ce = s[j] as i64;
+        if ce == 101 || ce == 69 {
+            j = j + 1;
+            let eneg = false;
+            if j < len(s) {
+                let cs = s[j] as i64;
+                if cs == 43 { j = j + 1; };
+                if cs == 45 { j = j + 1; eneg = true; };
+            };
+            let ev = 0;
+            let eany = false;
+            while j < len(s) {
+                let c = s[j] as i64;
+                if c == 95 { j = j + 1; continue; };
+                let d = __go_sc_digit_val(c);
+                if d < 0 { break; };
+                if d > 9 { break; };
+                eany = true;
+                if ev < 10000 { ev = ev * 10 + d; };
+                j = j + 1;
+            }
+            if !eany { return syn; };
+            if eneg { exp_part = 0 - ev; } else { exp_part = ev; };
+        };
+    };
+    if j != len(s) { return syn; };
+    // underscore placement (Go literal rules)
+    if !__go_sc_underscore_ok(s, i, len(s)) {
+        // the exponent's digits also pass through the
+        // same checker shape; a misplaced underscore
+        // anywhere is a syntax error
+        return syn;
+    };
+    let e10 = exp_part - frac_digits + dropped;
+    let sc = __go_sc_scale10(mant, e10);
+    let v = sc.v;
+    if neg { v = 0.0 - v; };
+    if sc.range_err {
+        return GoConvF64 { v: v, err: __go_sc_num_error(__go_sc_fn_parse_float(), s, 1) };
+    };
+    return GoConvF64 { v: v, err: go_errors_nil() };
+}
+
+// Hexadecimal float: 0x<mant>[.<frac>]p<exp>, the
+// digits after 0x start at index i. Go requires the
+// p exponent when a point is present and (in
+// ParseFloat) accepts a missing p as p0 only for
+// integer mantissas; gostd accepts an optional p in
+// both cases and flags the divergence in NOTES.
+fn __go_sc_parse_hex_float(s: Vec<u8>, i0: i64, neg: bool) -> GoConvF64 {
+    let syn = GoConvF64 { v: 0.0, err: __go_sc_num_error(__go_sc_fn_parse_float(), s, 0) };
+    let mant = 0 as u64;
+    let kept = 0;
+    let frac_hex = 0;
+    let seen_digit = false;
+    let seen_dot = false;
+    let j = i0;
+    while j < len(s) {
+        let c = s[j] as i64;
+        if c == 46 {
+            if seen_dot { break; };
+            seen_dot = true;
+            j = j + 1;
+            continue;
+        };
+        if c == 95 { j = j + 1; continue; };
+        if c == 112 || c == 80 { break; };
+        let d = __go_sc_digit_val(c);
+        if d < 0 { break; };
+        if d > 15 { break; };
+        seen_digit = true;
+        if seen_dot { frac_hex = frac_hex + 1; };
+        if kept < 15 {
+            mant = mant * 16 + (d as u64);
+            kept = kept + 1;
+        } else {
+            frac_hex = frac_hex - 1;
+            // digits beyond the kept window shift the
+            // binary exponent up by 4 each; modelled by
+            // reducing the fraction count (may go
+            // negative -- that is the point)
+        };
+        j = j + 1;
+    }
+    if !seen_digit { return syn; };
+    let pexp = 0;
+    if j < len(s) {
+        let cp = s[j] as i64;
+        if cp == 112 || cp == 80 {
+            j = j + 1;
+            let eneg = false;
+            if j < len(s) {
+                let cs = s[j] as i64;
+                if cs == 43 { j = j + 1; };
+                if cs == 45 { j = j + 1; eneg = true; };
+            };
+            let ev = 0;
+            let eany = false;
+            while j < len(s) {
+                let d = __go_sc_digit_val(s[j] as i64);
+                if d < 0 { break; };
+                if d > 9 { break; };
+                eany = true;
+                if ev < 100000 { ev = ev * 10 + d; };
+                j = j + 1;
+            }
+            if !eany { return syn; };
+            if eneg { pexp = 0 - ev; } else { pexp = ev; };
+        };
+    };
+    if j != len(s) { return syn; };
+    // value = mant * 2^(pexp - 4*frac_hex)
+    let e2 = pexp - 4 * frac_hex;
+    let v = mant as f64;
+    if e2 >= 0 {
+        let k = 0;
+        while k < e2 {
+            v = v * 2.0;
+            if __go_sc_is_inf(v) {
+                let r = v;
+                if neg { r = 0.0 - r; };
+                return GoConvF64 { v: r, err: __go_sc_num_error(__go_sc_fn_parse_float(), s, 1) };
+            };
+            k = k + 1;
+        }
+    } else {
+        let k = 0;
+        let ae = 0 - e2;
+        while k < ae {
+            v = v / 2.0;
+            k = k + 1;
+        }
+        if v == 0.0 {
+            if mant != 0 {
+                return GoConvF64 { v: 0.0, err: __go_sc_num_error(__go_sc_fn_parse_float(), s, 1) };
+            };
+        };
+    };
+    if neg { v = 0.0 - v; };
+    return GoConvF64 { v: v, err: go_errors_nil() };
+}

@@ -1,0 +1,289 @@
+// gostd encoding/hex: the SLA-side model of
+// Go's encoding/hex package.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77414  streaming adapters (NewDecoder /
+//          NewEncoder, Dumper): gostd has no
+//          streaming reader/writer surface -- loud
+//          refusal. SHARED INTENTIONALLY with
+//          encoding/base64 (R1400): the same code,
+//          the same documented meaning. Both files
+//          state the sharing here so a future
+//          renumbering does not split them.
+//
+// ErrLength sentinel (target id; errors.sla
+// reserves the 900000-999999 range):
+//   900020 "encoding/hex: odd length hex string"
+// InvalidByteError is positional: Go reports
+// "encoding/hex: invalid byte: %#U" (e.g.
+// "U+007A 'z'"). gostd builds that message; the
+// oracle phase checks the exact rendering.
+//
+// VALUE REPRESENTATION (gostd contract):
+//   Go []byte / string -> Vec<u8>
+//   Go error           -> GosError heap ptr
+
+struct GoHexBytes {
+    v: Vec<u8>,
+    err: ptr,
+}
+
+// ---------- ErrLength ----------
+
+fn go_hex_err_length() -> ptr {
+    let m = Vec::new();
+    m.push(101u8); m.push(110u8); m.push(99u8); m.push(111u8); m.push(100u8); m.push(105u8); m.push(110u8); m.push(103u8); m.push(47u8); m.push(104u8);
+    m.push(101u8); m.push(120u8); m.push(58u8); m.push(32u8); m.push(111u8); m.push(100u8); m.push(100u8); m.push(32u8); m.push(108u8); m.push(101u8);
+    m.push(110u8); m.push(103u8); m.push(116u8); m.push(104u8); m.push(32u8); m.push(104u8); m.push(101u8); m.push(120u8); m.push(32u8); m.push(115u8);
+    m.push(116u8); m.push(114u8); m.push(105u8); m.push(110u8); m.push(103u8);
+    return go_errors_new_with_id(m, 900020);
+}
+
+// ---------- helpers ----------
+
+fn __go_hex_digit(v: i64) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8;
+    };
+    return (87 + v) as u8;
+}
+
+fn __go_hex_digit_upper(v: i64) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8;
+    };
+    return (55 + v) as u8;
+}
+
+fn __go_hex_val(c: u8) -> i64 {
+    let v = c as i64;
+    if v >= 48 {
+        if v <= 57 { return v - 48; };
+    };
+    if v >= 97 {
+        if v <= 102 { return v - 87; };
+    };
+    if v >= 65 {
+        if v <= 70 { return v - 55; };
+    };
+    return 0 - 1;
+}
+
+// "encoding/hex: invalid byte: %#U"
+// (Go's %#U rendering of the offending byte).
+// The U+ part is uppercase hex; the quoted rune
+// is the character itself when printable, a
+// '\u00XX' escape (lowercase hex) for controls
+// (U+0000..U+001F, U+007F..U+009F), and the
+// UTF-8 encoding for printable Latin-1 (U+00A0
+// and above). '\'' and '\\' are backslash-escaped.
+fn __go_hex_invalid_byte(b: u8) -> ptr {
+    let m = Vec::new();
+    m.push(101u8); m.push(110u8); m.push(99u8); m.push(111u8); m.push(100u8); m.push(105u8); m.push(110u8); m.push(103u8); m.push(47u8); m.push(104u8);
+    m.push(101u8); m.push(120u8); m.push(58u8); m.push(32u8); m.push(105u8); m.push(110u8); m.push(118u8); m.push(97u8); m.push(108u8); m.push(105u8);
+    m.push(100u8); m.push(32u8); m.push(98u8); m.push(121u8); m.push(116u8); m.push(101u8); m.push(58u8); m.push(32u8); m.push(85u8); m.push(43u8);
+    m.push(48u8); m.push(48u8);
+    let v = b as i64;
+    m.push(__go_hex_digit_upper(v >> 4));
+    m.push(__go_hex_digit_upper(v & 15));
+    m.push(32u8);
+    m.push(39u8);
+    if v >= 32 {
+        if v <= 126 {
+            if v == 39 {
+                m.push(92u8);
+                m.push(39u8);
+            } else {
+                if v == 92 {
+                    m.push(92u8);
+                    m.push(92u8);
+                } else {
+                    m.push(b);
+                };
+            };
+        } else {
+            if v < 160 {
+                // U+007F..U+009F controls.
+                m.push(92u8);
+                m.push(117u8);
+                m.push(48u8);
+                m.push(48u8);
+                m.push(__go_hex_digit(v >> 4));
+                m.push(__go_hex_digit(v & 15));
+            } else {
+                // Printable Latin-1: UTF-8 encoding.
+                m.push((192 + (v >> 6)) as u8);
+                m.push((128 + (v & 63)) as u8);
+            };
+        };
+    } else {
+        // Control byte: '\u00XX' (lowercase hex).
+        m.push(92u8);
+        m.push(117u8);
+        m.push(48u8);
+        m.push(48u8);
+        m.push(__go_hex_digit(v >> 4));
+        m.push(__go_hex_digit(v & 15));
+    };
+    m.push(39u8);
+    return go_errors_new(m);
+}
+
+// ---------- lengths ----------
+
+fn go_hex_encoded_len(n: i64) -> i64 {
+    return n * 2;
+}
+
+fn go_hex_decoded_len(x: i64) -> i64 {
+    return x / 2;
+}
+
+// ---------- encode ----------
+
+fn go_hex_encode(src: Vec<u8>) -> Vec<u8> {
+    return go_hex_append_encode(Vec::new(), src);
+}
+
+fn go_hex_encode_to_string(src: Vec<u8>) -> Vec<u8> {
+    return go_hex_encode(src);
+}
+
+fn go_hex_append_encode(dst: Vec<u8>, src: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(dst) {
+        out.push(dst[i]);
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(src) {
+        let v = src[j] as i64;
+        out.push(__go_hex_digit(v >> 4));
+        out.push(__go_hex_digit(v & 15));
+        j = j + 1;
+    }
+    return out;
+}
+
+// ---------- decode ----------
+
+// Decode(src): the decoded prefix + the error.
+// An invalid byte reports InvalidByteError at that
+// byte; an odd length (with a valid last byte)
+// reports ErrLength. Go checks the last byte for
+// validity before reporting the length error.
+fn go_hex_decode(src: Vec<u8>) -> GoHexBytes {
+    return go_hex_append_decode(Vec::new(), src);
+}
+
+fn go_hex_decode_string(src: Vec<u8>) -> GoHexBytes {
+    return go_hex_decode(src);
+}
+
+fn go_hex_append_decode(dst: Vec<u8>, src: Vec<u8>) -> GoHexBytes {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(dst) {
+        out.push(dst[i]);
+        i = i + 1;
+    }
+    let j = 0;
+    while j + 1 < len(src) {
+        let a = __go_hex_val(src[j]);
+        if a < 0 {
+            return GoHexBytes { v: out, err: __go_hex_invalid_byte(src[j]) };
+        };
+        let b = __go_hex_val(src[j + 1]);
+        if b < 0 {
+            return GoHexBytes { v: out, err: __go_hex_invalid_byte(src[j + 1]) };
+        };
+        out.push(((a << 4) | b) as u8);
+        j = j + 2;
+    }
+    if len(src) % 2 == 1 {
+        if __go_hex_val(src[j]) < 0 {
+            return GoHexBytes { v: out, err: __go_hex_invalid_byte(src[j]) };
+        };
+        return GoHexBytes { v: out, err: go_hex_err_length() };
+    };
+    return GoHexBytes { v: out, err: go_errors_nil() };
+}
+
+// ---------- Dump ----------
+
+// hex.Dump: 16 bytes per line, offset + hex +
+// ASCII column. The format is Go's dumper exactly:
+// "%08x  " then per byte "xx " (an extra space
+// after the 8th byte, " |" after the 16th), then
+// the ASCII column ('.' for non-printable) between
+// bars, then '\n'. Partial lines are padded with
+// spaces so the bars align.
+fn go_hex_dump(data: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let off = 0;
+    while off < len(data) {
+        let n = len(data) - off;
+        if n > 16 { n = 16; };
+        // Offset: 8 hex digits + 2 spaces.
+        let o = off;
+        let k = 7;
+        while k >= 0 {
+            out.push(__go_hex_digit((o >> (k * 4)) & 15));
+            k = k - 1;
+        }
+        out.push(32u8);
+        out.push(32u8);
+        // Hex bytes.
+        let i = 0;
+        while i < 16 {
+            if i < n {
+                let v = data[off + i] as i64;
+                out.push(__go_hex_digit(v >> 4));
+                out.push(__go_hex_digit(v & 15));
+                out.push(32u8);
+            } else {
+                out.push(32u8);
+                out.push(32u8);
+                out.push(32u8);
+            };
+            if i == 7 { out.push(32u8); };
+            i = i + 1;
+        }
+        out.push(32u8);
+        out.push(124u8);
+        // ASCII column.
+        let j = 0;
+        while j < n {
+            let c = data[off + j];
+            if c < 32u8 || c > 126u8 {
+                out.push(46u8);
+            } else {
+                out.push(c);
+            };
+            j = j + 1;
+        }
+        out.push(124u8);
+        out.push(10u8);
+        off = off + 16;
+    }
+    return out;
+}
+
+// ---------- streaming refusals (77414) ----------
+
+// NewDecoder / NewEncoder / Dumper need a
+// streaming reader/writer surface, which gostd
+// does not have. Loud refusal. (77414 is shared
+// intentionally with encoding/base64, R1400.)
+fn go_hex_new_decoder() -> GoHexBytes {
+    panic(77414);
+}
+
+fn go_hex_new_encoder() -> GoHexBytes {
+    panic(77414);
+}
+
+fn go_hex_dumper(dst: Vec<u8>) -> Vec<u8> {
+    panic(77414);
+}

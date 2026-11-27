@@ -1,0 +1,1163 @@
+// gostd maps: the SLA-side model of Go's maps package.
+//
+// Oracle: Go 1.27.2 stdlib src/maps/maps.go (112 lines) and
+// src/maps/iter.go (56 lines), both read 2026-11-27. Census:
+// CENSUS-170.md rev1 section 7.2.1, wave 1b, generic-
+// instantiation prerequisite handled SLA-side by CONCRETE-
+// TYPE INSTANTIATION (see below).
+//
+// Organisation follows the psa_std / gostd precedent: one
+// .sla file per Go package, public entry points
+// go_<pkg>_<name>, private helpers __go_<pkg>_<name>,
+// panic codes listed up front, loud refusals instead of
+// silent approximations. Strings are Vec<u8> everywhere.
+// Splice position: maps goes AFTER the existing 21-file
+// splice order (errors, math, strconv, strings, fmt,
+// sync, time, sort, runtime, io, bytes, hash, crc32,
+// fnv, base64, hex, utf8, path, flag, bufio, log,
+// context) -- i.e. position 22, or after slices/cmp if
+// those wave-1b siblings land first; the order among the
+// three does not matter, because maps depends on none of
+// them (see "Cross-file dependencies" below). It is
+// placed last because it is a leaf: nothing earlier
+// needs it, and it needs only bytes.
+//
+// Cross-file dependencies (all in earlier splice files):
+//   bytes.sla   go_bytes_equal (string-key and []byte-
+//               value comparison) and go_bytes_clone
+//               (copying a Vec<u8> key/value out of a
+//               map without moving it out of the source
+//               -- see "Move discipline" below)
+//
+// VALUE REPRESENTATION (the brief's concrete-type
+// instantiation): SLA has no map type at the gostd
+// surface this file is written to, so a Go map is an
+// explicit association-list struct: an ordered Vec of
+// key/value entry structs, one struct per concrete
+// instantiation. Four instantiations are covered:
+//   map[string]i64    -> GoMapsStringI64
+//   map[string][]byte -> GoMapsStringBytes (Go []byte and
+//                          Go string are both Vec<u8>, so
+//                          this also spells map[string]string)
+//   map[string]bool   -> GoMapsStringBool
+//   map[i64]i64       -> GoMapsI64I64
+// Any other instantiation (map[string]any, map[int]string,
+// map[string]SomeStruct, ...) is FRONTEND-GENERATED: the
+// frontend copies one instantiation block below, renames
+// the types and functions, and supplies the key/value
+// comparison for its types (see seam (b)). No other
+// instantiation lives in this file.
+//
+// REPRESENTATION COSTS, stated honestly: lookup, insert,
+// delete and Equal are all LINEAR in the number of
+// entries -- every operation scans the entry Vec. There
+// is no hashing anywhere in this file. Insertion order
+// is preserved (entries append; an overwrite keeps the
+// entry in place), which is a valid order under Go's
+// rule that map iteration order is unspecified, but it
+// is NOT Go's randomised order: a program that depends
+// on observing a particular order is as broken against
+// gostd as against Go on a given day, and a program
+// that depends on order being randomised (e.g. a test
+// that fails if order is stable) will behave
+// differently here. Keys/Values return snapshots in
+// insertion order for the same reason.
+//
+// A NOTE ON HashMap (read before "fixing" this file):
+// the wider corpus DOES use a generic HashMap<K, V>
+// (sa_std/hashmap.sa): runtime.sla models Go map[K]V
+// as HashMap<K, V> and sync.sla's GoSyncMap<K, V> wraps
+// one. This file nevertheless uses the association list
+// the task brief orders, for two reasons. First, the
+// brief is explicit: concrete-type instantiation with
+// an ordered Vec of pairs. Second, the HashMap key-
+// enumeration surface is itself unconfirmed --
+// runtime.sla's go_runtime_hashmap_keys_* ride on
+// __go_hashmap_keys helpers that the integration phase
+// "must confirm or provide", and HashMap only recently
+// had a by-value-insert defect fixed (task 164). A
+// HashMap-backed rework of this file is a NAMED
+// integration decision for Muse/the user, not
+// something this file silently chooses or forecloses:
+// the public function names below (go_maps_<Fn>_<K>V)
+// are representation-independent, so a rework swaps
+// the struct bodies and the private find/remove_at
+// helpers and leaves every call site untouched.
+//
+// Panic codes (gostd block 77400-77499; this file):
+//   77443  maps iterator / range-over-func use: All,
+//          Insert and Collect (iter.go) take or return
+//          an iter.Seq/Seq2, and SLA has no iterator
+//          surface. The stubs below panic if ever
+//          emitted; the frontend must refuse those
+//          call sites (see seam (a)).
+//          RENUMBER NOTE (R1424, unanimous 10-0 =
+//          maps_renumber, Muse relay 16669; executed
+//          2026-11-27, CONTEXT-B-FIX-170.md): the
+//          iterator stubs used to panic 77431, which
+//          sits inside sort's reserved block 77430-77439.
+//          (The old note here claiming "no live
+//          panic(77431) exists" was stale -- 12 live
+//          sites existed; the carve-out question is now
+//          moot.) Per R1424 the 12 sites were
+//          mechanically renumbered to 77443, verified
+//          free across the whole corpus (all .sla +
+//          manifests + IO-CONTRACT-170.md: zero
+//          occurrences before the renumber) and outside
+//          sort's block.
+// No other code in this file panics. 77432 (nil
+// comparator backstop) is NOT claimed: there is no
+// SLA surface that can detect a nil fn value, so a
+// nil eq/del argument is a frontend refusal, not a
+// runtime check (see seam (b)). No target ids are
+// claimed: Go's maps package has no error values, so
+// this file defines no error sentinel.
+//
+// THE SEAMS -- integration checks, one per item the
+// task brief names. None of these is decided silently
+// inside this file; each names the party that must
+// confirm it at integration time.
+//
+// (a) ITERATORS / range-over-func. Go's maps.All,
+//     maps.Insert and maps.Collect (iter.go) are
+//     iterator surface: All returns iter.Seq2[K, V],
+//     Insert consumes one, Collect consumes one.
+//     SLA has no iter.Seq/Seq2 and no range-over-func,
+//     so there is no spelling for a lazy iterator
+//     value. DECISION: All/Insert/Collect exist here
+//     ONLY as loud-refusal stubs panicking 77443
+//     (one per instantiation, same shape as io's
+//     go_io_pipe stub, panic 77402). The frontend
+//     must refuse maps.All / maps.Insert /
+//     maps.Collect at the call site and must never
+//     emit a call to the stubs. maps.Keys and
+//     maps.Values are different: Go's iter.go versions
+//     ALSO return iterators, but this file provides
+//     them as EAGER SNAPSHOTS -- go_maps_keys_* returns
+//     Vec<K> and go_maps_values_* returns Vec<V> in
+//     insertion order. That is the snapshot shape the
+//     frontend's range statement already rides on
+//     (runtime.sla's go_runtime_hashmap_keys_* return
+//     Vec<K> snapshots for exactly this purpose), and
+//     the key/value SET is identical to Go's; only
+//     laziness is lost. A program that depends on the
+//     iterator being lazy (e.g. ranging a map that is
+//     mutated mid-iteration and expecting Go's
+//     may-or-may-not-visit rule per entry) sees the
+//     snapshot rule instead: entries are fixed at the
+//     Keys/Values call.
+//
+// (b) COMPARISON / EQUALITY AND THE fn-VALUE SEAM.
+//     Go's Equal compares values with ==; EqualFunc
+//     and DeleteFunc take a func value (eq/del).
+//     The fn-typed parameter shape is proven in the
+//     corpus: bufio.sla carries a split field of type
+//     fn(Vec<u8>, bool) -> GoBufioSplitResult, defaults
+//     it to the named fn go_bufio_scan_lines and calls
+//     it through a let-bound local; sync.sla's
+//     go_sync_map_range takes f: fn(K, V) -> bool and
+//     calls f(keys[i], v) directly. This file follows
+//     exactly that shape: EqualFunc takes
+//     eq: fn(V, V) -> bool and DeleteFunc takes
+//     del: fn(K, V) -> bool, called directly. What the
+//     corpus PROVES IMPOSSIBLE (R1400/S3) is passing a
+//     CLOSURE as a fn value: the checker rejects
+//     closure-to-fn_ptr conversion in every form.
+//     DECISION: the frontend must LIFT each Go func
+//     literal passed to EqualFunc/DeleteFunc to a
+//     named top-level fn and pass that name; a closure
+//     literal at such a call site is a frontend
+//     refusal, never an emitted closure. The same
+//     seam covers the per-instantiation equality this
+//     file cannot spell itself: Equal for a
+//     frontend-generated instantiation compares its
+//     values with a frontend-emitted named helper of
+//     the same fn(V, V) -> bool shape, and cross-type
+//     EqualFunc (Go allows V1 != V2 across the two
+//     maps) is a frontend-generated loop riding on
+//     the go_maps_get_* helpers below -- this file
+//     provides same-instantiation EqualFunc only.
+//     A NIL eq/del argument has no gostd spelling:
+//     no SLA surface can test a fn value for nil, so
+//     the mapping line must refuse a nil func argument
+//     at the call site (the same rule as log's nil-
+//     writer refusal), not pass a dummy. That is why
+//     77432 is left unclaimed.
+//
+// (c) LANGUAGE OPERATIONS (get/set/delete/len). Go's
+//     maps package has no Get/Set: m[k], m[k] = v and
+//     delete(m, k) are language operations. The
+//     frontend emits those itself, but it cannot reach
+//     into m.entries (a private representation), so
+//     this file exposes go_maps_get_* / set_* /
+//     delete_* / len_* per instantiation as the
+//     frontend's emission surface for map index,
+//     assignment, delete and len. They are NOT Go
+//     maps-package API; they are the reason a maps.sla
+//     value is usable by emitted code at all. Set
+//     overwrites in place (the entry keeps its
+//     position); get returns (zero, false) on a miss,
+//     with the Go zero value per instantiation (0,
+//     empty Vec, false).
+//
+// (d) NIL MAPS. Go distinguishes a nil map (reads
+//     OK, writes panic) from an empty one, and
+//     Clone(nil) returns nil. This representation
+//     cannot spell nil: go_maps_new_* returns an
+//     empty, non-nil map, and Clone of an empty map
+//     returns an empty map. DECISION: the frontend
+//     must refuse a write (assignment, Copy onto,
+//     DeleteFunc on) a nil map at the call site -- a
+//     frontend refusal, same class as (b) -- and a
+//     nil-map source form maps to go_maps_new_* at
+//     the point the frontend can prove non-nil, or
+//     to a refusal. Reads of a nil map are the empty
+//     behaviour, which this file already gives.
+//
+// (e) MOVE DISCIPLINE. Vec::push MOVES its argument;
+//     plain fn call args do NOT consume Vec values
+//     (brief). This file is written to that rule:
+//     every Vec<u8> key/value that is PUSHED into a
+//     result comes from go_bytes_clone (a fresh copy),
+//     never moved out of a source map; every Vec<u8>
+//     passed to a helper (go_bytes_equal,
+//     __go_maps_find_*, eq/del) is passed directly as
+//     a fn argument. Struct literals are built fresh
+//     at the push site. Two combinations the debug
+//     phase must still confirm (integration checks,
+//     same class as context.sla's IC list): IC-1,
+//     indexed-element field assignment through a
+//     borrow (m.entries[idx].v = v in go_maps_set_*
+//     -- field assignment through & is proven in
+//     log.sla, method calls on indexed elements are
+//     proven in sync.sla, the combination is the
+//     check; FALLBACK if it fails: remove_at + push,
+//     which moves the overwritten entry to the end --
+//     still a valid unspecified order); IC-2, chained
+//     index-then-field reads as fn arguments
+//     (m.entries[i].k -- the flag.sla precedent
+//     __go_flag_eq(fs.defs[i].name, name) is exactly
+//     this shape, so this is expected to check, but
+//     it is listed because this file leans on it in
+//     every loop).
+//
+// DIVERGENCES (all deliberate, all noted here):
+//   - Lookup is linear, not hashed (representation
+//     costs above); HashMap rework is a named
+//     decision, not a silent default.
+//   - Keys/Values are eager Vec snapshots, not
+//     iter.Seq/Seq2 (seam (a)).
+//   - Iteration order is insertion order, not Go's
+//     randomised order (representation costs above).
+//   - Clone copies byte contents: Go's Clone is
+//     shallow (the new map shares each []byte's
+//     backing array with the source). SLA Vec<u8>
+//     values are owned, not shared backing arrays, so
+//     a cloned entry's key/value bytes are fresh
+//     copies via go_bytes_clone. Observable
+//     difference: mutating a []byte value obtained
+//     from the clone does not affect the source's
+//     value (in Go it would). Key/value identity
+//     otherwise matches: same keys, same values,
+//     same length, independent maps.
+//   - Clone of an empty map returns an empty map, not
+//     nil (seam (d)).
+//   - DeleteFunc visits each entry exactly once, in
+//     insertion order, deciding deletion per entry as
+//     it goes. Go ranges the map while deleting, so
+//     an entry may or may not be visited if the map
+//     is mutated during the range; gostd's rule is
+//     the deterministic member of Go's allowed
+//     behaviours (every entry present at the call
+//     gets exactly one del call).
+//   - Go's Equal/EqualFunc take two map types that
+//     may differ (M1, M2) as long as K and V match
+//     (Equal) or K matches (EqualFunc). Named Go map
+//     types share this file's representation, so they
+//     use the same functions; genuinely different
+//     value types in EqualFunc are frontend-generated
+//     (seam (b)).
+//   - Go notes maps has no special handling for
+//     non-reflexive keys (NaN). Moot here: neither
+//     key type in this file (string, i64) has a NaN.
+//
+// LOUD REFUSALS (every gap in this file panics with a
+// claimed code; nothing is a silent stub):
+//   77443  All / Insert / Collect, all four
+//          instantiations (no iterator surface)
+// All other entry points are implemented. What is NOT
+// in this file (out of the census scope for maps):
+// the rest of iter.go is refused, not implemented;
+// encoding/json's map[string]T paths ride on the
+// instantiations here plus json's own surface; no
+// other maps-package function exists in Go 1.27.2
+// (maps.go is Equal, EqualFunc, Clone, Copy,
+// DeleteFunc plus Clear -- Clear lives in the
+// builtin clear, covered here as go_maps_clear_*).
+//
+// Nothing in this file has been compiled or tested
+// (write-first batch; the debug phase is separate).
+
+@import "sa_std/vec.sa"
+
+// ---------- map[string]i64 ----------
+
+// One entry of a map[string]i64: the key is a Go
+// string (Vec<u8>), the value a Go int (i64).
+struct GoMapsEntryStringI64 {
+    k: Vec<u8>,
+    v: i64,
+}
+
+// map[string]i64 as an ordered association list.
+// entries is in insertion order; a Set overwrite
+// keeps the entry in place.
+struct GoMapsStringI64 {
+    entries: Vec<GoMapsEntryStringI64>,
+}
+
+// maps: make(map[string]i64). An empty, non-nil map
+// (seam (d): nil has no spelling in this file).
+fn go_maps_new_string_i64() -> GoMapsStringI64 {
+    return GoMapsStringI64 { entries: Vec::new() };
+}
+
+// Index of k in m, or -1. String keys compare with
+// go_bytes_equal (byte-wise, like Go's string ==).
+fn __go_maps_find_string_i64(m: &GoMapsStringI64, k: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(m.entries) {
+        if go_bytes_equal(m.entries[i].k, k) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Drop the entry at idx by rebuilding the entry Vec
+// without it. Vec<u8> keys are cloned, never moved
+// out of m (seam (e)); i64 values copy.
+fn __go_maps_remove_at_string_i64(m: &GoMapsStringI64, idx: i64) -> void {
+    let kept = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        if i != idx {
+            kept.push(GoMapsEntryStringI64 { k: go_bytes_clone(m.entries[i].k), v: m.entries[i].v });
+        };
+        i = i + 1;
+    }
+    m.entries = kept;
+    return;
+}
+
+// m[k]: the value and true, or (0, false) on a miss
+// (Go's zero value + ok bit; language operation, seam
+// (c)). The key is passed as a fn argument, so the
+// source map is not consumed.
+fn go_maps_get_string_i64(m: &GoMapsStringI64, k: Vec<u8>) -> (i64, bool) {
+    let idx = __go_maps_find_string_i64(m, k);
+    if idx < 0 { return (0, false); };
+    return (m.entries[idx].v, true);
+}
+
+// m[k] = v: overwrite in place if k is present, else
+// append (language operation, seam (c)). The entry
+// keeps its position on overwrite; IC-1 (see the
+// header) covers the indexed field assignment.
+fn go_maps_set_string_i64(m: &GoMapsStringI64, k: Vec<u8>, v: i64) -> void {
+    let idx = __go_maps_find_string_i64(m, k);
+    if idx < 0 {
+        m.entries.push(GoMapsEntryStringI64 { k: k, v: v });
+    } else {
+        m.entries[idx].v = v;
+    };
+    return;
+}
+
+// delete(m, k): no-op on a missing key, like Go
+// (language operation, seam (c)).
+fn go_maps_delete_string_i64(m: &GoMapsStringI64, k: Vec<u8>) -> void {
+    let idx = __go_maps_find_string_i64(m, k);
+    if idx < 0 { return; };
+    __go_maps_remove_at_string_i64(m, idx);
+    return;
+}
+
+// len(m) (language operation, seam (c)).
+fn go_maps_len_string_i64(m: &GoMapsStringI64) -> i64 {
+    return len(m.entries);
+}
+
+// maps.Keys(m) as an eager snapshot: the keys in
+// insertion order (seam (a)). Keys are cloned out of
+// the map, never moved (seam (e)).
+fn go_maps_keys_string_i64(m: &GoMapsStringI64) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(go_bytes_clone(m.entries[i].k));
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Values(m) as an eager snapshot: the values in
+// insertion order (seam (a)). i64 copies.
+fn go_maps_values_string_i64(m: &GoMapsStringI64) -> Vec<i64> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(m.entries[i].v);
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Equal(m1, m2): same length and every key of m1
+// present in m2 with an == value (Go's maps.go).
+fn go_maps_equal_string_i64(m1: &GoMapsStringI64, m2: &GoMapsStringI64) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_string_i64(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if m1.entries[i].v != m2.entries[j].v { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.EqualFunc(m1, m2, eq): like Equal, but values
+// compare with eq. eq is a named top-level fn, never
+// a closure literal (seam (b)); a nil eq is a
+// frontend refusal (77432 deliberately unclaimed).
+fn go_maps_equal_func_string_i64(m1: &GoMapsStringI64, m2: &GoMapsStringI64, eq: fn(i64, i64) -> bool) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_string_i64(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if !eq(m1.entries[i].v, m2.entries[j].v) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.Clone(m): a new map with the same key/value
+// pairs (Go's maps.go). Byte contents of keys are
+// fresh copies (see the Clone divergence note in the
+// header); the maps are independent afterwards.
+fn go_maps_clone_string_i64(m: &GoMapsStringI64) -> GoMapsStringI64 {
+    let out = go_maps_new_string_i64();
+    let i = 0;
+    while i < len(m.entries) {
+        out.entries.push(GoMapsEntryStringI64 { k: go_bytes_clone(m.entries[i].k), v: m.entries[i].v });
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Copy(dst, src): every pair of src overwrites
+// into dst (Go's maps.go). Copying a map onto itself
+// is a no-op per entry, like Go.
+fn go_maps_copy_string_i64(dst: &GoMapsStringI64, src: &GoMapsStringI64) -> void {
+    let i = 0;
+    while i < len(src.entries) {
+        go_maps_set_string_i64(dst, src.entries[i].k, src.entries[i].v);
+        i = i + 1;
+    }
+    return;
+}
+
+// maps.DeleteFunc(m, del): delete every pair for
+// which del returns true (Go's maps.go). Each entry
+// present at the call gets exactly one del call, in
+// insertion order (see the DeleteFunc divergence note
+// in the header). del is a named top-level fn, never
+// a closure literal (seam (b)).
+fn go_maps_delete_func_string_i64(m: &GoMapsStringI64, del: fn(Vec<u8>, i64) -> bool) -> void {
+    let i = 0;
+    while i < len(m.entries) {
+        if del(m.entries[i].k, m.entries[i].v) {
+            __go_maps_remove_at_string_i64(m, i);
+        } else {
+            i = i + 1;
+        };
+    }
+    return;
+}
+
+// clear(m): drop every pair (Go's builtin clear).
+fn go_maps_clear_string_i64(m: &GoMapsStringI64) -> void {
+    m.entries = Vec::new();
+    return;
+}
+
+// ---------- iterator refusals, map[string]i64 ----------
+//
+// maps.All / Insert / Collect (iter.go) are iterator
+// surface with no SLA spelling (seam (a)). These stubs
+// panic 77443 if ever emitted; the frontend must
+// refuse those call sites.
+
+// maps.All(m) iter.Seq2[K, V]: no iterator surface.
+fn go_maps_all_string_i64(m: &GoMapsStringI64) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Insert(m, seq): no iterator surface.
+fn go_maps_insert_string_i64(m: &GoMapsStringI64) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Collect(seq): no iterator surface.
+fn go_maps_collect_string_i64() -> GoMapsStringI64 {
+    panic(77443);
+}
+
+// ---------- map[string][]byte ----------
+
+// One entry of a map[string][]byte: both key and
+// value are byte strings (Vec<u8>). This also spells
+// map[string]string: Go string and []byte share the
+// Vec<u8> representation.
+struct GoMapsEntryStringBytes {
+    k: Vec<u8>,
+    v: Vec<u8>,
+}
+
+// map[string][]byte as an ordered association list.
+struct GoMapsStringBytes {
+    entries: Vec<GoMapsEntryStringBytes>,
+}
+
+// maps: make(map[string][]byte). An empty, non-nil map
+// (seam (d): nil has no spelling in this file).
+fn go_maps_new_string_bytes() -> GoMapsStringBytes {
+    return GoMapsStringBytes { entries: Vec::new() };
+}
+
+// Index of k in m, or -1. String keys compare with
+// go_bytes_equal (byte-wise, like Go's string ==).
+fn __go_maps_find_string_bytes(m: &GoMapsStringBytes, k: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(m.entries) {
+        if go_bytes_equal(m.entries[i].k, k) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Drop the entry at idx by rebuilding the entry Vec
+// without it. Both Vec<u8> fields are cloned, never
+// moved out of m (seam (e)).
+fn __go_maps_remove_at_string_bytes(m: &GoMapsStringBytes, idx: i64) -> void {
+    let kept = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        if i != idx {
+            kept.push(GoMapsEntryStringBytes { k: go_bytes_clone(m.entries[i].k), v: go_bytes_clone(m.entries[i].v) });
+        };
+        i = i + 1;
+    }
+    m.entries = kept;
+    return;
+}
+
+// m[k]: the value and true, or (empty, false) on a
+// miss (Go's zero value + ok bit; language operation,
+// seam (c)). The returned value is a fresh copy, so
+// the caller owns it and the map keeps its own.
+fn go_maps_get_string_bytes(m: &GoMapsStringBytes, k: Vec<u8>) -> (Vec<u8>, bool) {
+    let idx = __go_maps_find_string_bytes(m, k);
+    if idx < 0 { return (Vec::new(), false); };
+    return (go_bytes_clone(m.entries[idx].v), true);
+}
+
+// m[k] = v: overwrite in place if k is present, else
+// append (language operation, seam (c)). The entry
+// keeps its position on overwrite; IC-1 (see the
+// header) covers the indexed field assignment. The
+// value moves into the map; the caller must not use
+// v afterwards.
+fn go_maps_set_string_bytes(m: &GoMapsStringBytes, k: Vec<u8>, v: Vec<u8>) -> void {
+    let idx = __go_maps_find_string_bytes(m, k);
+    if idx < 0 {
+        m.entries.push(GoMapsEntryStringBytes { k: k, v: v });
+    } else {
+        m.entries[idx].v = v;
+    };
+    return;
+}
+
+// delete(m, k): no-op on a missing key, like Go
+// (language operation, seam (c)).
+fn go_maps_delete_string_bytes(m: &GoMapsStringBytes, k: Vec<u8>) -> void {
+    let idx = __go_maps_find_string_bytes(m, k);
+    if idx < 0 { return; };
+    __go_maps_remove_at_string_bytes(m, idx);
+    return;
+}
+
+// len(m) (language operation, seam (c)).
+fn go_maps_len_string_bytes(m: &GoMapsStringBytes) -> i64 {
+    return len(m.entries);
+}
+
+// maps.Keys(m) as an eager snapshot: the keys in
+// insertion order (seam (a)). Keys are cloned out of
+// the map, never moved (seam (e)).
+fn go_maps_keys_string_bytes(m: &GoMapsStringBytes) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(go_bytes_clone(m.entries[i].k));
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Values(m) as an eager snapshot: the values in
+// insertion order (seam (a)). Values are cloned out
+// of the map, never moved (seam (e)).
+fn go_maps_values_string_bytes(m: &GoMapsStringBytes) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(go_bytes_clone(m.entries[i].v));
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Equal(m1, m2): same length and every key of m1
+// present in m2 with a byte-equal value (Go's maps.go;
+// []byte values have no == in Go either, so byte-wise
+// comparison is the Go-correct spelling here).
+fn go_maps_equal_string_bytes(m1: &GoMapsStringBytes, m2: &GoMapsStringBytes) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_string_bytes(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if !go_bytes_equal(m1.entries[i].v, m2.entries[j].v) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.EqualFunc(m1, m2, eq): like Equal, but values
+// compare with eq. eq is a named top-level fn, never
+// a closure literal (seam (b)); a nil eq is a
+// frontend refusal (77432 deliberately unclaimed).
+fn go_maps_equal_func_string_bytes(m1: &GoMapsStringBytes, m2: &GoMapsStringBytes, eq: fn(Vec<u8>, Vec<u8>) -> bool) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_string_bytes(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if !eq(m1.entries[i].v, m2.entries[j].v) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.Clone(m): a new map with the same key/value
+// pairs (Go's maps.go). Keys and values are fresh
+// copies (see the Clone divergence note in the
+// header); the maps are independent afterwards.
+fn go_maps_clone_string_bytes(m: &GoMapsStringBytes) -> GoMapsStringBytes {
+    let out = go_maps_new_string_bytes();
+    let i = 0;
+    while i < len(m.entries) {
+        out.entries.push(GoMapsEntryStringBytes { k: go_bytes_clone(m.entries[i].k), v: go_bytes_clone(m.entries[i].v) });
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Copy(dst, src): every pair of src overwrites
+// into dst (Go's maps.go). Copying a map onto itself
+// is a no-op per entry, like Go.
+fn go_maps_copy_string_bytes(dst: &GoMapsStringBytes, src: &GoMapsStringBytes) -> void {
+    let i = 0;
+    while i < len(src.entries) {
+        go_maps_set_string_bytes(dst, src.entries[i].k, src.entries[i].v);
+        i = i + 1;
+    }
+    return;
+}
+
+// maps.DeleteFunc(m, del): delete every pair for
+// which del returns true (Go's maps.go). Each entry
+// present at the call gets exactly one del call, in
+// insertion order (see the DeleteFunc divergence note
+// in the header). del is a named top-level fn, never
+// a closure literal (seam (b)).
+fn go_maps_delete_func_string_bytes(m: &GoMapsStringBytes, del: fn(Vec<u8>, Vec<u8>) -> bool) -> void {
+    let i = 0;
+    while i < len(m.entries) {
+        if del(m.entries[i].k, m.entries[i].v) {
+            __go_maps_remove_at_string_bytes(m, i);
+        } else {
+            i = i + 1;
+        };
+    }
+    return;
+}
+
+// clear(m): drop every pair (Go's builtin clear).
+fn go_maps_clear_string_bytes(m: &GoMapsStringBytes) -> void {
+    m.entries = Vec::new();
+    return;
+}
+
+// ---------- iterator refusals, map[string][]byte ----------
+//
+// maps.All / Insert / Collect (iter.go) are iterator
+// surface with no SLA spelling (seam (a)). These stubs
+// panic 77443 if ever emitted; the frontend must
+// refuse those call sites.
+
+// maps.All(m) iter.Seq2[K, V]: no iterator surface.
+fn go_maps_all_string_bytes(m: &GoMapsStringBytes) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Insert(m, seq): no iterator surface.
+fn go_maps_insert_string_bytes(m: &GoMapsStringBytes) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Collect(seq): no iterator surface.
+fn go_maps_collect_string_bytes() -> GoMapsStringBytes {
+    panic(77443);
+}
+
+// ---------- map[string]bool ----------
+
+// One entry of a map[string]bool: the key is a Go
+// string (Vec<u8>), the value a Go bool.
+struct GoMapsEntryStringBool {
+    k: Vec<u8>,
+    v: bool,
+}
+
+// map[string]bool as an ordered association list.
+struct GoMapsStringBool {
+    entries: Vec<GoMapsEntryStringBool>,
+}
+
+// maps: make(map[string]bool). An empty, non-nil map
+// (seam (d): nil has no spelling in this file).
+fn go_maps_new_string_bool() -> GoMapsStringBool {
+    return GoMapsStringBool { entries: Vec::new() };
+}
+
+// Index of k in m, or -1. String keys compare with
+// go_bytes_equal (byte-wise, like Go's string ==).
+fn __go_maps_find_string_bool(m: &GoMapsStringBool, k: Vec<u8>) -> i64 {
+    let i = 0;
+    while i < len(m.entries) {
+        if go_bytes_equal(m.entries[i].k, k) { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Drop the entry at idx by rebuilding the entry Vec
+// without it. Vec<u8> keys are cloned, never moved
+// out of m (seam (e)); bool values copy.
+fn __go_maps_remove_at_string_bool(m: &GoMapsStringBool, idx: i64) -> void {
+    let kept = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        if i != idx {
+            kept.push(GoMapsEntryStringBool { k: go_bytes_clone(m.entries[i].k), v: m.entries[i].v });
+        };
+        i = i + 1;
+    }
+    m.entries = kept;
+    return;
+}
+
+// m[k]: the value and true, or (false, false) on a
+// miss (Go's zero value + ok bit; language operation,
+// seam (c)).
+fn go_maps_get_string_bool(m: &GoMapsStringBool, k: Vec<u8>) -> (bool, bool) {
+    let idx = __go_maps_find_string_bool(m, k);
+    if idx < 0 { return (false, false); };
+    return (m.entries[idx].v, true);
+}
+
+// m[k] = v: overwrite in place if k is present, else
+// append (language operation, seam (c)). The entry
+// keeps its position on overwrite; IC-1 (see the
+// header) covers the indexed field assignment.
+fn go_maps_set_string_bool(m: &GoMapsStringBool, k: Vec<u8>, v: bool) -> void {
+    let idx = __go_maps_find_string_bool(m, k);
+    if idx < 0 {
+        m.entries.push(GoMapsEntryStringBool { k: k, v: v });
+    } else {
+        m.entries[idx].v = v;
+    };
+    return;
+}
+
+// delete(m, k): no-op on a missing key, like Go
+// (language operation, seam (c)).
+fn go_maps_delete_string_bool(m: &GoMapsStringBool, k: Vec<u8>) -> void {
+    let idx = __go_maps_find_string_bool(m, k);
+    if idx < 0 { return; };
+    __go_maps_remove_at_string_bool(m, idx);
+    return;
+}
+
+// len(m) (language operation, seam (c)).
+fn go_maps_len_string_bool(m: &GoMapsStringBool) -> i64 {
+    return len(m.entries);
+}
+
+// maps.Keys(m) as an eager snapshot: the keys in
+// insertion order (seam (a)). Keys are cloned out of
+// the map, never moved (seam (e)).
+fn go_maps_keys_string_bool(m: &GoMapsStringBool) -> Vec<Vec<u8>> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(go_bytes_clone(m.entries[i].k));
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Values(m) as an eager snapshot: the values in
+// insertion order (seam (a)). bool values copy.
+fn go_maps_values_string_bool(m: &GoMapsStringBool) -> Vec<bool> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(m.entries[i].v);
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Equal(m1, m2): same length and every key of m1
+// present in m2 with an == value (Go's maps.go).
+fn go_maps_equal_string_bool(m1: &GoMapsStringBool, m2: &GoMapsStringBool) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_string_bool(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if m1.entries[i].v != m2.entries[j].v { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.EqualFunc(m1, m2, eq): like Equal, but values
+// compare with eq. eq is a named top-level fn, never
+// a closure literal (seam (b)); a nil eq is a
+// frontend refusal (77432 deliberately unclaimed).
+fn go_maps_equal_func_string_bool(m1: &GoMapsStringBool, m2: &GoMapsStringBool, eq: fn(bool, bool) -> bool) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_string_bool(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if !eq(m1.entries[i].v, m2.entries[j].v) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.Clone(m): a new map with the same key/value
+// pairs (Go's maps.go). Byte contents of keys are
+// fresh copies (see the Clone divergence note in the
+// header); the maps are independent afterwards.
+fn go_maps_clone_string_bool(m: &GoMapsStringBool) -> GoMapsStringBool {
+    let out = go_maps_new_string_bool();
+    let i = 0;
+    while i < len(m.entries) {
+        out.entries.push(GoMapsEntryStringBool { k: go_bytes_clone(m.entries[i].k), v: m.entries[i].v });
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Copy(dst, src): every pair of src overwrites
+// into dst (Go's maps.go). Copying a map onto itself
+// is a no-op per entry, like Go.
+fn go_maps_copy_string_bool(dst: &GoMapsStringBool, src: &GoMapsStringBool) -> void {
+    let i = 0;
+    while i < len(src.entries) {
+        go_maps_set_string_bool(dst, src.entries[i].k, src.entries[i].v);
+        i = i + 1;
+    }
+    return;
+}
+
+// maps.DeleteFunc(m, del): delete every pair for
+// which del returns true (Go's maps.go). Each entry
+// present at the call gets exactly one del call, in
+// insertion order (see the DeleteFunc divergence note
+// in the header). del is a named top-level fn, never
+// a closure literal (seam (b)).
+fn go_maps_delete_func_string_bool(m: &GoMapsStringBool, del: fn(Vec<u8>, bool) -> bool) -> void {
+    let i = 0;
+    while i < len(m.entries) {
+        if del(m.entries[i].k, m.entries[i].v) {
+            __go_maps_remove_at_string_bool(m, i);
+        } else {
+            i = i + 1;
+        };
+    }
+    return;
+}
+
+// clear(m): drop every pair (Go's builtin clear).
+fn go_maps_clear_string_bool(m: &GoMapsStringBool) -> void {
+    m.entries = Vec::new();
+    return;
+}
+
+// ---------- iterator refusals, map[string]bool ----------
+//
+// maps.All / Insert / Collect (iter.go) are iterator
+// surface with no SLA spelling (seam (a)). These stubs
+// panic 77443 if ever emitted; the frontend must
+// refuse those call sites.
+
+// maps.All(m) iter.Seq2[K, V]: no iterator surface.
+fn go_maps_all_string_bool(m: &GoMapsStringBool) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Insert(m, seq): no iterator surface.
+fn go_maps_insert_string_bool(m: &GoMapsStringBool) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Collect(seq): no iterator surface.
+fn go_maps_collect_string_bool() -> GoMapsStringBool {
+    panic(77443);
+}
+
+// ---------- map[i64]i64 ----------
+
+// One entry of a map[i64]i64: both key and value are
+// Go ints (i64). This is the integer-keyed
+// instantiation; Go map[int]int and map[int64]int64
+// share it (Go int is i64 in this file's contract).
+struct GoMapsEntryI64I64 {
+    k: i64,
+    v: i64,
+}
+
+// map[i64]i64 as an ordered association list.
+struct GoMapsI64I64 {
+    entries: Vec<GoMapsEntryI64I64>,
+}
+
+// maps: make(map[i64]i64). An empty, non-nil map
+// (seam (d): nil has no spelling in this file).
+fn go_maps_new_i64_i64() -> GoMapsI64I64 {
+    return GoMapsI64I64 { entries: Vec::new() };
+}
+
+// Index of k in m, or -1. Integer keys compare with
+// == (like Go's comparable-key rule for ints).
+fn __go_maps_find_i64_i64(m: &GoMapsI64I64, k: i64) -> i64 {
+    let i = 0;
+    while i < len(m.entries) {
+        if m.entries[i].k == k { return i; };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Drop the entry at idx by rebuilding the entry Vec
+// without it. i64 keys and values copy.
+fn __go_maps_remove_at_i64_i64(m: &GoMapsI64I64, idx: i64) -> void {
+    let kept = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        if i != idx {
+            kept.push(GoMapsEntryI64I64 { k: m.entries[i].k, v: m.entries[i].v });
+        };
+        i = i + 1;
+    }
+    m.entries = kept;
+    return;
+}
+
+// m[k]: the value and true, or (0, false) on a miss
+// (Go's zero value + ok bit; language operation, seam
+// (c)).
+fn go_maps_get_i64_i64(m: &GoMapsI64I64, k: i64) -> (i64, bool) {
+    let idx = __go_maps_find_i64_i64(m, k);
+    if idx < 0 { return (0, false); };
+    return (m.entries[idx].v, true);
+}
+
+// m[k] = v: overwrite in place if k is present, else
+// append (language operation, seam (c)). The entry
+// keeps its position on overwrite; IC-1 (see the
+// header) covers the indexed field assignment.
+fn go_maps_set_i64_i64(m: &GoMapsI64I64, k: i64, v: i64) -> void {
+    let idx = __go_maps_find_i64_i64(m, k);
+    if idx < 0 {
+        m.entries.push(GoMapsEntryI64I64 { k: k, v: v });
+    } else {
+        m.entries[idx].v = v;
+    };
+    return;
+}
+
+// delete(m, k): no-op on a missing key, like Go
+// (language operation, seam (c)).
+fn go_maps_delete_i64_i64(m: &GoMapsI64I64, k: i64) -> void {
+    let idx = __go_maps_find_i64_i64(m, k);
+    if idx < 0 { return; };
+    __go_maps_remove_at_i64_i64(m, idx);
+    return;
+}
+
+// len(m) (language operation, seam (c)).
+fn go_maps_len_i64_i64(m: &GoMapsI64I64) -> i64 {
+    return len(m.entries);
+}
+
+// maps.Keys(m) as an eager snapshot: the keys in
+// insertion order (seam (a)). i64 keys copy.
+fn go_maps_keys_i64_i64(m: &GoMapsI64I64) -> Vec<i64> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(m.entries[i].k);
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Values(m) as an eager snapshot: the values in
+// insertion order (seam (a)). i64 values copy.
+fn go_maps_values_i64_i64(m: &GoMapsI64I64) -> Vec<i64> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(m.entries) {
+        out.push(m.entries[i].v);
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Equal(m1, m2): same length and every key of m1
+// present in m2 with an == value (Go's maps.go).
+fn go_maps_equal_i64_i64(m1: &GoMapsI64I64, m2: &GoMapsI64I64) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_i64_i64(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if m1.entries[i].v != m2.entries[j].v { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.EqualFunc(m1, m2, eq): like Equal, but values
+// compare with eq. eq is a named top-level fn, never
+// a closure literal (seam (b)); a nil eq is a
+// frontend refusal (77432 deliberately unclaimed).
+fn go_maps_equal_func_i64_i64(m1: &GoMapsI64I64, m2: &GoMapsI64I64, eq: fn(i64, i64) -> bool) -> bool {
+    if len(m1.entries) != len(m2.entries) { return false; };
+    let i = 0;
+    while i < len(m1.entries) {
+        let j = __go_maps_find_i64_i64(m2, m1.entries[i].k);
+        if j < 0 { return false; };
+        if !eq(m1.entries[i].v, m2.entries[j].v) { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// maps.Clone(m): a new map with the same key/value
+// pairs (Go's maps.go). The maps are independent
+// afterwards.
+fn go_maps_clone_i64_i64(m: &GoMapsI64I64) -> GoMapsI64I64 {
+    let out = go_maps_new_i64_i64();
+    let i = 0;
+    while i < len(m.entries) {
+        out.entries.push(GoMapsEntryI64I64 { k: m.entries[i].k, v: m.entries[i].v });
+        i = i + 1;
+    }
+    return out;
+}
+
+// maps.Copy(dst, src): every pair of src overwrites
+// into dst (Go's maps.go). Copying a map onto itself
+// is a no-op per entry, like Go.
+fn go_maps_copy_i64_i64(dst: &GoMapsI64I64, src: &GoMapsI64I64) -> void {
+    let i = 0;
+    while i < len(src.entries) {
+        go_maps_set_i64_i64(dst, src.entries[i].k, src.entries[i].v);
+        i = i + 1;
+    }
+    return;
+}
+
+// maps.DeleteFunc(m, del): delete every pair for
+// which del returns true (Go's maps.go). Each entry
+// present at the call gets exactly one del call, in
+// insertion order (see the DeleteFunc divergence note
+// in the header). del is a named top-level fn, never
+// a closure literal (seam (b)).
+fn go_maps_delete_func_i64_i64(m: &GoMapsI64I64, del: fn(i64, i64) -> bool) -> void {
+    let i = 0;
+    while i < len(m.entries) {
+        if del(m.entries[i].k, m.entries[i].v) {
+            __go_maps_remove_at_i64_i64(m, i);
+        } else {
+            i = i + 1;
+        };
+    }
+    return;
+}
+
+// clear(m): drop every pair (Go's builtin clear).
+fn go_maps_clear_i64_i64(m: &GoMapsI64I64) -> void {
+    m.entries = Vec::new();
+    return;
+}
+
+// ---------- iterator refusals, map[i64]i64 ----------
+//
+// maps.All / Insert / Collect (iter.go) are iterator
+// surface with no SLA spelling (seam (a)). These stubs
+// panic 77443 if ever emitted; the frontend must
+// refuse those call sites.
+
+// maps.All(m) iter.Seq2[K, V]: no iterator surface.
+fn go_maps_all_i64_i64(m: &GoMapsI64I64) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Insert(m, seq): no iterator surface.
+fn go_maps_insert_i64_i64(m: &GoMapsI64I64) -> void {
+    let _m = m;
+    panic(77443);
+}
+
+// maps.Collect(seq): no iterator surface.
+fn go_maps_collect_i64_i64() -> GoMapsI64I64 {
+    panic(77443);
+}

@@ -1,0 +1,159 @@
+// gostd hash/crc32: the SLA-side model of Go's
+// hash/crc32 package. CRC32 state is a u64 holding
+// a 32-bit value (SLA has no u32 type); every step
+// keeps the 32-bit masking invariant, and u64
+// arithmetic wraps mod 2^64 (probed). The table is
+// a Vec<u64> of 256 entries, built by MakeTable
+// from the reversed polynomial.
+//
+// Go's digest stores the FINALISED crc (the
+// update function inverts at both ends, exactly
+// as in Go's crc32.go), so Sum32 is the stored
+// value and Reset sets it to 0. New(tab) in Go
+// takes a *Table; gostd takes the table value, so
+// there is no nil-table case (Go panics on first
+// Write with a nil table; gostd has no such path).
+//
+// Polynomials (reversed form, as Go's MakeTable
+// takes them):
+//   IEEE       0xedb88320 = 3988292384
+//   Castagnoli 0x82f63b78 = 2197175160
+//   Koopman    0xeb31d82e = 3949012510
+//
+// No panic codes in this file.
+
+const GO_CRC32_SIZE: i64 = 4;
+const GO_CRC32_IEEE: u64 = 3988292384;
+const GO_CRC32_CASTAGNOLI: u64 = 2197175160;
+const GO_CRC32_KOOPMAN: u64 = 3949012510;
+
+struct GosCRC32 {
+    tab: Vec<u64>,
+    crc: u64,
+}
+
+// MakeTable(poly): the 256-entry table. The
+// polynomial is the reversed form.
+fn go_crc32_make_table(poly: u64) -> Vec<u64> {
+    let t = Vec::new();
+    let i = 0;
+    while i < 256 {
+        let crc = i as u64;
+        let j = 0;
+        while j < 8 {
+            if (crc & (1 as u64)) == (1 as u64) {
+                crc = (crc >> 1) ^ poly;
+            } else {
+                crc = crc >> 1;
+            };
+            j = j + 1;
+        }
+        t.push(crc);
+        i = i + 1;
+    }
+    return t;
+}
+
+// The IEEE / Castagnoli / Koopman tables.
+fn go_crc32_ieee_table() -> Vec<u64> {
+    return go_crc32_make_table((3988292384 as u64));
+}
+
+fn go_crc32_castagnoli_table() -> Vec<u64> {
+    return go_crc32_make_table((2197175160 as u64));
+}
+
+fn go_crc32_koopman_table() -> Vec<u64> {
+    return go_crc32_make_table((3949012510 as u64));
+}
+
+// update: Go's crc32.update -- invert, run the
+// table loop, invert back. Takes and returns the
+// FINALISED crc (the digest's stored value).
+fn go_crc32_update(crc: u64, tab: Vec<u64>, p: Vec<u8>) -> u64 {
+    let c = crc ^ (4294967295 as u64);
+    let i = 0;
+    while i < len(p) {
+        let idx = (c & (255 as u64)) ^ (p[i] as u64);
+        c = tab[idx] ^ (c >> 8);
+        i = i + 1;
+    }
+    return c ^ (4294967295 as u64);
+}
+
+// Checksum(data, tab) uint32
+fn go_crc32_checksum(data: Vec<u8>, tab: Vec<u64>) -> u64 {
+    return go_crc32_update((0 as u64), tab, data);
+}
+
+// ChecksumIEEE(data) uint32
+fn go_crc32_checksum_ieee(data: Vec<u8>) -> u64 {
+    return go_crc32_update((0 as u64), go_crc32_ieee_table(), data);
+}
+
+// New(tab) *digest
+fn go_crc32_new(tab: Vec<u64>) -> GosCRC32 {
+    return GosCRC32 { tab: tab, crc: (0 as u64) };
+}
+
+fn go_crc32_new_ieee() -> GosCRC32 {
+    return GosCRC32 { tab: go_crc32_ieee_table(), crc: (0 as u64) };
+}
+
+fn go_crc32_new_castagnoli() -> GosCRC32 {
+    return GosCRC32 { tab: go_crc32_castagnoli_table(), crc: (0 as u64) };
+}
+
+fn go_crc32_new_koopman() -> GosCRC32 {
+    return GosCRC32 { tab: go_crc32_koopman_table(), crc: (0 as u64) };
+}
+
+fn go_crc32_size() -> i64 {
+    return 4;
+}
+
+fn go_crc32_block_size() -> i64 {
+    return 1;
+}
+
+fn go_crc32_write(d: &GosCRC32, p: Vec<u8>) -> i64 {
+    d.crc = go_crc32_update(d.crc, d.tab, p);
+    return len(p);
+}
+
+fn go_crc32_sum32(d: &GosCRC32) -> u64 {
+    return d.crc;
+}
+
+// Sum(b): the 4 digest bytes (big endian) appended
+// to b.
+fn go_crc32_sum(d: &GosCRC32, dst: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(dst) {
+        out.push(dst[i]);
+        i = i + 1;
+    }
+    let v = d.crc;
+    out.push(((v >> 24) as u8));
+    out.push(((v >> 16) as u8));
+    out.push(((v >> 8) as u8));
+    out.push((v as u8));
+    return out;
+}
+
+fn go_crc32_reset(d: &GosCRC32) -> void {
+    d.crc = (0 as u64);
+    return;
+}
+
+// Clone: the digest is value state; a copy.
+fn go_crc32_clone(d: &GosCRC32) -> GosCRC32 {
+    let tab = Vec::new();
+    let i = 0;
+    while i < len(d.tab) {
+        tab.push(d.tab[i]);
+        i = i + 1;
+    }
+    return GosCRC32 { tab: tab, crc: d.crc };
+}

@@ -1,0 +1,501 @@
+// gostd sort: Go's sort package.
+//
+// Two cores, because Go has two shapes:
+//   - go_sort_run(n, less, swap): the index-based core.
+//     sort.Interface IS an index-based protocol (Len /
+//     Less(i,j) / Swap(i,j)), and sort.Slice's less is
+//     index-based too. The frontend wraps a user type's
+//     methods (or a slice's elements) into the two
+//     function values; gostd owns only the algorithm.
+//   - go_sort_vec<T>(v, less): the same algorithm over a
+//     Vec<T> with an element-ordering function; swaps are
+//     gostd's own. sort.Slice over a Go []T lowers to this
+//     (the frontend passes the Vec and an element less
+//     built from the user's index less), and the concrete
+//     Ints / Float64s / Strings sorts call it directly.
+// The algorithm is written twice (once per core) rather
+// than once over an abstraction SLA does not give gostd;
+// the two copies must be kept in step -- noted in
+// NOTES-runtime.md.
+//
+// Algorithm: introsort -- median-of-three quicksort,
+// insertion sort below 12 elements, heapsort when the
+// recursion depth exceeds 2*floor(log2(n)). This is the
+// pre-pdqsort Go sort.Sort shape; Go 1.19+ uses pdqsort,
+// whose observable difference is speed only, never the
+// resulting order (for a strict weak ordering less).
+// sort.Stable is a separate merge sort (go_sort_stable).
+//
+// NaN handling for Float64s follows Go exactly: NaNs sort
+// before all other values (sort.Float64s contract).
+//
+// Panic codes: none. Go's sort never panics on its own
+// inputs; a less that is not a strict weak ordering is a
+// caller bug Go leaves unspecified, and so does gostd.
+// Block 77430-77439 is reserved for this file.
+
+@import "sa_std/vec.sa"
+
+// ================= index core =================
+
+fn __go_sort_log2(n: i64) -> i64 {
+    let r = 0;
+    let x = n;
+    while x > 1 {
+        x = x / 2;
+        r = r + 1;
+    }
+    return r;
+}
+
+fn __go_sort_insertion_run(lo: i64, hi: i64, less: fn(i64, i64) -> bool, swap: fn(i64, i64) -> void) -> void {
+    let i = lo + 1;
+    while i < hi {
+        let j = i;
+        while j > lo {
+            if less(j, j - 1) {
+                swap(j, j - 1);
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_sort_sift_down_run(lo: i64, hi: i64, first: i64, less: fn(i64, i64) -> bool, swap: fn(i64, i64) -> void) -> void {
+    // Heap sift-down over indices [lo, hi), heap rooted at
+    // `first` (Go's sort heap implementation shape).
+    let root = first;
+    while true {
+        let child = 2 * (root - lo) + 1 + lo;
+        if child >= hi {
+            return;
+        };
+        let c = child;
+        if child + 1 < hi {
+            if less(child, child + 1) {
+                c = child + 1;
+            };
+        };
+        if less(root, c) {
+            swap(root, c);
+            root = c;
+        } else {
+            return;
+        }
+    }
+}
+
+fn __go_sort_heap_run(lo: i64, hi: i64, less: fn(i64, i64) -> bool, swap: fn(i64, i64) -> void) -> void {
+    let first = lo;
+    let n = hi - lo;
+    let i = n / 2 - 1;
+    while i >= 0 {
+        __go_sort_sift_down_run(lo, hi, first + i, less, swap);
+        i = i - 1;
+    }
+    let j = hi - 1;
+    while j > first {
+        swap(first, j);
+        __go_sort_sift_down_run(lo, j, first, less, swap);
+        j = j - 1;
+    }
+    return;
+}
+
+fn __go_sort_median3_run(m1: i64, m2: i64, m3: i64, less: fn(i64, i64) -> bool, swap: fn(i64, i64) -> void) -> void {
+    // Orders the three indices so less(m1<=m2<=m3) holds
+    // pairwise after swaps (Go's medianOfThree moves the
+    // median to m2 via element swaps).
+    if less(m2, m1) {
+        swap(m2, m1);
+    };
+    if less(m3, m2) {
+        swap(m3, m2);
+    };
+    if less(m2, m1) {
+        swap(m2, m1);
+    };
+    return;
+}
+
+fn __go_sort_quick_run(lo: i64, hi: i64, depth: i64, less: fn(i64, i64) -> bool, swap: fn(i64, i64) -> void) -> void {
+    let n = hi - lo;
+    if n < 12 {
+        __go_sort_insertion_run(lo, hi, less, swap);
+        return;
+    };
+    if depth <= 0 {
+        __go_sort_heap_run(lo, hi, less, swap);
+        return;
+    };
+    let mid = lo + n / 2;
+    __go_sort_median3_run(lo, mid, hi - 1, less, swap);
+    // Pivot is the median, now at mid; stash it at hi-2
+    // and Lomuto-partition [lo, hi-2) against it. The
+    // elements at lo and hi-1 are already <= / >= pivot
+    // from the median step and act as sentinels.
+    swap(mid, hi - 2);
+    let store = lo + 1;
+    let i = lo + 1;
+    while i < hi - 2 {
+        if less(i, hi - 2) {
+            swap(i, store);
+            store = store + 1;
+        };
+        i = i + 1;
+    }
+    swap(store, hi - 2);
+    __go_sort_quick_run(lo, store, depth - 1, less, swap);
+    __go_sort_quick_run(store + 1, hi, depth - 1, less, swap);
+    return;
+}
+
+// sort.Sort / sort.Slice over index-addressed data.
+fn go_sort_run(n: i64, less: fn(i64, i64) -> bool, swap: fn(i64, i64) -> void) -> void {
+    if n < 2 {
+        return;
+    };
+    __go_sort_quick_run(0, n, 2 * __go_sort_log2(n), less, swap);
+    return;
+}
+
+fn go_sort_run_is_sorted(n: i64, less: fn(i64, i64) -> bool) -> bool {
+    let i = 1;
+    while i < n {
+        if less(i, i - 1) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// sort.Search: smallest i in [0, n) with f(i) == true,
+// f monotonic (false...false true...true); n if none.
+fn go_sort_search(n: i64, f: fn(i64) -> bool) -> i64 {
+    let lo = 0;
+    let hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if f(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+// ================= Vec core =================
+
+fn __go_sort_swap_vec<T>(v: &Vec<T>, i: i64, j: i64) -> void {
+    if i == j {
+        return;
+    };
+    let tmp = v[i];
+    v[i] = v[j];
+    v[j] = tmp;
+    return;
+}
+
+fn __go_sort_insertion_vec<T>(v: &Vec<T>, lo: i64, hi: i64, less: fn(&T, &T) -> bool) -> void {
+    let i = lo + 1;
+    while i < hi {
+        let j = i;
+        while j > lo {
+            if less(&v[j], &v[j - 1]) {
+                __go_sort_swap_vec(v, j, j - 1);
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_sort_sift_down_vec<T>(v: &Vec<T>, lo: i64, hi: i64, first: i64, less: fn(&T, &T) -> bool) -> void {
+    let root = first;
+    while true {
+        let child = 2 * (root - lo) + 1 + lo;
+        if child >= hi {
+            return;
+        };
+        let c = child;
+        if child + 1 < hi {
+            if less(&v[child], &v[child + 1]) {
+                c = child + 1;
+            };
+        };
+        if less(&v[root], &v[c]) {
+            __go_sort_swap_vec(v, root, c);
+            root = c;
+        } else {
+            return;
+        }
+    }
+}
+
+fn __go_sort_heap_vec<T>(v: &Vec<T>, lo: i64, hi: i64, less: fn(&T, &T) -> bool) -> void {
+    let n = hi - lo;
+    let i = n / 2 - 1;
+    while i >= 0 {
+        __go_sort_sift_down_vec(v, lo, hi, lo + i, less);
+        i = i - 1;
+    }
+    let j = hi - 1;
+    while j > lo {
+        __go_sort_swap_vec(v, lo, j);
+        __go_sort_sift_down_vec(v, lo, j, lo, less);
+        j = j - 1;
+    }
+    return;
+}
+
+fn __go_sort_median3_vec<T>(v: &Vec<T>, m1: i64, m2: i64, m3: i64, less: fn(&T, &T) -> bool) -> void {
+    if less(&v[m2], &v[m1]) {
+        __go_sort_swap_vec(v, m2, m1);
+    };
+    if less(&v[m3], &v[m2]) {
+        __go_sort_swap_vec(v, m3, m2);
+    };
+    if less(&v[m2], &v[m1]) {
+        __go_sort_swap_vec(v, m2, m1);
+    };
+    return;
+}
+
+fn __go_sort_quick_vec<T>(v: &Vec<T>, lo: i64, hi: i64, depth: i64, less: fn(&T, &T) -> bool) -> void {
+    let n = hi - lo;
+    if n < 12 {
+        __go_sort_insertion_vec(v, lo, hi, less);
+        return;
+    };
+    if depth <= 0 {
+        __go_sort_heap_vec(v, lo, hi, less);
+        return;
+    };
+    let mid = lo + n / 2;
+    __go_sort_median3_vec(v, lo, mid, hi - 1, less);
+    __go_sort_swap_vec(v, mid, hi - 2);
+    let store = lo + 1;
+    let i = lo + 1;
+    while i < hi - 2 {
+        if less(&v[i], &v[hi - 2]) {
+            __go_sort_swap_vec(v, i, store);
+            store = store + 1;
+        };
+        i = i + 1;
+    }
+    __go_sort_swap_vec(v, store, hi - 2);
+    __go_sort_quick_vec(v, lo, store, depth - 1, less);
+    __go_sort_quick_vec(v, store + 1, hi, depth - 1, less);
+    return;
+}
+
+// sort.Slice / sort.Sort over a Vec-backed Go slice.
+fn go_sort_vec<T>(v: &Vec<T>, less: fn(&T, &T) -> bool) -> void {
+    let n = len(v);
+    if n < 2 {
+        return;
+    };
+    __go_sort_quick_vec(v, 0, n, 2 * __go_sort_log2(n), less);
+    return;
+}
+
+fn go_sort_vec_is_sorted<T>(v: &Vec<T>, less: fn(&T, &T) -> bool) -> bool {
+    let n = len(v);
+    let i = 1;
+    while i < n {
+        if less(&v[i], &v[i - 1]) {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- stable sort (merge sort over a scratch copy) ----
+
+fn __go_sort_merge_vec<T>(v: &Vec<T>, scratch: &Vec<T>, lo: i64, mid: i64, hi: i64, less: fn(&T, &T) -> bool) -> void {
+    let i = lo;
+    let j = mid;
+    let k = lo;
+    while i < mid {
+        if j >= hi {
+            scratch[k] = v[i];
+            i = i + 1;
+            k = k + 1;
+        } else {
+            if less(&v[j], &v[i]) {
+                scratch[k] = v[j];
+                j = j + 1;
+                k = k + 1;
+            } else {
+                // Ties take from the left run: stability.
+                scratch[k] = v[i];
+                i = i + 1;
+                k = k + 1;
+            };
+        }
+    }
+    while j < hi {
+        scratch[k] = v[j];
+        j = j + 1;
+        k = k + 1;
+    }
+    let t = lo;
+    while t < hi {
+        v[t] = scratch[t];
+        t = t + 1;
+    }
+    return;
+}
+
+fn __go_sort_stable_rec<T>(v: &Vec<T>, scratch: &Vec<T>, lo: i64, hi: i64, less: fn(&T, &T) -> bool) -> void {
+    if hi - lo < 2 {
+        return;
+    };
+    let mid = lo + (hi - lo) / 2;
+    __go_sort_stable_rec(v, scratch, lo, mid, less);
+    __go_sort_stable_rec(v, scratch, mid, hi, less);
+    __go_sort_merge_vec(v, scratch, lo, mid, hi, less);
+    return;
+}
+
+// sort.Stable over a Vec-backed Go slice. T must be
+// copyable into the scratch Vec (same requirement the
+// frontend's Vec surface already imposes on elements).
+fn go_sort_stable<T>(v: &Vec<T>, less: fn(&T, &T) -> bool) -> void {
+    let n = len(v);
+    if n < 2 {
+        return;
+    };
+    let scratch: Vec<T> = Vec::new();
+    let i = 0;
+    while i < n {
+        scratch.push(v[i]);
+        i = i + 1;
+    }
+    __go_sort_stable_rec(v, &scratch, 0, n, less);
+    return;
+}
+
+// ================= concrete sorts =================
+
+fn __go_less_i64(a: &i64, b: &i64) -> bool {
+    return *a < *b;
+}
+
+fn go_sort_ints(v: &Vec<i64>) -> void {
+    go_sort_vec(v, __go_less_i64);
+    return;
+}
+
+fn go_sort_ints_are_sorted(v: &Vec<i64>) -> bool {
+    return go_sort_vec_is_sorted(v, __go_less_i64);
+}
+
+fn __go_less_f64(a: &f64, b: &f64) -> bool {
+    let x = *a;
+    let y = *b;
+    // Go sort.Float64s: NaN sorts before everything,
+    // including -Inf; two NaNs are equal.
+    if x != x {
+        return y == y;
+    };
+    if y != y {
+        return false;
+    };
+    return x < y;
+}
+
+fn go_sort_float64s(v: &Vec<f64>) -> void {
+    go_sort_vec(v, __go_less_f64);
+    return;
+}
+
+fn go_sort_float64s_are_sorted(v: &Vec<f64>) -> bool {
+    return go_sort_vec_is_sorted(v, __go_less_f64);
+}
+
+fn __go_less_bytes(a: &Vec<u8>, b: &Vec<u8>) -> bool {
+    // Byte-wise lexicographic, Go's string < exactly
+    // (gostd strings are Vec<u8>; see NOTES-text.md).
+    let nx = len(a);
+    let ny = len(b);
+    let n = nx;
+    if ny < n {
+        n = ny;
+    };
+    let i = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        };
+        i = i + 1;
+    }
+    return nx < ny;
+}
+
+fn go_sort_strings(v: &Vec<Vec<u8>>) -> void {
+    go_sort_vec(v, __go_less_bytes);
+    return;
+}
+
+fn go_sort_strings_are_sorted(v: &Vec<Vec<u8>>) -> bool {
+    return go_sort_vec_is_sorted(v, __go_less_bytes);
+}
+
+// ================= concrete searches =================
+//
+// Go's SearchInts / SearchStrings / SearchFloat64s return
+// the insertion index in a SORTED slice (and callers test
+// membership themselves); these mirror that contract.
+
+fn go_sort_search_ints(v: &Vec<i64>, x: i64) -> i64 {
+    let lo = 0;
+    let hi = len(v);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if v[mid] < x {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn go_sort_search_strings(v: &Vec<Vec<u8>>, x: Vec<u8>) -> i64 {
+    let lo = 0;
+    let hi = len(v);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if __go_less_bytes(&v[mid], &x) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn go_sort_search_float64s(v: &Vec<f64>, x: f64) -> i64 {
+    let lo = 0;
+    let hi = len(v);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if __go_less_f64(&v[mid], &x) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}

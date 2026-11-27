@@ -1,0 +1,1367 @@
+// gostd fmt: the SLA-side model of Go's fmt package.
+// Organisation follows the psa_std precedent: public
+// entry points go_<pkg>_<name>, private helpers
+// __go_<pkg>_<name>, panic codes listed up front.
+//
+// Panic codes (gostd block 77400-77499):
+//   77446  a Stringer value was formatted but the
+//          program's go_stringer_dispatch does not
+//          know its dispatch id (raised by the
+//          frontend-emitted dispatch function, which
+//          gostd calls -- see the contract below)
+//   77447  internal fmt state error (defensive; no
+//          gostd path is expected to reach it)
+// (Codes renumbered from an initial 77430/77431 to
+// stay clear of the sort block in the whole-library
+// map in NOTES-runtime.md -- see NOTES-text.md.)
+//
+// THE VALUE CONTRACT (see NOTES-text.md for the full
+// statement). gosla passes every Go value that can
+// reach a fmt call as a GosVal:
+//
+//   tag 0   nil           (no payload)
+//   tag 1   bool          i = 0/1
+//   tag 2   int           i = the value (all Go int
+//                         widths arrive pre-extended
+//                         to i64 by the frontend)
+//   tag 3   uint          u = the value
+//   tag 4   float         f = the value (float32
+//                         arrives pre-widened to f64)
+//   tag 5   string        s = the bytes
+//   tag 6   []byte        s = the bytes
+//   tag 7   error         err = the GosError ptr
+//   tag 8   Stringer      i = dispatch id, u = data
+//                         handle (see below)
+//   tag 9   pointer       u = the address value
+//   tag 10  slice/array   items = the elements
+//   tag 11  map           items = flattened
+//                         k, v, k, v, ... (gostd
+//                         sorts by key for output,
+//                         like Go)
+//   tag 12  struct        items = the fields,
+//                         names = the field names
+//                         (parallel to items; used
+//                         by %+v)
+//
+// STRINGER CONTRACT: the frontend emits, once per
+// program, `fn go_stringer_dispatch(id: i64,
+// data: u64) -> Vec<u8>` returning the String()
+// bytes for the (id, data) pair; a program with no
+// Stringer types emits a stub that panics 77446.
+// gostd calls it for tag 8. %#v of a Stringer uses
+// the same string (Go prints Go-syntax of the
+// underlying value, which gostd cannot see --
+// documented divergence).
+//
+// STDOUT CONTRACT: Print/Printf/Println write through
+// `fn go_host_write_stdout(b: Vec<u8>) -> void`,
+// also emitted once per program by the frontend.
+// Fprintf's writer is modelled as a *GosBuilder
+// (strings.sla), gostd's growable byte buffer.
+
+struct GosVal {
+    tag: i64,
+    i: i64,
+    u: u64,
+    f: f64,
+    s: Vec<u8>,
+    items: Vec<GosVal>,
+    names: Vec<Vec<u8>>,
+    err: ptr,
+}
+
+fn __go_val_blank() -> GosVal {
+    return GosVal {
+        tag: 0,
+        i: 0,
+        u: 0 as u64,
+        f: 0.0,
+        s: Vec::new(),
+        items: Vec::new(),
+        names: Vec::new(),
+        err: go_errors_nil(),
+    };
+}
+
+fn go_val_nil() -> GosVal {
+    return __go_val_blank();
+}
+
+fn go_val_bool(v: bool) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 1;
+    if v { g.i = 1; };
+    return g;
+}
+
+fn go_val_int(v: i64) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 2;
+    g.i = v;
+    return g;
+}
+
+fn go_val_uint(v: u64) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 3;
+    g.u = v;
+    return g;
+}
+
+fn go_val_float(v: f64) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 4;
+    g.f = v;
+    return g;
+}
+
+fn go_val_string(v: Vec<u8>) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 5;
+    g.s = v;
+    return g;
+}
+
+fn go_val_bytes(v: Vec<u8>) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 6;
+    g.s = v;
+    return g;
+}
+
+fn go_val_error(e: ptr) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 7;
+    g.err = e;
+    return g;
+}
+
+fn go_val_stringer(dispatch_id: i64, data: u64) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 8;
+    g.i = dispatch_id;
+    g.u = data;
+    return g;
+}
+
+fn go_val_pointer(addr: u64) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 9;
+    g.u = addr;
+    return g;
+}
+
+fn go_val_slice(items: Vec<GosVal>) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 10;
+    g.items = items;
+    return g;
+}
+
+fn go_val_map(items: Vec<GosVal>) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 11;
+    g.items = items;
+    return g;
+}
+
+fn go_val_struct(items: Vec<GosVal>, names: Vec<Vec<u8>>) -> GosVal {
+    let g = __go_val_blank();
+    g.tag = 12;
+    g.items = items;
+    g.names = names;
+    return g;
+}
+
+// ---------- format state ----------
+
+// One formatting run. out accumulates the result;
+// argi is the next sequential argument index; wlist
+// collects the errors consumed by %w verbs (Errorf
+// only).
+struct GosFmt {
+    out: Vec<u8>,
+    argi: i64,
+    wlist: Vec<ptr>,
+}
+
+fn __go_fmt_new_state() -> GosFmt {
+    return GosFmt { out: Vec::new(), argi: 0, wlist: Vec::new() };
+}
+
+// Flag bits in GoSpec.flags.
+fn __go_fmt_flag_plus() -> i64 { return 1; }
+fn __go_fmt_flag_minus() -> i64 { return 2; }
+fn __go_fmt_flag_sharp() -> i64 { return 4; }
+fn __go_fmt_flag_space() -> i64 { return 8; }
+fn __go_fmt_flag_zero() -> i64 { return 16; }
+
+fn __go_fmt_has(flags: i64, bit: i64) -> bool {
+    return (flags / bit) % 2 == 1;
+}
+
+// A parsed verb specification: %[flags][width][.prec]verb
+// width/prec of -1 mean "not specified".
+struct GoSpec {
+    flags: i64,
+    width: i64,
+    prec: i64,
+    verb: i64,
+}
+
+// ---------- byte helpers ----------
+
+fn __go_fmt_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+fn __go_fmt_lit_nil() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(60u8); s.push(110u8); s.push(105u8); s.push(108u8); s.push(62u8);
+    return s;
+}
+
+fn __go_fmt_lit_true() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(116u8); s.push(114u8); s.push(117u8); s.push(101u8);
+    return s;
+}
+
+fn __go_fmt_lit_false() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(102u8); s.push(97u8); s.push(108u8); s.push(115u8); s.push(101u8);
+    return s;
+}
+
+fn __go_fmt_lit_missing() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(77u8); s.push(73u8); s.push(83u8); s.push(83u8); s.push(73u8);
+    s.push(78u8); s.push(71u8);
+    return s;
+}
+
+fn __go_fmt_lit_noverb() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(78u8); s.push(79u8); s.push(86u8); s.push(69u8); s.push(82u8);
+    s.push(66u8);
+    return s;
+}
+
+fn __go_fmt_lit_extra() -> Vec<u8> {
+    let s = Vec::new();
+    s.push(69u8); s.push(88u8); s.push(84u8); s.push(82u8); s.push(65u8);
+    return s;
+}
+
+// Type names as Go's fmt prints them in bad-verb and
+// EXTRA tokens. gostd's tags do not carry Go type
+// identity beyond the shapes below, so these are the
+// canonical approximations (NOTES-text.md): a tag-2
+// value reports "int" whatever its Go width was, a
+// tag-9 pointer reports "ptr" (Go would print the
+// pointed-to type), slices/maps/structs report their
+// kind word.
+fn __go_fmt_type_name(tag: i64) -> Vec<u8> {
+    let s = Vec::new();
+    if tag == 0 { return __go_fmt_lit_nil(); };
+    if tag == 1 {
+        s.push(98u8); s.push(111u8); s.push(111u8); s.push(108u8);
+        return s;
+    };
+    if tag == 2 {
+        s.push(105u8); s.push(110u8); s.push(116u8);
+        return s;
+    };
+    if tag == 3 {
+        s.push(117u8); s.push(105u8); s.push(110u8); s.push(116u8);
+        return s;
+    };
+    if tag == 4 {
+        s.push(102u8); s.push(108u8); s.push(111u8); s.push(97u8);
+        s.push(116u8); s.push(54u8); s.push(52u8);
+        return s;
+    };
+    if tag == 5 {
+        s.push(115u8); s.push(116u8); s.push(114u8); s.push(105u8);
+        s.push(110u8); s.push(103u8);
+        return s;
+    };
+    if tag == 6 {
+        s.push(91u8); s.push(93u8); s.push(98u8); s.push(121u8);
+        s.push(116u8); s.push(101u8);
+        return s;
+    };
+    if tag == 7 {
+        s.push(101u8); s.push(114u8); s.push(114u8); s.push(111u8);
+        s.push(114u8);
+        return s;
+    };
+    if tag == 8 {
+        s.push(83u8); s.push(116u8); s.push(114u8); s.push(105u8);
+        s.push(110u8); s.push(103u8); s.push(101u8); s.push(114u8);
+        return s;
+    };
+    if tag == 9 {
+        s.push(112u8); s.push(116u8); s.push(114u8);
+        return s;
+    };
+    if tag == 10 {
+        s.push(115u8); s.push(108u8); s.push(105u8); s.push(99u8);
+        s.push(101u8);
+        return s;
+    };
+    if tag == 11 {
+        s.push(109u8); s.push(97u8); s.push(112u8);
+        return s;
+    };
+    s.push(115u8); s.push(116u8); s.push(114u8); s.push(117u8);
+    s.push(99u8); s.push(116u8);
+    return s;
+}
+
+// Is this tag a "string" for Sprint's space rule?
+// Go adds spaces between two operands when neither
+// is a string; []byte and Stringer do not count.
+fn __go_fmt_is_string_tag(tag: i64) -> bool {
+    return tag == 5;
+}
+
+// ---------- rendered fragments ----------
+
+// A formatted argument before width padding: a sign /
+// base prefix (which zero padding must not precede),
+// the body, and whether the 0 flag may pad with zeros
+// (numeric bodies only, and not when precision was
+// given for integers -- Go's rule).
+struct GoRendered {
+    prefix: Vec<u8>,
+    body: Vec<u8>,
+    zero_ok: bool,
+}
+
+fn __go_fmt_plain(body: Vec<u8>) -> GoRendered {
+    return GoRendered { prefix: Vec::new(), body: body, zero_ok: false };
+}
+
+// Write a rendered fragment into the output,
+// applying width and flags.
+fn __go_fmt_emit(st: &GosFmt, r: GoRendered, spec: GoSpec) -> void {
+    let total = len(r.prefix) + len(r.body);
+    if spec.width > total {
+        let padn = spec.width - total;
+        if __go_fmt_has(spec.flags, __go_fmt_flag_minus()) {
+            __go_fmt_append(st.out, r.prefix);
+            __go_fmt_append(st.out, r.body);
+            let k = 0;
+            while k < padn { st.out.push(32u8); k = k + 1; }
+            return;
+        };
+        if __go_fmt_has(spec.flags, __go_fmt_flag_zero()) {
+            if r.zero_ok {
+                __go_fmt_append(st.out, r.prefix);
+                let k = 0;
+                while k < padn { st.out.push(48u8); k = k + 1; }
+                __go_fmt_append(st.out, r.body);
+                return;
+            };
+        };
+        let k = 0;
+        while k < padn { st.out.push(32u8); k = k + 1; }
+        __go_fmt_append(st.out, r.prefix);
+        __go_fmt_append(st.out, r.body);
+        return;
+    };
+    __go_fmt_append(st.out, r.prefix);
+    __go_fmt_append(st.out, r.body);
+    return;
+}
+
+// ---------- %v rendering (recursive) ----------
+
+fn __go_fmt_bytes_less(a: Vec<u8>, b: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(a) {
+        if i >= len(b) { return false; };
+        if a[i] != b[i] { return a[i] < b[i]; };
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+
+// Key ordering for map output: Go sorts keys with
+// numeric order for numeric kinds, byte order for
+// strings, and (for other kinds) the rendered form.
+fn __go_fmt_key_less(a: GosVal, b: GosVal) -> bool {
+    if a.tag == 2 {
+        if b.tag == 2 { return a.i < b.i; };
+        if b.tag == 3 {
+            if a.i < 0 { return true; };
+            return (a.i as u64) < b.u;
+        };
+    };
+    if a.tag == 3 {
+        if b.tag == 3 { return a.u < b.u; };
+        if b.tag == 2 {
+            if b.i < 0 { return false; };
+            return a.u < (b.i as u64);
+        };
+    };
+    if a.tag == 4 {
+        if b.tag == 4 { return a.f < b.f; };
+    };
+    if a.tag == 5 {
+        if b.tag == 5 { return __go_fmt_bytes_less(a.s, b.s); };
+    };
+    let ra = __go_fmt_render_v(a, false, false);
+    let rb = __go_fmt_render_v(b, false, false);
+    return __go_fmt_bytes_less(ra, rb);
+}
+
+// Copy of a map's flattened items, insertion-sorted
+// by key (pairwise: even indices are keys).
+fn __go_fmt_sorted_pairs(items: Vec<GosVal>) -> Vec<GosVal> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(items) {
+        out.push(items[i]);
+        i = i + 1;
+    }
+    let n = len(out) / 2;
+    let a = 1;
+    while a < n {
+        let b = a;
+        while b > 0 {
+            let k1 = out[(b - 1) * 2];
+            let k2 = out[b * 2];
+            if !__go_fmt_key_less(k2, k1) { break; };
+            out[b * 2] = k1;
+            out[(b - 1) * 2] = k2;
+            let v1 = out[(b - 1) * 2 + 1];
+            let v2 = out[b * 2 + 1];
+            out[b * 2 + 1] = v1;
+            out[(b - 1) * 2 + 1] = v2;
+            b = b - 1;
+        }
+        a = a + 1;
+    }
+    return out;
+}
+
+// The default (%v) rendering of a value. plus/sharp
+// carry the + and # flags into compound values, as
+// Go does.
+fn __go_fmt_render_v(v: GosVal, plus: bool, sharp: bool) -> Vec<u8> {
+    if v.tag == 0 { return __go_fmt_lit_nil(); };
+    if v.tag == 1 {
+        if v.i != 0 { return __go_fmt_lit_true(); };
+        return __go_fmt_lit_false();
+    };
+    if v.tag == 2 { return go_strconv_format_int(v.i, 10); };
+    if v.tag == 3 { return go_strconv_format_uint(v.u, 10); };
+    if v.tag == 4 { return go_strconv_format_float(v.f, 103, -1, 64); };
+    if v.tag == 5 { return v.s; };
+    if v.tag == 6 {
+        // Go prints []byte under %v as a decimal list
+        let out = Vec::new();
+        out.push(91u8);
+        let i = 0;
+        while i < len(v.s) {
+            if i > 0 { out.push(32u8); };
+            __go_fmt_append(out, go_strconv_format_uint(v.s[i] as u64, 10));
+            i = i + 1;
+        }
+        out.push(93u8);
+        return out;
+    };
+    if v.tag == 7 {
+        if v.err == go_errors_nil() { return __go_fmt_lit_nil(); };
+        return go_errors_error_string(v.err);
+    };
+    if v.tag == 8 { return go_stringer_dispatch(v.i, v.u); };
+    if v.tag == 9 {
+        let out = Vec::new();
+        out.push(48u8); out.push(120u8);
+        __go_fmt_append(out, go_strconv_format_uint(v.u, 16));
+        return out;
+    };
+    if v.tag == 10 {
+        let out = Vec::new();
+        out.push(91u8);
+        let i = 0;
+        while i < len(v.items) {
+            if i > 0 { out.push(32u8); };
+            __go_fmt_append(out, __go_fmt_render_v(v.items[i], plus, sharp));
+            i = i + 1;
+        }
+        out.push(93u8);
+        return out;
+    };
+    if v.tag == 11 {
+        let pairs = __go_fmt_sorted_pairs(v.items);
+        let out = Vec::new();
+        out.push(109u8); out.push(97u8); out.push(112u8); out.push(91u8);
+        let i = 0;
+        while i + 1 < len(pairs) {
+            if i > 0 { out.push(32u8); };
+            __go_fmt_append(out, __go_fmt_render_v(pairs[i], plus, sharp));
+            out.push(58u8);
+            __go_fmt_append(out, __go_fmt_render_v(pairs[i + 1], plus, sharp));
+            i = i + 2;
+        }
+        out.push(93u8);
+        return out;
+    };
+    // tag 12: struct
+    let out = Vec::new();
+    out.push(123u8);
+    let i = 0;
+    while i < len(v.items) {
+        if i > 0 { out.push(32u8); };
+        if plus {
+            if i < len(v.names) {
+                __go_fmt_append(out, v.names[i]);
+                out.push(58u8);
+            };
+        };
+        __go_fmt_append(out, __go_fmt_render_v(v.items[i], plus, sharp));
+        i = i + 1;
+    }
+    out.push(125u8);
+    return out;
+}
+
+// %#v rendering. Go prints Go-syntax source, which
+// needs type names gostd does not carry; this is the
+// documented approximation: scalars in their natural
+// Go-syntax form, compounds bracketed with ", "
+// separators, no type names.
+fn __go_fmt_render_sharp(v: GosVal) -> Vec<u8> {
+    if v.tag == 5 { return go_strconv_quote(v.s); };
+    if v.tag == 6 {
+        let out = Vec::new();
+        out.push(91u8); out.push(93u8); out.push(98u8); out.push(121u8);
+        out.push(116u8); out.push(101u8); out.push(123u8);
+        let i = 0;
+        while i < len(v.s) {
+            if i > 0 { out.push(44u8); out.push(32u8); };
+            out.push(48u8); out.push(120u8);
+            __go_fmt_append(out, go_strconv_format_uint(v.s[i] as u64, 16));
+            i = i + 1;
+        }
+        out.push(125u8);
+        return out;
+    };
+    if v.tag == 7 {
+        if v.err == go_errors_nil() { return __go_fmt_lit_nil(); };
+        return go_strconv_quote(go_errors_error_string(v.err));
+    };
+    if v.tag == 10 {
+        let out = Vec::new();
+        out.push(91u8);
+        let i = 0;
+        while i < len(v.items) {
+            if i > 0 { out.push(44u8); out.push(32u8); };
+            __go_fmt_append(out, __go_fmt_render_sharp(v.items[i]));
+            i = i + 1;
+        }
+        out.push(93u8);
+        return out;
+    };
+    if v.tag == 11 {
+        let pairs = __go_fmt_sorted_pairs(v.items);
+        let out = Vec::new();
+        out.push(109u8); out.push(97u8); out.push(112u8); out.push(91u8);
+        let i = 0;
+        while i + 1 < len(pairs) {
+            if i > 0 { out.push(44u8); out.push(32u8); };
+            __go_fmt_append(out, __go_fmt_render_sharp(pairs[i]));
+            out.push(58u8);
+            __go_fmt_append(out, __go_fmt_render_sharp(pairs[i + 1]));
+            i = i + 2;
+        }
+        out.push(93u8);
+        return out;
+    };
+    if v.tag == 12 {
+        let out = Vec::new();
+        out.push(123u8);
+        let i = 0;
+        while i < len(v.items) {
+            if i > 0 { out.push(44u8); out.push(32u8); };
+            __go_fmt_append(out, __go_fmt_render_sharp(v.items[i]));
+            i = i + 1;
+        }
+        out.push(125u8);
+        return out;
+    };
+    return __go_fmt_render_v(v, false, true);
+}
+
+// ---------- bad verbs ----------
+
+// Go's error token for a verb that does not apply:
+// %!verb(type=value), %!verb(MISSING), %!verb(<nil>).
+fn __go_fmt_bad_text(verb: i64, v: GosVal, has: bool) -> Vec<u8> {
+    let out = Vec::new();
+    out.push(37u8);
+    out.push(33u8);
+    out.push(verb as u8);
+    out.push(40u8);
+    if !has {
+        __go_fmt_append(out, __go_fmt_lit_missing());
+    } else {
+        if v.tag == 0 {
+            __go_fmt_append(out, __go_fmt_lit_nil());
+        } else {
+            if v.tag == 7 {
+                if v.err == go_errors_nil() {
+                    // Go prints %!w(<nil>) / %!v(<nil>)
+                    // with no type= prefix
+                    __go_fmt_append(out, __go_fmt_lit_nil());
+                    out.push(41u8);
+                    return out;
+                };
+            };
+            __go_fmt_append(out, __go_fmt_type_name(v.tag));
+            out.push(61u8);
+            __go_fmt_append(out, __go_fmt_render_v(v, false, false));
+        };
+    };
+    out.push(41u8);
+    return out;
+}
+
+fn __go_fmt_noverb_text() -> Vec<u8> {
+    let out = Vec::new();
+    out.push(37u8);
+    out.push(33u8);
+    out.push(40u8);
+    __go_fmt_append(out, __go_fmt_lit_noverb());
+    out.push(41u8);
+    return out;
+}
+
+// ---------- scalar verb renderers ----------
+
+fn __go_fmt_abs_u64(v: i64) -> u64 {
+    if v >= 0 { return v as u64; };
+    return ((0 - (v + 1)) as u64) + 1;
+}
+
+fn __go_fmt_upper_bytes(b: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(b) {
+        let c = b[i] as i64;
+        if c >= 97 {
+            if c <= 122 {
+                out.push((c - 32) as u8);
+                i = i + 1;
+                continue;
+            };
+        };
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __go_fmt_hex_encode(b: Vec<u8>, upper: bool) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(b) {
+        let hi = (b[i] as i64) / 16;
+        let lo = (b[i] as i64) % 16;
+        let c1 = __go_sc_hex_lower(hi) as i64;
+        let c2 = __go_sc_hex_lower(lo) as i64;
+        if upper {
+            if c1 >= 97 { c1 = c1 - 32; };
+            if c2 >= 97 { c2 = c2 - 32; };
+        };
+        out.push(c1 as u8);
+        out.push(c2 as u8);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Truncate to at most n bytes without splitting a
+// rune (Go's %s precision rule). n < 0: no truncation.
+fn __go_fmt_truncate(s: Vec<u8>, n: i64) -> Vec<u8> {
+    if n < 0 { return s; };
+    if len(s) <= n { return s; };
+    let acc = 0;
+    let i = 0;
+    while i < len(s) {
+        let d = __go_utf8_decode(s, i);
+        if acc + d.size > n { break; };
+        acc = acc + d.size;
+        i = i + d.size;
+    }
+    let out = Vec::new();
+    let k = 0;
+    while k < acc {
+        out.push(s[k]);
+        k = k + 1;
+    }
+    return out;
+}
+
+// Integer verbs over a magnitude + sign. Handles
+// d, b, o, O, x, X (and v as d). Precision is the
+// minimum digit count; the 0 flag is suppressed when
+// precision is present, per Go.
+fn __go_fmt_int_render(mag: u64, neg: bool, spec: GoSpec) -> GoRendered {
+    let base = 10;
+    if spec.verb == 98 { base = 2; };
+    if spec.verb == 111 { base = 8; };
+    if spec.verb == 79 { base = 8; };
+    if spec.verb == 120 { base = 16; };
+    if spec.verb == 88 { base = 16; };
+    let digits = go_strconv_format_uint(mag, base);
+    if spec.verb == 88 { digits = __go_fmt_upper_bytes(digits); };
+    if spec.prec >= 0 {
+        if mag == 0 {
+            if spec.prec == 0 { digits = Vec::new(); };
+        };
+        while len(digits) < spec.prec {
+            let nd = Vec::new();
+            nd.push(48u8);
+            __go_fmt_append(nd, digits);
+            digits = nd;
+        }
+    };
+    let prefix = Vec::new();
+    if neg { prefix.push(45u8); };
+    if !neg {
+        if __go_fmt_has(spec.flags, __go_fmt_flag_plus()) { prefix.push(43u8); };
+        if __go_fmt_has(spec.flags, __go_fmt_flag_space()) {
+            if !__go_fmt_has(spec.flags, __go_fmt_flag_plus()) { prefix.push(32u8); };
+        };
+    };
+    if spec.verb == 79 {
+        prefix.push(48u8); prefix.push(111u8);
+    };
+    if __go_fmt_has(spec.flags, __go_fmt_flag_sharp()) {
+        if spec.verb == 120 { prefix.push(48u8); prefix.push(120u8); };
+        if spec.verb == 88 { prefix.push(48u8); prefix.push(88u8); };
+        if spec.verb == 98 { prefix.push(48u8); prefix.push(98u8); };
+        if spec.verb == 111 {
+            if len(digits) == 0 {
+                prefix.push(48u8);
+            } else {
+                if digits[0] != 48 { prefix.push(48u8); };
+            };
+        };
+    };
+    let zero_ok = true;
+    if spec.prec >= 0 { zero_ok = false; };
+    return GoRendered { prefix: prefix, body: digits, zero_ok: zero_ok };
+}
+
+// %c and %U over a rune value.
+fn __go_fmt_rune_render(r: i64, spec: GoSpec) -> GoRendered {
+    if spec.verb == 85 {
+        // %U: U+XXXX, at least four hex digits
+        let body = Vec::new();
+        body.push(85u8); body.push(43u8);
+        let rr = r;
+        if rr < 0 { rr = 65533; };
+        if rr > 1114111 { rr = 65533; };
+        let hex = __go_fmt_upper_bytes(go_strconv_format_uint(rr as u64, 16));
+        let k = len(hex);
+        while k < 4 { body.push(48u8); k = k + 1; }
+        __go_fmt_append(body, hex);
+        if __go_fmt_has(spec.flags, __go_fmt_flag_sharp()) {
+            if __go_sc_is_print(rr) {
+                body.push(32u8);
+                __go_fmt_append(body, go_strconv_quote_rune(rr));
+            };
+        };
+        return __go_fmt_plain(body);
+    };
+    // %c: the rune itself, UTF-8 encoded (invalid
+    // values encode as U+FFFD through __go_utf8_append)
+    let body = Vec::new();
+    __go_utf8_append(body, r);
+    return __go_fmt_plain(body);
+}
+
+fn __go_fmt_int_arg(v: i64, spec: GoSpec) -> GoRendered {
+    if spec.verb == 118 { spec.verb = 100; };
+    if spec.verb == 99 { return __go_fmt_rune_render(v, spec); };
+    if spec.verb == 85 { return __go_fmt_rune_render(v, spec); };
+    if spec.verb == 113 { return __go_fmt_plain(go_strconv_quote_rune(v)); };
+    if spec.verb == 100 || spec.verb == 98 || spec.verb == 111 || spec.verb == 79 || spec.verb == 120 || spec.verb == 88 {
+        let neg = v < 0;
+        return __go_fmt_int_render(__go_fmt_abs_u64(v), neg, spec);
+    };
+    return __go_fmt_plain(__go_fmt_bad_text(spec.verb, go_val_int(v), true));
+}
+
+fn __go_fmt_uint_arg(u: u64, spec: GoSpec) -> GoRendered {
+    if spec.verb == 118 { spec.verb = 100; };
+    if spec.verb == 99 { return __go_fmt_rune_render(u as i64, spec); };
+    if spec.verb == 85 { return __go_fmt_rune_render(u as i64, spec); };
+    if spec.verb == 113 { return __go_fmt_plain(go_strconv_quote_rune(u as i64)); };
+    if spec.verb == 100 || spec.verb == 98 || spec.verb == 111 || spec.verb == 79 || spec.verb == 120 || spec.verb == 88 {
+        return __go_fmt_int_render(u, false, spec);
+    };
+    return __go_fmt_plain(__go_fmt_bad_text(spec.verb, go_val_uint(u), true));
+}
+
+// Float verbs: f, e, E, g, G, x, X, b, and v as g.
+// Digit generation is strconv's (see strconv.sla for
+// its own accuracy notes).
+fn __go_fmt_float_arg(f: f64, spec: GoSpec) -> GoRendered {
+    if spec.verb == 118 { spec.verb = 103; };
+    let verb = spec.verb;
+    if verb == 102 || verb == 101 || verb == 69 || verb == 103 || verb == 71 || verb == 120 || verb == 88 || verb == 98 {
+        if __go_sc_is_nan(f) {
+            let body = Vec::new();
+            body.push(78u8); body.push(97u8); body.push(78u8);
+            return __go_fmt_plain(body);
+        };
+        if __go_sc_is_inf(f) {
+            let prefix = Vec::new();
+            if f < 0.0 {
+                prefix.push(45u8);
+            } else {
+                if __go_fmt_has(spec.flags, __go_fmt_flag_plus()) { prefix.push(43u8); };
+                if __go_fmt_has(spec.flags, __go_fmt_flag_space()) {
+                    if !__go_fmt_has(spec.flags, __go_fmt_flag_plus()) { prefix.push(32u8); };
+                };
+            };
+            let body = Vec::new();
+            body.push(73u8); body.push(110u8); body.push(102u8);
+            return GoRendered { prefix: prefix, body: body, zero_ok: false };
+        };
+        let prec = spec.prec;
+        if verb == 102 { if prec < 0 { prec = 6; }; };
+        if verb == 101 { if prec < 0 { prec = 6; }; };
+        if verb == 69 { if prec < 0 { prec = 6; }; };
+        let raw = go_strconv_format_float(f, verb, prec, 64);
+        let prefix = Vec::new();
+        let body = raw;
+        if len(raw) > 0 {
+            if raw[0] == 45 {
+                prefix.push(45u8);
+                body = __go_str_slice(raw, 1, len(raw));
+            } else {
+                if __go_fmt_has(spec.flags, __go_fmt_flag_plus()) { prefix.push(43u8); };
+                if __go_fmt_has(spec.flags, __go_fmt_flag_space()) {
+                    if !__go_fmt_has(spec.flags, __go_fmt_flag_plus()) { prefix.push(32u8); };
+                };
+            };
+        };
+        return GoRendered { prefix: prefix, body: body, zero_ok: true };
+    };
+    return __go_fmt_plain(__go_fmt_bad_text(spec.verb, go_val_float(f), true));
+}
+
+// String-like verbs over raw bytes: s, q, x, X, and
+// v as s. Used for tag 5 (string) and for the
+// string-shaped verbs of tag 6 ([]byte).
+fn __go_fmt_string_arg(s: Vec<u8>, spec: GoSpec) -> GoRendered {
+    if spec.verb == 118 { spec.verb = 115; };
+    if spec.verb == 115 {
+        return __go_fmt_plain(__go_fmt_truncate(s, spec.prec));
+    };
+    if spec.verb == 113 {
+        return __go_fmt_plain(go_strconv_quote(__go_fmt_truncate(s, spec.prec)));
+    };
+    if spec.verb == 120 {
+        return __go_fmt_plain(__go_fmt_hex_encode(__go_fmt_truncate(s, spec.prec), false));
+    };
+    if spec.verb == 88 {
+        return __go_fmt_plain(__go_fmt_hex_encode(__go_fmt_truncate(s, spec.prec), true));
+    };
+    return __go_fmt_plain(__go_fmt_bad_text(spec.verb, go_val_string(s), true));
+}
+
+// Format one argument under a parsed spec, writing
+// into st.out with padding. Compound %v shapes go
+// through the recursive renderer; verbs that do not
+// apply produce Go's %!verb(...) tokens.
+fn __go_fmt_format_arg(st: &GosFmt, spec: GoSpec, v: GosVal) -> void {
+    let plus = __go_fmt_has(spec.flags, __go_fmt_flag_plus());
+    let sharp = __go_fmt_has(spec.flags, __go_fmt_flag_sharp());
+    if v.tag == 0 {
+        if spec.verb == 118 {
+            __go_fmt_emit(st, __go_fmt_plain(__go_fmt_lit_nil()), spec);
+            return;
+        };
+        __go_fmt_append(st.out, __go_fmt_bad_text(spec.verb, v, true));
+        return;
+    };
+    if v.tag == 1 {
+        if spec.verb == 116 || spec.verb == 118 {
+            if v.i != 0 {
+                __go_fmt_emit(st, __go_fmt_plain(__go_fmt_lit_true()), spec);
+            } else {
+                __go_fmt_emit(st, __go_fmt_plain(__go_fmt_lit_false()), spec);
+            };
+            return;
+        };
+        __go_fmt_append(st.out, __go_fmt_bad_text(spec.verb, v, true));
+        return;
+    };
+    if v.tag == 2 {
+        __go_fmt_emit(st, __go_fmt_int_arg(v.i, spec), spec);
+        return;
+    };
+    if v.tag == 3 {
+        __go_fmt_emit(st, __go_fmt_uint_arg(v.u, spec), spec);
+        return;
+    };
+    if v.tag == 4 {
+        __go_fmt_emit(st, __go_fmt_float_arg(v.f, spec), spec);
+        return;
+    };
+    if v.tag == 5 {
+        __go_fmt_emit(st, __go_fmt_string_arg(v.s, spec), spec);
+        return;
+    };
+    if v.tag == 6 {
+        if spec.verb == 115 || spec.verb == 113 || spec.verb == 120 || spec.verb == 88 {
+            __go_fmt_emit(st, __go_fmt_string_arg(v.s, spec), spec);
+            return;
+        };
+        if spec.verb == 118 {
+            if sharp {
+                __go_fmt_emit(st, __go_fmt_plain(__go_fmt_render_sharp(v)), spec);
+            } else {
+                __go_fmt_emit(st, __go_fmt_plain(__go_fmt_render_v(v, plus, false)), spec);
+            };
+            return;
+        };
+        __go_fmt_append(st.out, __go_fmt_bad_text(spec.verb, v, true));
+        return;
+    };
+    if v.tag == 7 {
+        if spec.verb == 118 || spec.verb == 115 {
+            if sharp {
+                if spec.verb == 118 {
+                    __go_fmt_emit(st, __go_fmt_plain(__go_fmt_render_sharp(v)), spec);
+                    return;
+                };
+            };
+            let body = __go_fmt_lit_nil();
+            if v.err != go_errors_nil() {
+                body = go_errors_error_string(v.err);
+            };
+            __go_fmt_emit(st, __go_fmt_plain(__go_fmt_truncate(body, spec.prec)), spec);
+            return;
+        };
+        if spec.verb == 113 {
+            let body = __go_fmt_lit_nil();
+            if v.err != go_errors_nil() {
+                body = go_errors_error_string(v.err);
+            };
+            __go_fmt_emit(st, __go_fmt_plain(go_strconv_quote(body)), spec);
+            return;
+        };
+        __go_fmt_append(st.out, __go_fmt_bad_text(spec.verb, v, true));
+        return;
+    };
+    if v.tag == 8 {
+        let s = go_stringer_dispatch(v.i, v.u);
+        __go_fmt_emit(st, __go_fmt_string_arg(s, spec), spec);
+        return;
+    };
+    if v.tag == 9 {
+        if spec.verb == 112 || spec.verb == 118 {
+            let body = Vec::new();
+            body.push(48u8); body.push(120u8);
+            __go_fmt_append(body, go_strconv_format_uint(v.u, 16));
+            __go_fmt_emit(st, __go_fmt_plain(body), spec);
+            return;
+        };
+        __go_fmt_append(st.out, __go_fmt_bad_text(spec.verb, v, true));
+        return;
+    };
+    if v.tag == 10 {
+        if spec.verb == 118 {
+            if sharp {
+                __go_fmt_emit(st, __go_fmt_plain(__go_fmt_render_sharp(v)), spec);
+            } else {
+                __go_fmt_emit(st, __go_fmt_plain(__go_fmt_render_v(v, plus, false)), spec);
+            };
+            return;
+        };
+        if spec.verb == 113 {
+            // Go prints slices of strings/chars quoted
+            // element-wise: ["a" "b"]
+            let out = Vec::new();
+            out.push(91u8);
+            let i = 0;
+            while i < len(v.items) {
+                if i > 0 { out.push(32u8); };
+                let el = v.items[i];
+                if el.tag == 5 {
+                    __go_fmt_append(out, go_strconv_quote(el.s));
+                } else {
+                    if el.tag == 2 {
+                        __go_fmt_append(out, go_strconv_quote_rune(el.i));
+                    } else {
+                        __go_fmt_append(out, __go_fmt_bad_text(113, el, true));
+                    };
+                };
+                i = i + 1;
+            }
+            out.push(93u8);
+            __go_fmt_emit(st, __go_fmt_plain(out), spec);
+            return;
+        };
+        if spec.verb == 120 || spec.verb == 88 {
+            // Go concatenates the hex of each element
+            let out = Vec::new();
+            let i = 0;
+            while i < len(v.items) {
+                let el = v.items[i];
+                if el.tag == 5 || el.tag == 6 {
+                    __go_fmt_append(out, __go_fmt_hex_encode(el.s, spec.verb == 88));
+                } else {
+                    if el.tag == 2 {
+                        let h = go_strconv_format_int(el.i, 16);
+                        if spec.verb == 88 { h = __go_fmt_upper_bytes(h); };
+                        __go_fmt_append(out, h);
+                    } else {
+                        if el.tag == 3 {
+                            let h = go_strconv_format_uint(el.u, 16);
+                            if spec.verb == 88 { h = __go_fmt_upper_bytes(h); };
+                            __go_fmt_append(out, h);
+                        } else {
+                            __go_fmt_append(out, __go_fmt_bad_text(spec.verb, el, true));
+                        };
+                    };
+                };
+                i = i + 1;
+            }
+            __go_fmt_emit(st, __go_fmt_plain(out), spec);
+            return;
+        };
+        __go_fmt_append(st.out, __go_fmt_bad_text(spec.verb, v, true));
+        return;
+    };
+    // tags 11 (map) and 12 (struct): only %v shapes
+    if spec.verb == 118 {
+        if sharp {
+            __go_fmt_emit(st, __go_fmt_plain(__go_fmt_render_sharp(v)), spec);
+        } else {
+            __go_fmt_emit(st, __go_fmt_plain(__go_fmt_render_v(v, plus, false)), spec);
+        };
+        return;
+    };
+    __go_fmt_append(st.out, __go_fmt_bad_text(spec.verb, v, true));
+    return;
+}
+
+// ---------- the format engine ----------
+
+// Append Go's %!(EXTRA type=value, ...) for the
+// arguments the format never consumed.
+fn __go_fmt_extra(st: &GosFmt, args: Vec<GosVal>) -> void {
+    if st.argi >= len(args) { return; };
+    st.out.push(37u8);
+    st.out.push(33u8);
+    st.out.push(40u8);
+    __go_fmt_append(st.out, __go_fmt_lit_extra());
+    st.out.push(32u8);
+    let i = st.argi;
+    while i < len(args) {
+        if i > st.argi {
+            st.out.push(44u8);
+            st.out.push(32u8);
+        };
+        let a = args[i];
+        if a.tag == 0 {
+            __go_fmt_append(st.out, __go_fmt_lit_nil());
+        } else {
+            __go_fmt_append(st.out, __go_fmt_type_name(a.tag));
+            st.out.push(61u8);
+            __go_fmt_append(st.out, __go_fmt_render_v(a, false, false));
+        };
+        i = i + 1;
+    }
+    st.out.push(41u8);
+    return;
+}
+
+// Run one format string over args. errorf enables
+// the %w verb (and collects wrapped errors into
+// st.wlist). Argument selection follows Go: explicit
+// %[n] indexes set the cursor so following implicit
+// verbs continue at n+1; `*` width/precision consume
+// an argument each.
+fn __go_fmt_dofmt(format: Vec<u8>, args: Vec<GosVal>, errorf: bool) -> GosFmt {
+    let st = __go_fmt_new_state();
+    let i = 0;
+    while i < len(format) {
+        let c = format[i] as i64;
+        if c != 37 {
+            st.out.push(format[i]);
+            i = i + 1;
+            continue;
+        };
+        i = i + 1;
+        if i >= len(format) {
+            __go_fmt_append(st.out, __go_fmt_noverb_text());
+            break;
+        };
+        if format[i] as i64 == 37 {
+            st.out.push(37u8);
+            i = i + 1;
+            continue;
+        };
+        // explicit argument index %[n]
+        let explicit = -1;
+        if format[i] as i64 == 91 {
+            let j = i + 1;
+            let num = 0;
+            let any = false;
+            while j < len(format) {
+                let d = format[j] as i64;
+                if d < 48 { break; };
+                if d > 57 { break; };
+                num = num * 10 + (d - 48);
+                any = true;
+                j = j + 1;
+            }
+            if any {
+                if j < len(format) {
+                    if format[j] as i64 == 93 {
+                        explicit = num;
+                        i = j + 1;
+                    };
+                };
+            };
+        };
+        // flags
+        let flags = 0;
+        let scanning = true;
+        while scanning {
+            if i >= len(format) { scanning = false; break; };
+            let fc = format[i] as i64;
+            if fc == 43 { flags = flags + __go_fmt_flag_plus(); i = i + 1; continue; };
+            if fc == 45 { flags = flags + __go_fmt_flag_minus(); i = i + 1; continue; };
+            if fc == 35 { flags = flags + __go_fmt_flag_sharp(); i = i + 1; continue; };
+            if fc == 32 { flags = flags + __go_fmt_flag_space(); i = i + 1; continue; };
+            if fc == 48 { flags = flags + __go_fmt_flag_zero(); i = i + 1; continue; };
+            scanning = false;
+        }
+        // width
+        let width = -1;
+        if i < len(format) {
+            if format[i] as i64 == 42 {
+                i = i + 1;
+                if st.argi < len(args) {
+                    let wa = args[st.argi];
+                    st.argi = st.argi + 1;
+                    if wa.tag == 2 { width = wa.i; };
+                    if wa.tag == 3 { width = wa.u as i64; };
+                    if width < 0 {
+                        flags = flags + __go_fmt_flag_minus();
+                        width = 0 - width;
+                    };
+                };
+            } else {
+                let w = 0;
+                let any = false;
+                while i < len(format) {
+                    let d = format[i] as i64;
+                    if d < 48 { break; };
+                    if d > 57 { break; };
+                    w = w * 10 + (d - 48);
+                    any = true;
+                    i = i + 1;
+                }
+                if any { width = w; };
+            };
+        };
+        // precision
+        let prec = -1;
+        if i < len(format) {
+            if format[i] as i64 == 46 {
+                i = i + 1;
+                prec = 0;
+                if i < len(format) {
+                    if format[i] as i64 == 42 {
+                        i = i + 1;
+                        prec = -1;
+                        if st.argi < len(args) {
+                            let pa = args[st.argi];
+                            st.argi = st.argi + 1;
+                            if pa.tag == 2 { prec = pa.i; };
+                            if pa.tag == 3 { prec = pa.u as i64; };
+                            if prec < 0 { prec = -1; };
+                        };
+                    } else {
+                        let p = 0;
+                        while i < len(format) {
+                            let d = format[i] as i64;
+                            if d < 48 { break; };
+                            if d > 57 { break; };
+                            p = p * 10 + (d - 48);
+                            i = i + 1;
+                        }
+                        prec = p;
+                    };
+                };
+            };
+        };
+        if i >= len(format) {
+            __go_fmt_append(st.out, __go_fmt_noverb_text());
+            break;
+        };
+        let verb = format[i] as i64;
+        i = i + 1;
+        let spec = GoSpec { flags: flags, width: width, prec: prec, verb: verb };
+        // select the argument
+        let has = false;
+        let arg = __go_val_blank();
+        if explicit > 0 {
+            if explicit <= len(args) {
+                arg = args[explicit - 1];
+                has = true;
+            };
+            st.argi = explicit;
+        } else {
+            if st.argi < len(args) {
+                arg = args[st.argi];
+                has = true;
+            };
+            st.argi = st.argi + 1;
+        };
+        if verb == 119 {
+            // %w: Errorf only
+            if !errorf {
+                __go_fmt_append(st.out, __go_fmt_bad_text(verb, arg, has));
+                continue;
+            };
+            if !has {
+                __go_fmt_append(st.out, __go_fmt_bad_text(verb, arg, false));
+                continue;
+            };
+            if arg.tag != 7 {
+                __go_fmt_append(st.out, __go_fmt_bad_text(verb, arg, true));
+                continue;
+            };
+            if arg.err == go_errors_nil() {
+                __go_fmt_append(st.out, __go_fmt_bad_text(verb, arg, true));
+                continue;
+            };
+            st.wlist.push(arg.err);
+            let body = go_errors_error_string(arg.err);
+            __go_fmt_emit(&st, __go_fmt_plain(body), spec);
+            continue;
+        };
+        if !has {
+            __go_fmt_append(st.out, __go_fmt_bad_text(verb, arg, false));
+            continue;
+        };
+        __go_fmt_format_arg(&st, spec, arg);
+    }
+    __go_fmt_extra(&st, args);
+    return st;
+}
+
+// ---------- entry points ----------
+
+// fmt.Sprintf(format, args...)
+fn go_fmt_sprintf(format: Vec<u8>, args: Vec<GosVal>) -> Vec<u8> {
+    let st = __go_fmt_dofmt(format, args, false);
+    return st.out;
+}
+
+// fmt.Sprint(args...): %v for every operand, spaces
+// between two operands when neither is a string.
+fn go_fmt_sprint(args: Vec<GosVal>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(args) {
+        if i > 0 {
+            let prev = args[i - 1];
+            let cur = args[i];
+            if !__go_fmt_is_string_tag(prev.tag) {
+                if !__go_fmt_is_string_tag(cur.tag) {
+                    out.push(32u8);
+                };
+            };
+        };
+        __go_fmt_append(out, __go_fmt_render_v(args[i], false, false));
+        i = i + 1;
+    }
+    return out;
+}
+
+// fmt.Sprintln(args...): %v for every operand,
+// spaces between all operands, trailing newline.
+fn go_fmt_sprintln(args: Vec<GosVal>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(args) {
+        if i > 0 { out.push(32u8); };
+        __go_fmt_append(out, __go_fmt_render_v(args[i], false, false));
+        i = i + 1;
+    }
+    out.push(10u8);
+    return out;
+}
+
+// The (n, err) pair of the Print/Fprintf family.
+struct GoFmtResult {
+    n: i64,
+    err: ptr,
+}
+
+// fmt.Fprintf(w, format, args...): the writer is a
+// *GosBuilder (gostd's byte-buffer shape for
+// io.Writer at this surface).
+fn go_fmt_fprintf(w: &GosBuilder, format: Vec<u8>, args: Vec<GosVal>) -> GoFmtResult {
+    let s = go_fmt_sprintf(format, args);
+    let n = go_strings_builder_write_string(w, s);
+    return GoFmtResult { n: n, err: go_errors_nil() };
+}
+
+// fmt.Print / Printf / Println: write through the
+// frontend-emitted go_host_write_stdout hook.
+fn go_fmt_print(args: Vec<GosVal>) -> GoFmtResult {
+    let s = go_fmt_sprint(args);
+    go_host_write_stdout(s);
+    return GoFmtResult { n: len(s), err: go_errors_nil() };
+}
+
+fn go_fmt_printf(format: Vec<u8>, args: Vec<GosVal>) -> GoFmtResult {
+    let s = go_fmt_sprintf(format, args);
+    go_host_write_stdout(s);
+    return GoFmtResult { n: len(s), err: go_errors_nil() };
+}
+
+fn go_fmt_println(args: Vec<GosVal>) -> GoFmtResult {
+    let s = go_fmt_sprintln(args);
+    go_host_write_stdout(s);
+    return GoFmtResult { n: len(s), err: go_errors_nil() };
+}
+
+// fmt.Errorf(format, args...): like Sprintf, but %w
+// verbs record wrapped errors. Zero %w: a plain
+// error. One %w: a wrap node whose message is the
+// formatted string verbatim and whose Unwrap is the
+// recorded error. Several %w: a multi node (message
+// verbatim, all recorded errors in kids).
+fn go_fmt_errorf(format: Vec<u8>, args: Vec<GosVal>) -> ptr {
+    let st = __go_fmt_dofmt(format, args, true);
+    if len(st.wlist) == 0 {
+        return go_errors_new(st.out);
+    };
+    if len(st.wlist) == 1 {
+        return go_errors_new_wrap(st.out, st.wlist[0]);
+    };
+    return go_errors_new_multi(st.out, st.wlist);
+}
