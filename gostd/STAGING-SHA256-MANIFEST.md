@@ -30,12 +30,12 @@ afa892be0abe81d87abf3ccedc5e93312b80e98fb8e8a044c36359358ec37f3c  gostd/maps.sla
 537ff6a7ac57c37871a997dbc9285ecf0b3f3f6d76d4c62c80cd9fe287fa3106  gostd/math.sla
 ea8b1b7325c8e6cb184b12456d78991760aadbfc5dfa85e9b6e2e91f6df2202c  gostd/path.sla
 019d7190ee7427b29217dc193944acc066c4981eaa3ef9118b14c0ac6020323e  gostd/regexp.sla
-9239b3b8027916987a79b4b4e3b7d672a1643b2e94a671bb2774750f8545abee  gostd/runtime.sla
+82e7463f500d08380527e2b70b3d1bb419f3113f95e32a3182b6991ed456aa97  gostd/runtime.sla
 b9e989dfdec7618e1154a6ff234c50e61a9e2e63f71f972f0dd0e9bba60b35e9  gostd/slices.sla
 cc292904c2705743455fffdb697b5a4fe79336181720c17c28fdfa0e872bfe78  gostd/sort.sla
 a2caa934528f786f9c3921b64b08ddca8a2ad1982e5001c7f2806be187cc50c9  gostd/strconv.sla
 3e6f4bb64c50d64d33a85f8eadf19dc3bb61721b4370fe1eae2af8dfaed6e3bc  gostd/strings.sla
-e81dabee7ede8dd6fd7da9684c73c5ee8b4f3c251632fec75f93a387987e9c1b  gostd/sync.sla
+c5ea34568236dcf566621086a40ce74242c6d0290bb94094b78cb0bdb857fb58  gostd/sync.sla
 c5c165da086df557f285035388ed39f11ea83626be630e83df2a0fb2d70bfc14  gostd/sync_atomic.sla
 24f62e5e802cc39668cceb7f26033f8c10b5e44852017bd8f4744a27ec86bb12  gostd/time.sla
 4880975fa181f4683604dea2a95a1a559f0e3947ade46fa8934ae7a9502e12da  gostd/utf8.sla
@@ -48,3 +48,5 @@ a78998b00561edff23f3473317ebd10ce19e6cca126a01a8fda7348c9e02559d  gostd/MANIFEST
 c31a5d76fb506295b5a507a7451812c57977fbcf38c83dc36279341cb0fede08  gostd/MANIFEST-regexp.md
 2a3b485ec26877e40d2cbbaa91ae881820de396cde3b779f2fca33bc762d86e8  gostd/MANIFEST-slices.md
 e6946244a2388e2e7501a443867f52cf4f3dc84ccff63b5c01ae900f517a2157  gostd/MANIFEST-sync_atomic.md
+
+Updated 2026-11-28 ~16:05 CST per Muse ruling R1538 (relay 20081, B1 route (a) corpus-side import): runtime.sla, sync.sla now list the post-import shas (82e7463f… / c5ea3456…); the other 35 lines unchanged. Pushed to gosa main in the same commit as the two edited files.

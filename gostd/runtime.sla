@@ -45,6 +45,7 @@
 
 @import "sa_std/vec.sa"
 @import "sa_std/hashmap.sa"
+@import "sla_std/hashmap.sla"
 
 // ---- integer limits (Go math constants / runtime bounds) ----
 

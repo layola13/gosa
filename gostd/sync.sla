@@ -46,6 +46,7 @@
 @import "sa_std/thread.sai"
 @import "sa_std/vec.sa"
 @import "sa_std/hashmap.sa"
+@import "sla_std/hashmap.sla"
 @import "sa_std/core/option.sa"
 
 // ================= Mutex =================
