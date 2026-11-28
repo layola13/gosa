@@ -1,0 +1,48 @@
+# task-170 gostd corpus — staging sha256 manifest
+
+Staging baseline for the 37 gostd files landed on layola13/gosa main in
+commit 7c20ea63 (parent 10b1d29). These are the sha256 of the files as they
+stood in xiaohuoche pre-push staging
+(`~/workspace/task170-work/corpus-landing-170/staging/gostd/`) — the baseline
+for the (liv)/(lv) landing re-verification (Muse relay 18976, 2026-11-28 10:16 CST).
+
+Verified 2026-11-28 ~10:17 CST: `sha256sum -c` against staging, 37/37 OK.
+CENSUS-170.md does NOT contain per-file sha, so this file is the baseline.
+
+f1848b7eaf46e273304b24a2828390b799872c43950a8edcdb3c4c210dc47222  gostd/base64.sla
+1daefc65e38502ae45d687529c9847636ae2fa4496ae1705506fad78f2c23bcb  gostd/bufio.sla
+d82c5cae73795c4304d88adf769db67582fa13969f48db5619e818ea497d014e  gostd/bytes.sla
+e38f6401bf07592996c2421c1dcf4d7b1334249e07958da843eaf9023d7a29b8  gostd/cmp.sla
+788a68eefe137af77032716cb304a213cd6ce77b9bf0547cfbd57c2a3856c437  gostd/context.sla
+ca86bb699f1e248717362db52386466e76efbbffc8e1da9f458efe155d301d00  gostd/crc32.sla
+a7081ecdfd684cb6798462ba35639cd2cd312a9468a909e5b92f6bb31d382937  gostd/encoding_json.sla
+a3e7a8336c3b56122541a749eedae0dba4f5a70af2555b6ff7a683bc4251a0e6  gostd/errors.sla
+8949d15af6141f9fbee6c40b275f9e30bd46790554e1d5b98ee374aaf69aa8e0  gostd/flag.sla
+64637d9cb97538bf4c142fca4290a95d38f3d8c72178922a720147779b8aa356  gostd/fmt.sla
+cdf109ed54bf94971831cb7afd85e60244af3ba68121059c66b0046c298d479b  gostd/fnv.sla
+1786bb2aa6c500da1eb7ff839aa6377aa2285a25f6bf94c7d70ffff316fafc23  gostd/hash.sla
+770fc1bf0ea3d0d4f52926bb5bbf4f95fc3c5b710be5c25c0d8ea3d212eaeee6  gostd/hex.sla
+566d5901798a33f6032d6256f693ccbe381b9309f38f36211948fcc8e37db77d  gostd/io.sla
+54d52584c0b8d451fa25c47c2ec9441a10c1898df7e0176e654e8da91b16ad21  gostd/log.sla
+afa892be0abe81d87abf3ccedc5e93312b80e98fb8e8a044c36359358ec37f3c  gostd/maps.sla
+323964cbeb9abf70ed1b8b98922abac5948d748b7ceefee365b37e4945c38d8b  gostd/math.sla
+ea8b1b7325c8e6cb184b12456d78991760aadbfc5dfa85e9b6e2e91f6df2202c  gostd/path.sla
+019d7190ee7427b29217dc193944acc066c4981eaa3ef9118b14c0ac6020323e  gostd/regexp.sla
+9239b3b8027916987a79b4b4e3b7d672a1643b2e94a671bb2774750f8545abee  gostd/runtime.sla
+b9e989dfdec7618e1154a6ff234c50e61a9e2e63f71f972f0dd0e9bba60b35e9  gostd/slices.sla
+cc292904c2705743455fffdb697b5a4fe79336181720c17c28fdfa0e872bfe78  gostd/sort.sla
+9b782895713e9f1f7f59a5b77c14012af3d1e511f972c471c5bd8bdce57638cb  gostd/strconv.sla
+3e6f4bb64c50d64d33a85f8eadf19dc3bb61721b4370fe1eae2af8dfaed6e3bc  gostd/strings.sla
+e81dabee7ede8dd6fd7da9684c73c5ee8b4f3c251632fec75f93a387987e9c1b  gostd/sync.sla
+c5c165da086df557f285035388ed39f11ea83626be630e83df2a0fb2d70bfc14  gostd/sync_atomic.sla
+24f62e5e802cc39668cceb7f26033f8c10b5e44852017bd8f4744a27ec86bb12  gostd/time.sla
+4880975fa181f4683604dea2a95a1a559f0e3947ade46fa8934ae7a9502e12da  gostd/utf8.sla
+3a73f8c0c042a930a6d25f00b2a21b90bf60abd32bd2b8f8a76cfc3e2fe6932d  gostd/MANIFEST-bufio.md
+2eeab8f37d60cd4fa86f0d0457e19a73de0b27ef37f0fc5293abdf67e17199f2  gostd/MANIFEST-cmp.md
+96bcc136114c6b0fa34996e48de200374186e9dd9bba057b73e526c118146f03  gostd/MANIFEST-context.md
+a78998b00561edff23f3473317ebd10ce19e6cca126a01a8fda7348c9e02559d  gostd/MANIFEST-encoding_json.md
+02ed3b50622a6cdb4804729eabe87dbff841e48836abd05e178fcd8c3b09c633  gostd/MANIFEST-log.md
+06f737957440c0c6d4a0a3681dd73ddfc9681682826ac69567e635a6aedf0d54  gostd/MANIFEST-maps.md
+c31a5d76fb506295b5a507a7451812c57977fbcf38c83dc36279341cb0fede08  gostd/MANIFEST-regexp.md
+2a3b485ec26877e40d2cbbaa91ae881820de396cde3b779f2fca33bc762d86e8  gostd/MANIFEST-slices.md
+e6946244a2388e2e7501a443867f52cf4f3dc84ccff63b5c01ae900f517a2157  gostd/MANIFEST-sync_atomic.md
