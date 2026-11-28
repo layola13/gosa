@@ -29,21 +29,6 @@
 
 @import "sa_std/math.sai"
 
-@extern sa_math_exp(x: f64) -> f64
-@extern sa_math_log(x: f64) -> f64
-@extern sa_math_log10(x: f64) -> f64
-@extern sa_math_log2(x: f64) -> f64
-@extern sa_math_tan(x: f64) -> f64
-@extern sa_math_asin(x: f64) -> f64
-@extern sa_math_acos(x: f64) -> f64
-@extern sa_math_atan(x: f64) -> f64
-@extern sa_math_atan2(y: f64, x: f64) -> f64
-@extern sa_math_hypot(x: f64, y: f64) -> f64
-@extern sa_math_sinh(x: f64) -> f64
-@extern sa_math_cosh(x: f64) -> f64
-@extern sa_math_tanh(x: f64) -> f64
-@extern sa_math_expm1(x: f64) -> f64
-@extern sa_math_log1p(x: f64) -> f64
 
 // ---- constants (Go's math constants, full precision) ----
 

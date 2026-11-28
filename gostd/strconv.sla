@@ -287,7 +287,7 @@ fn go_strconv_format_uint(v: u64, base: i64) -> Vec<u8> {
 // strconv.FormatInt(i int64, base int) string
 fn go_strconv_format_int(v: i64, base: i64) -> Vec<u8> {
     if v >= 0 { return go_strconv_format_uint(v as u64, base); };
-    let mag = (~(v as u64)) + 1;
+    let mag = 0u64 - (v as u64);
     let out = Vec::new();
     out.push(45u8);
     __go_sc_append(out, go_strconv_format_uint(mag, base));
@@ -363,7 +363,7 @@ fn __go_sc_parse_uint_digits(s: Vec<u8>, dlo: i64, dhi: i64, base: i64, bit_size
     if dlo >= dhi {
         return GoConvU64 { v: 0, err: __go_sc_num_error(__go_sc_fn_parse_uint(), s, 0) };
     };
-    let maxv = 18446744073709551615 as u64;
+    let maxv = (0 as u64) - 1;
     if bit_size < 64 {
         maxv = ((1 as u64) << (bit_size as u64)) - 1;
     };
@@ -975,7 +975,7 @@ fn __go_sc_pow10f(e: i64) -> f64 {
         if (k & 1) == 1 { result = result * base; };
         base = base * base;
         k = k >> 1;
-        if base > 1.7976931348623157e307 {
+        if base > go_math_float64frombits(((2146435071 as u64) << 32) | 4294967295) {
             // further squaring would overflow; the
             // remaining factors saturate the result
             if k > 0 { result = result * base; };
@@ -999,15 +999,15 @@ struct GoNorm10 {
 fn __go_sc_norm10_full(v: f64) -> GoNorm10 {
     let x = v;
     let e = 0;
-    while x >= 1e16 { x = x / 1e16; e = e + 16; }
-    while x >= 1e8 { x = x / 1e8; e = e + 8; }
-    while x >= 1e4 { x = x / 1e4; e = e + 4; }
-    while x >= 1e2 { x = x / 100.0; e = e + 2; }
+    while x >= 10000000000000000.0 { x = x / 10000000000000000.0; e = e + 16; }
+    while x >= 100000000.0 { x = x / 100000000.0; e = e + 8; }
+    while x >= 10000.0 { x = x / 10000.0; e = e + 4; }
+    while x >= 100.0 { x = x / 100.0; e = e + 2; }
     while x >= 10.0 { x = x / 10.0; e = e + 1; }
-    while x < 1e-15 { x = x * 1e16; e = e - 16; }
-    while x < 1e-7 { x = x * 1e8; e = e - 8; }
-    while x < 1e-3 { x = x * 1e4; e = e - 4; }
-    while x < 1e-1 { x = x * 100.0; e = e - 2; }
+    while x < 0.000000000000001 { x = x * 10000000000000000.0; e = e - 16; }
+    while x < 0.0000001 { x = x * 100000000.0; e = e - 8; }
+    while x < 0.001 { x = x * 10000.0; e = e - 4; }
+    while x < 0.1 { x = x * 100.0; e = e - 2; }
     while x < 1.0 { x = x * 10.0; e = e - 1; }
     return GoNorm10 { x: x, e: e };
 }

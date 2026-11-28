@@ -9,6 +9,8 @@ for the (liv)/(lv) landing re-verification (Muse relay 18976, 2026-11-28 10:16 C
 Verified 2026-11-28 ~10:17 CST: `sha256sum -c` against staging, 37/37 OK.
 CENSUS-170.md does NOT contain per-file sha, so this file is the baseline.
 
+Updated 2026-11-28 ~12:47 CST per Muse ruling 19457 (landing of the livlv ① fixes): errors.sla, math.sla, strconv.sla now list the fixed shas (c87396cf… / 537ff6a7… / a2caa934…); the other 34 lines unchanged. Pushed to gosa main in the same commit as the three fixed files.
+
 f1848b7eaf46e273304b24a2828390b799872c43950a8edcdb3c4c210dc47222  gostd/base64.sla
 1daefc65e38502ae45d687529c9847636ae2fa4496ae1705506fad78f2c23bcb  gostd/bufio.sla
 d82c5cae73795c4304d88adf769db67582fa13969f48db5619e818ea497d014e  gostd/bytes.sla
@@ -16,7 +18,7 @@ e38f6401bf07592996c2421c1dcf4d7b1334249e07958da843eaf9023d7a29b8  gostd/cmp.sla
 788a68eefe137af77032716cb304a213cd6ce77b9bf0547cfbd57c2a3856c437  gostd/context.sla
 ca86bb699f1e248717362db52386466e76efbbffc8e1da9f458efe155d301d00  gostd/crc32.sla
 a7081ecdfd684cb6798462ba35639cd2cd312a9468a909e5b92f6bb31d382937  gostd/encoding_json.sla
-a3e7a8336c3b56122541a749eedae0dba4f5a70af2555b6ff7a683bc4251a0e6  gostd/errors.sla
+c87396cfa65eb99756cc266645850274886841bb4353f0393745afac7fdaa56d  gostd/errors.sla
 8949d15af6141f9fbee6c40b275f9e30bd46790554e1d5b98ee374aaf69aa8e0  gostd/flag.sla
 64637d9cb97538bf4c142fca4290a95d38f3d8c72178922a720147779b8aa356  gostd/fmt.sla
 cdf109ed54bf94971831cb7afd85e60244af3ba68121059c66b0046c298d479b  gostd/fnv.sla
@@ -25,13 +27,13 @@ cdf109ed54bf94971831cb7afd85e60244af3ba68121059c66b0046c298d479b  gostd/fnv.sla
 566d5901798a33f6032d6256f693ccbe381b9309f38f36211948fcc8e37db77d  gostd/io.sla
 54d52584c0b8d451fa25c47c2ec9441a10c1898df7e0176e654e8da91b16ad21  gostd/log.sla
 afa892be0abe81d87abf3ccedc5e93312b80e98fb8e8a044c36359358ec37f3c  gostd/maps.sla
-323964cbeb9abf70ed1b8b98922abac5948d748b7ceefee365b37e4945c38d8b  gostd/math.sla
+537ff6a7ac57c37871a997dbc9285ecf0b3f3f6d76d4c62c80cd9fe287fa3106  gostd/math.sla
 ea8b1b7325c8e6cb184b12456d78991760aadbfc5dfa85e9b6e2e91f6df2202c  gostd/path.sla
 019d7190ee7427b29217dc193944acc066c4981eaa3ef9118b14c0ac6020323e  gostd/regexp.sla
 9239b3b8027916987a79b4b4e3b7d672a1643b2e94a671bb2774750f8545abee  gostd/runtime.sla
 b9e989dfdec7618e1154a6ff234c50e61a9e2e63f71f972f0dd0e9bba60b35e9  gostd/slices.sla
 cc292904c2705743455fffdb697b5a4fe79336181720c17c28fdfa0e872bfe78  gostd/sort.sla
-9b782895713e9f1f7f59a5b77c14012af3d1e511f972c471c5bd8bdce57638cb  gostd/strconv.sla
+a2caa934528f786f9c3921b64b08ddca8a2ad1982e5001c7f2806be187cc50c9  gostd/strconv.sla
 3e6f4bb64c50d64d33a85f8eadf19dc3bb61721b4370fe1eae2af8dfaed6e3bc  gostd/strings.sla
 e81dabee7ede8dd6fd7da9684c73c5ee8b4f3c251632fec75f93a387987e9c1b  gostd/sync.sla
 c5c165da086df557f285035388ed39f11ea83626be630e83df2a0fb2d70bfc14  gostd/sync_atomic.sla

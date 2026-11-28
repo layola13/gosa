@@ -53,6 +53,15 @@ struct GosError {
     target_id: i64,
 }
 
+// Reinterpret a bare `ptr` GosError handle as a typed pointer.
+// The checker rejects dereferencing a bare `ptr` (DereferenceNonPointer);
+// Box::into_raw produces exactly a *GosError, so this cast is a
+// zero-cost reinterpretation, same family as the context-B fix
+// (declare the true node pointer type).
+fn __go_err_node(e: ptr) -> *GosError {
+    return e as *GosError;
+}
+
 fn go_errors_nil() -> ptr {
     return 0 as ptr;
 }
@@ -141,13 +150,13 @@ fn go_errors_new_multi(msg: Vec<u8>, kids: Vec<ptr>) -> ptr {
 // through other paths).
 fn go_errors_set_target(e: ptr, target_id: i64) -> void {
     __go_err_check(e);
-    (*e).target_id = target_id;
+    (*__go_err_node(e)).target_id = target_id;
     return;
 }
 
 fn go_errors_target_id(e: ptr) -> i64 {
     __go_err_check(e);
-    return (*e).target_id;
+    return (*__go_err_node(e)).target_id;
 }
 
 // error.Error() string: a wrap node's string is its
@@ -160,20 +169,20 @@ fn go_errors_target_id(e: ptr) -> i64 {
 fn go_errors_error_string(e: ptr) -> Vec<u8> {
     __go_err_check(e);
     let out = Vec::new();
-    if len((*e).kids) > 0 {
-        if (*e).msg_wins {
-            __go_err_append(out, (*e).msg);
+    if len((*__go_err_node(e)).kids) > 0 {
+        if (*__go_err_node(e)).msg_wins {
+            __go_err_append(out, (*__go_err_node(e)).msg);
             return out;
         };
         let i = 0;
-        while i < len((*e).kids) {
+        while i < len((*__go_err_node(e)).kids) {
             if i > 0 { out.push(10u8); };
-            __go_err_append(out, go_errors_error_string((*e).kids[i]));
+            __go_err_append(out, go_errors_error_string((*__go_err_node(e)).kids[i]));
             i = i + 1;
         }
         return out;
     };
-    __go_err_append(out, (*e).msg);
+    __go_err_append(out, (*__go_err_node(e)).msg);
     return out;
 }
 
@@ -191,13 +200,13 @@ fn __go_err_append(dst: Vec<u8>, src: Vec<u8>) -> void {
 // kids through go_errors_join_kids instead.
 fn go_errors_unwrap(e: ptr) -> ptr {
     if e == go_errors_nil() { return go_errors_nil(); };
-    if (*e).wrap { return (*e).cause; };
+    if (*__go_err_node(e)).wrap { return (*__go_err_node(e)).cause; };
     return go_errors_nil();
 }
 
 fn go_errors_join_kids(e: ptr) -> Vec<ptr> {
     if e == go_errors_nil() { return Vec::new(); };
-    return (*e).kids;
+    return (*__go_err_node(e)).kids;
 }
 
 // Does node `e` match `target`? Go: e == target, or
@@ -208,9 +217,9 @@ fn __go_err_matches(e: ptr, target: ptr) -> bool {
     if e == target { return true; };
     if e == go_errors_nil() { return false; };
     if target == go_errors_nil() { return false; };
-    let tid = (*target).target_id;
+    let tid = (*__go_err_node(target)).target_id;
     if tid != 0 {
-        if (*e).target_id == tid { return true; };
+        if (*__go_err_node(e)).target_id == tid { return true; };
     };
     return false;
 }
@@ -226,8 +235,8 @@ fn go_errors_is(e: ptr, target: ptr) -> bool {
         if go_errors_is(c, target) { return true; };
     };
     let i = 0;
-    while i < len((*e).kids) {
-        if go_errors_is((*e).kids[i], target) { return true; };
+    while i < len((*__go_err_node(e)).kids) {
+        if go_errors_is((*__go_err_node(e)).kids[i], target) { return true; };
         i = i + 1;
     }
     return false;
@@ -242,7 +251,7 @@ fn go_errors_is(e: ptr, target: ptr) -> bool {
 fn go_errors_as(e: ptr, target_id: i64) -> ptr {
     if e == go_errors_nil() { return go_errors_nil(); };
     if target_id != 0 {
-        if (*e).target_id == target_id { return e; };
+        if (*__go_err_node(e)).target_id == target_id { return e; };
     };
     let c = go_errors_unwrap(e);
     if c != go_errors_nil() {
@@ -250,8 +259,8 @@ fn go_errors_as(e: ptr, target_id: i64) -> ptr {
         if hit != go_errors_nil() { return hit; };
     };
     let i = 0;
-    while i < len((*e).kids) {
-        let hit = go_errors_as((*e).kids[i], target_id);
+    while i < len((*__go_err_node(e)).kids) {
+        let hit = go_errors_as((*__go_err_node(e)).kids[i], target_id);
         if hit != go_errors_nil() { return hit; };
         i = i + 1;
     }
