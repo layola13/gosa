@@ -1,0 +1,1718 @@
+// gostd compress/bzip2: the SLA-side model of Go's
+// compress/bzip2 package (Go 1.27.2), over byte strings (Vec<u8>).
+// Organisation follows the psa_std precedent: public
+// entry points go_bzip2_*, private helpers __go_bzip2_*.
+//
+// Oracle: Go 1.27.2 compress/bzip2 (bzip2.go, bit_reader.go,
+// huffman.go, move_to_front.go), mirrored from the box Go
+// tree /usr/local/go/src/compress/bzip2/ into
+// wave2-oracle/compress_bzip2/ (bzip2.go sha 75175949...,
+// bit_reader.go sha a6e3de57..., huffman.go sha c7f62572...,
+// move_to_front.go sha 9c58462d... -- all four match the
+// box exactly).
+//
+// This file is number 31 in the splice order: the 28
+// landed corpus files, then archive/tar (29), archive/zip
+// (30), then this file (31). It is written against the fresh
+// 603232ac plugin (with the B1 hashmap import); the
+// installed plugin 0.1.8 fails earlier in the splice
+// (raw 1009 in fmt) and never reaches this file.
+//
+// API map (Go -> gostd):
+//   NewReader(r io.Reader) io.Reader ->
+//     go_bzip2_new_reader over the compressed bytes
+//     directly (divergence D0: gostd has no streaming
+//     Reader handle; the bit reader runs over an index
+//     into the caller's Vec<u8>).
+//   (reader).Read -> go_bzip2_reader_read(r, dst, max)
+//     appends up to max decompressed bytes to dst.
+//   StructuralError -> go_bzip2_err_* constructors, one
+//     target id per distinct Go message (900070-900089);
+//     Error() text is "bzip2 data invalid: " + detail.
+//   Internal (ported in full): bitReader, huffmanTree /
+//     huffmanNode / newHuffmanTree / buildHuffmanNode,
+//     moveToFrontDecoder, inverseBWT, updateCRC (+ the
+//     256-entry table built by __go_bzip2_crc_table).
+//   No writer exists in Go's compress/bzip2 (read-only
+//   package); there is none here either.
+//
+// Divergences:
+//   D0: NewReader takes the compressed bytes (Vec<u8>),
+//     not an io.Reader. gostd has no streaming reader
+//     handle; go_io_read_full is the random-access
+//     primitive elsewhere in the corpus, and the bit
+//     reader here is index-based over the same bytes.
+//   D1: u32 does not exist in SLA (see crc32.sla); all
+//     Go uint32 values (CRC state, tt entries, Huffman
+//     codes) are u64 holding 32-bit values, masked to
+//     32 bits at every step (crc32.sla precedent).
+//   D2: Go's preRLE aliases tt (preRLE = tt[:bufIndex]);
+//     SLA has no aliasing, so the reader walks tt
+//     directly with pre_rle_len / pre_rle_used instead
+//     of a separate preRLE field. Identical observable
+//     behaviour: inverseBWT mutates tt in place and the
+//     RLE walk reads the transformed entries.
+//   D3: Go's crctab is a package-level var built once by
+//     init(); gostd has no globals, so each reader owns
+//     its table (built once in NewReader, crc_tab).
+//   D4: Go's bitReader.ReadBits64 returns buffered bits
+//     even after an error is set; this port mirrors Go
+//     exactly (no sticky early return): it satisfies
+//     from the buffer first and only reads a new byte
+//     when more bits are needed.
+//   D5: buildHuffmanNode guards level > 31 with the
+//     "equal symbols" error. Go guards level == 31
+//     inside the empty-side branch only; for valid
+//     canonical codes (lengths 1..20, enforced in
+//     readBlock) the depth never exceeds 20 + the
+//     empty-side skips, so the guard is unreachable in
+//     practice and exists only to keep the (31 - level)
+//     shift defined in u64 arithmetic.
+//   D6: The Huffman decode fast path reads br.n directly
+//     (as in Go); the slow path goes through ReadBits.
+//     The Go fast path masks the shift with & 63; this
+//     port omits the mask because br.bits is always
+//     < 64 here (at most 55 after a refill), so the
+//     shift is already defined.
+//   D7: readBlock's lengths slice is reused across trees
+//     in Go; here newHuffmanTree takes &Vec<u64> and
+//     copies into its own sorted pairs, so the caller's
+//     lengths vec is untouched.
+//   D8: Go's repeat / repeatPower are int; here they are
+//     u64 (the repeat limit 2*1024*1024 and the
+//     block-size bound are both far below 2^63, and the
+//     values only flow into u64 shifts and comparisons).
+
+@import "sa_std/vec.sa";
+
+// ---------- constants ----------
+
+const GO_BZIP2_FILE_MAGIC: u64 = 16986;
+const GO_BZIP2_BLOCK_MAGIC: u64 = 54156738319193;
+const GO_BZIP2_FINAL_MAGIC: u64 = 25779555029136;
+const GO_BZIP2_CRC_POLY: u64 = 79764919;
+const GO_BZIP2_INVALID_NODE: u64 = 65535;
+const GO_BZIP2_REPEAT_LIMIT: u64 = 2097152;
+
+// Live panic codes (defensive; unreachable from readBlock
+// for valid streams, but present in the helpers exactly
+// as in Go):
+//   77465 newHuffmanTree: too few symbols (< 2 lengths)
+//   77466 newMTFDecoder: too many symbols (> 256)
+//   77467 newMTFDecoderWithRange: cannot have > 256 symbols
+// Reserved spares: 77468-77472.
+const GO_BZIP2_PANIC_HUFFMAN_TOO_FEW: i64 = 77465;
+const GO_BZIP2_PANIC_MTF_TOO_MANY: i64 = 77466;
+const GO_BZIP2_PANIC_MTF_RANGE_TOO_MANY: i64 = 77467;
+
+// ---------- error helpers ----------
+
+fn __go_bzip2_is_nil(e: ptr) -> bool {
+    return e == go_errors_nil();
+}
+
+fn __go_bzip2_is_eof(e: ptr) -> bool {
+    return go_errors_is(e, go_io_eof());
+}
+
+fn __go_bzip2_is_unexpected_eof(e: ptr) -> bool {
+    return go_errors_is(e, go_io_err_unexpected_eof());
+}
+
+// "bzip2 data invalid: " -- the shared prefix of every
+// StructuralError (Go's (StructuralError).Error()).
+fn __go_bzip2_msg_prefix(out: &Vec<u8>) -> void {
+    out.push(98u8);
+    out.push(122u8);
+    out.push(105u8);
+    out.push(112u8);
+    out.push(50u8);
+    out.push(32u8);
+    out.push(100u8);
+    out.push(97u8);
+    out.push(116u8);
+    out.push(97u8);
+    out.push(32u8);
+    out.push(105u8);
+    out.push(110u8);
+    out.push(118u8);
+    out.push(97u8);
+    out.push(108u8);
+    out.push(105u8);
+    out.push(100u8);
+    out.push(58u8);
+    out.push(32u8);
+    return;
+}
+
+fn __go_bzip2_slice(b: &Vec<u8>, lo: i64, hi: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = lo;
+    while i < hi {
+        out.push(b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------- StructuralError constructors ----------
+// One target id per distinct Go message (900070-900089).
+// The full text is "bzip2 data invalid: " + detail.
+
+fn __go_bzip2_err_bad_magic() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(98u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(103u8);
+    msg.push(105u8);
+    msg.push(99u8);
+    msg.push(32u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(117u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900070 as i64));
+}
+
+fn __go_bzip2_err_non_huffman() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(110u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(45u8);
+    msg.push(72u8);
+    msg.push(117u8);
+    msg.push(102u8);
+    msg.push(102u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(111u8);
+    msg.push(112u8);
+    msg.push(121u8);
+    msg.push(32u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(100u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, (900071 as i64));
+}
+
+fn __go_bzip2_err_bad_level() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(105u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(109u8);
+    msg.push(112u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(115u8);
+    msg.push(115u8);
+    msg.push(105u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(118u8);
+    msg.push(101u8);
+    msg.push(108u8);
+    return go_errors_new_with_id(msg, (900072 as i64));
+}
+
+fn __go_bzip2_err_block_crc() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(98u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(99u8);
+    msg.push(107u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(104u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(107u8);
+    msg.push(115u8);
+    msg.push(117u8);
+    msg.push(109u8);
+    msg.push(32u8);
+    msg.push(109u8);
+    msg.push(105u8);
+    msg.push(115u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(99u8);
+    msg.push(104u8);
+    return go_errors_new_with_id(msg, (900073 as i64));
+}
+
+fn __go_bzip2_err_file_crc() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(104u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(107u8);
+    msg.push(115u8);
+    msg.push(117u8);
+    msg.push(109u8);
+    msg.push(32u8);
+    msg.push(109u8);
+    msg.push(105u8);
+    msg.push(115u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(99u8);
+    msg.push(104u8);
+    return go_errors_new_with_id(msg, (900074 as i64));
+}
+
+fn __go_bzip2_err_bad_magic_cont() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(98u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(103u8);
+    msg.push(105u8);
+    msg.push(99u8);
+    msg.push(32u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(117u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(117u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(105u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900075 as i64));
+}
+
+fn __go_bzip2_err_randomized() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(112u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(114u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(100u8);
+    msg.push(111u8);
+    msg.push(109u8);
+    msg.push(105u8);
+    msg.push(122u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(115u8);
+    return go_errors_new_with_id(msg, (900076 as i64));
+}
+
+fn __go_bzip2_err_no_symbols() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(110u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(121u8);
+    msg.push(109u8);
+    msg.push(98u8);
+    msg.push(111u8);
+    msg.push(108u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(112u8);
+    msg.push(117u8);
+    msg.push(116u8);
+    return go_errors_new_with_id(msg, (900077 as i64));
+}
+
+fn __go_bzip2_err_bad_tree_count() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(105u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(110u8);
+    msg.push(117u8);
+    msg.push(109u8);
+    msg.push(98u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(102u8);
+    msg.push(32u8);
+    msg.push(72u8);
+    msg.push(117u8);
+    msg.push(102u8);
+    msg.push(102u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(101u8);
+    msg.push(115u8);
+    return go_errors_new_with_id(msg, (900078 as i64));
+}
+
+fn __go_bzip2_err_tree_index() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(120u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(103u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900079 as i64));
+}
+
+fn __go_bzip2_err_huffman_length() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(72u8);
+    msg.push(117u8);
+    msg.push(102u8);
+    msg.push(102u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    msg.push(116u8);
+    msg.push(104u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(117u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(102u8);
+    msg.push(32u8);
+    msg.push(114u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900080 as i64));
+}
+
+fn __go_bzip2_err_no_selectors() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(110u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(103u8);
+    msg.push(105u8);
+    msg.push(118u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    return go_errors_new_with_id(msg, (900081 as i64));
+}
+
+fn __go_bzip2_err_selector_range() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(117u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(102u8);
+    msg.push(32u8);
+    msg.push(114u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900082 as i64));
+}
+
+fn __go_bzip2_err_insufficient_selectors() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(115u8);
+    msg.push(117u8);
+    msg.push(102u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(99u8);
+    msg.push(105u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(100u8);
+    msg.push(105u8);
+    msg.push(99u8);
+    msg.push(101u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(110u8);
+    msg.push(117u8);
+    msg.push(109u8);
+    msg.push(98u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(102u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(121u8);
+    msg.push(109u8);
+    msg.push(98u8);
+    msg.push(111u8);
+    msg.push(108u8);
+    msg.push(115u8);
+    return go_errors_new_with_id(msg, (900083 as i64));
+}
+
+fn __go_bzip2_err_repeat_too_large() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(112u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(117u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(103u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900084 as i64));
+}
+
+fn __go_bzip2_err_repeats_past_end() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(112u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(112u8);
+    msg.push(97u8);
+    msg.push(115u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(102u8);
+    msg.push(32u8);
+    msg.push(98u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(99u8);
+    msg.push(107u8);
+    return go_errors_new_with_id(msg, (900085 as i64));
+}
+
+fn __go_bzip2_err_data_exceeds_block() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(100u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(97u8);
+    msg.push(32u8);
+    msg.push(101u8);
+    msg.push(120u8);
+    msg.push(99u8);
+    msg.push(101u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(98u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(99u8);
+    msg.push(107u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(105u8);
+    msg.push(122u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900086 as i64));
+}
+
+fn __go_bzip2_err_orig_ptr() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(103u8);
+    msg.push(80u8);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(117u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(111u8);
+    msg.push(102u8);
+    msg.push(32u8);
+    msg.push(98u8);
+    msg.push(111u8);
+    msg.push(117u8);
+    msg.push(110u8);
+    msg.push(100u8);
+    msg.push(115u8);
+    return go_errors_new_with_id(msg, (900087 as i64));
+}
+
+fn __go_bzip2_err_empty_huffman() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(101u8);
+    msg.push(109u8);
+    msg.push(112u8);
+    msg.push(116u8);
+    msg.push(121u8);
+    msg.push(32u8);
+    msg.push(72u8);
+    msg.push(117u8);
+    msg.push(102u8);
+    msg.push(102u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900088 as i64));
+}
+
+fn __go_bzip2_err_equal_symbols() -> ptr {
+    let msg = Vec::new();
+    __go_bzip2_msg_prefix(&msg);
+    msg.push(101u8);
+    msg.push(113u8);
+    msg.push(117u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(121u8);
+    msg.push(109u8);
+    msg.push(98u8);
+    msg.push(111u8);
+    msg.push(108u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(72u8);
+    msg.push(117u8);
+    msg.push(102u8);
+    msg.push(102u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900089 as i64));
+}
+
+// ---------- structs ----------
+
+struct GosBzip2BitReader {
+    src: Vec<u8>,
+    pos: i64,
+    n: u64,
+    bits: u64,
+    err: ptr,
+}
+
+struct GosBzip2ByteResult {
+    b: u8,
+    err: ptr,
+}
+
+struct GosBzip2HuffmanNode {
+    left: u64,
+    right: u64,
+    left_value: u64,
+    right_value: u64,
+}
+
+struct GosBzip2HuffmanTree {
+    nodes: Vec<GosBzip2HuffmanNode>,
+    next_node: i64,
+}
+
+struct GosBzip2HuffmanTreeResult {
+    tree: GosBzip2HuffmanTree,
+    err: ptr,
+}
+
+struct GosBzip2BuildNodeResult {
+    index: u64,
+    err: ptr,
+}
+
+struct GosBzip2HuffmanPair {
+    value: u64,
+    length: u64,
+}
+
+struct GosBzip2HuffmanCode {
+    code: u64,
+    code_len: u64,
+    value: u64,
+}
+
+struct GosBzip2Mtf {
+    list: Vec<u8>,
+}
+
+struct GosBzip2Reader {
+    br: GosBzip2BitReader,
+    file_crc: u64,
+    block_crc: u64,
+    want_block_crc: u64,
+    setup_done: bool,
+    eof: bool,
+    block_size: i64,
+    c: Vec<u64>,
+    tt: Vec<u64>,
+    t_pos: u64,
+    pre_rle_used: i64,
+    pre_rle_len: i64,
+    last_byte: i64,
+    byte_repeats: u64,
+    repeats: u64,
+    crc_tab: Vec<u64>,
+}
+
+// ---------- bit reader ----------
+
+fn __go_bzip2_bit_reader_new(src: Vec<u8>) -> GosBzip2BitReader {
+    return GosBzip2BitReader { src: src, pos: 0, n: 0, bits: 0, err: go_errors_nil() };
+}
+
+// Raw byte from the underlying source. Callers in the
+// continuation path only call this when br.bits == 0
+// (the byte boundary was restored first), exactly as
+// Go's read() calls br.r.ReadByte().
+fn __go_bzip2_bit_reader_read_byte(br: &GosBzip2BitReader) -> GosBzip2ByteResult {
+    if br.pos >= len(br.src) {
+        return GosBzip2ByteResult { b: 0, err: go_io_eof() };
+    };
+    let b = br.src[br.pos];
+    br.pos = br.pos + 1;
+    return GosBzip2ByteResult { b: b, err: go_errors_nil() };
+}
+
+// ReadBits64: Go's bitReader.ReadBits64, mirrored
+// exactly -- buffered bits are returned even after an
+// error is set (divergence D4); a fresh byte is only
+// read when more bits are needed. On a short read the
+// error is stored on br (EOF becomes ErrUnexpectedEOF,
+// as in Go) and 0 is returned.
+fn __go_bzip2_read_bits64(br: &GosBzip2BitReader, bits: u64) -> u64 {
+    while bits > br.bits {
+        let rb = __go_bzip2_bit_reader_read_byte(br);
+        if !__go_bzip2_is_nil(rb.err) {
+            if __go_bzip2_is_eof(rb.err) {
+                br.err = go_io_err_unexpected_eof();
+            } else {
+                br.err = rb.err;
+            };
+            return 0;
+        };
+        br.n = (br.n << 8) | (rb.b as u64);
+        br.bits = br.bits + (8 as u64);
+    }
+    // Go: n = (br.n >> (br.bits - bits)) & ((1 << bits) - 1).
+    // The valid bits are the low br.bits bits of br.n; the
+    // answer is their top `bits` bits, MSB first. Extracted
+    // one bit at a time with a mask (a variable right shift
+    // has no corpus precedent; the variable left shift
+    // used for the mask does).
+    let n = (0 as u64);
+    let k = (0 as u64);
+    while k < bits {
+        let pos = br.bits - (1 as u64) - k;
+        let mask = (1 as u64) << pos;
+        let b = (0 as u64);
+        if (br.n & mask) != (0 as u64) {
+            b = (1 as u64);
+        };
+        n = (n << 1) | b;
+        k = k + (1 as u64);
+    }
+    br.bits = br.bits - bits;
+    return n;
+}
+
+fn __go_bzip2_read_bits(br: &GosBzip2BitReader, bits: u64) -> u64 {
+    return __go_bzip2_read_bits64(br, bits);
+}
+
+fn __go_bzip2_read_bit(br: &GosBzip2BitReader) -> bool {
+    return __go_bzip2_read_bits(br, 1) != (0 as u64);
+}
+
+fn __go_bzip2_bit_reader_err(br: &GosBzip2BitReader) -> ptr {
+    return br.err;
+}
+
+// ---------- CRC ----------
+
+// The bzip2 CRC table (Go's init() over poly
+// 0x04C11DB7). Built at runtime exactly like Go's
+// init loop; crc32.sla builds its tables the same way.
+// Every step keeps the 32-bit masking invariant (SLA
+// u64 arithmetic wraps mod 2^64; the mask restores
+// Go's uint32 wrap).
+fn __go_bzip2_crc_table() -> Vec<u64> {
+    let t = Vec::new();
+    let i = 0;
+    while i < 256 {
+        let crc = (i as u64) << 24;
+        let j = 0;
+        while j < 8 {
+            if (crc & (2147483648 as u64)) != (0 as u64) {
+                crc = ((crc << 1) ^ GO_BZIP2_CRC_POLY) & (4294967295 as u64);
+            } else {
+                crc = (crc << 1) & (4294967295 as u64);
+            };
+            j = j + 1;
+        }
+        t.push(crc);
+        i = i + 1;
+    }
+    return t;
+}
+
+// One byte of the CRC fold. Go's updateCRC inverts at
+// both ends; folding one byte at a time with the
+// finalised value kept between steps is the same fold.
+fn __go_bzip2_crc_step(crc: u64, tab: &Vec<u64>, b: u8) -> u64 {
+    let c = crc ^ (4294967295 as u64);
+    let idx = ((c >> 24) & (255 as u64)) ^ (b as u64);
+    c = tab[idx] ^ ((c << 8) & (4294967295 as u64));
+    return c ^ (4294967295 as u64);
+}
+
+// updateCRC(val, b): Go's updateCRC. The initial value
+// is 0 (the digest's stored, finalised value).
+fn __go_bzip2_update_crc(val: u64, tab: &Vec<u64>, b: Vec<u8>) -> u64 {
+    let crc = val;
+    let i = 0;
+    while i < len(b) {
+        crc = __go_bzip2_crc_step(crc, tab, b[i]);
+        i = i + 1;
+    }
+    return crc;
+}
+
+// ---------- move-to-front decoder ----------
+
+fn __go_bzip2_mtf_new(symbols: Vec<u8>) -> GosBzip2Mtf {
+    if len(symbols) > 256 {
+        panic(77466);
+    };
+    return GosBzip2Mtf { list: symbols };
+}
+
+fn __go_bzip2_mtf_new_range(n: i64) -> GosBzip2Mtf {
+    if n > 256 {
+        panic(77467);
+    };
+    let m = Vec::new();
+    let i = 0;
+    while i < n {
+        m.push((i as u8));
+        i = i + 1;
+    }
+    return GosBzip2Mtf { list: m };
+}
+
+fn __go_bzip2_mtf_decode(m: &GosBzip2Mtf, n: i64) -> u8 {
+    let b = m.list[n];
+    let i = n;
+    while i > 0 {
+        m.list[i] = m.list[i - 1];
+        i = i - 1;
+    }
+    m.list[0] = b;
+    return b;
+}
+
+fn __go_bzip2_mtf_first(m: &GosBzip2Mtf) -> u8 {
+    return m.list[0];
+}
+
+// ---------- Huffman tree ----------
+
+// less for sort.sla's go_sort_vec: (length, value),
+// ascending. Pairs are unique, so no tie can occur.
+fn __go_bzip2_less_pair(a: &GosBzip2HuffmanPair, b: &GosBzip2HuffmanPair) -> bool {
+    if a.length != b.length {
+        return a.length < b.length;
+    };
+    return a.value < b.value;
+}
+
+// less for go_sort_vec: code ascending. Canonical
+// codes are unique, so no tie can occur.
+fn __go_bzip2_less_code(a: &GosBzip2HuffmanCode, b: &GosBzip2HuffmanCode) -> bool {
+    return a.code < b.code;
+}
+
+// newHuffmanTree: Go's newHuffmanTree. Builds the
+// canonical tree from code lengths. lengths is taken
+// by reference and never mutated (divergence D7).
+fn __go_bzip2_new_huffman_tree(lengths: &Vec<u64>) -> GosBzip2HuffmanTreeResult {
+    if len(lengths) < 2 {
+        panic(77465);
+    };
+    let pairs: Vec<GosBzip2HuffmanPair> = Vec::new();
+    let i = 0;
+    while i < len(lengths) {
+        pairs.push(GosBzip2HuffmanPair { value: (i as u64), length: lengths[i] });
+        i = i + 1;
+    }
+    go_sort_vec(&pairs, __go_bzip2_less_pair);
+    let code = (0 as u64);
+    let length = (32 as u64);
+    let codes: Vec<GosBzip2HuffmanCode> = Vec::new();
+    let j = len(pairs) - 1;
+    while j >= 0 {
+        let p = pairs[j];
+        if length > p.length {
+            length = p.length;
+        };
+        codes.push(GosBzip2HuffmanCode { code: code, code_len: length, value: p.value });
+        code = code + ((1 as u64) << ((32 as u64) - length));
+        j = j - 1;
+    }
+    go_sort_vec(&codes, __go_bzip2_less_code);
+    let nodes = Vec::new();
+    let k = 0;
+    while k < len(codes) {
+        nodes.push(GosBzip2HuffmanNode { left: 0, right: 0, left_value: 0, right_value: 0 });
+        k = k + 1;
+    }
+    let t = GosBzip2HuffmanTree { nodes: nodes, next_node: 0 };
+    let res = __go_bzip2_build_huffman_node(&t, &codes, 0, len(codes), 0);
+    if !__go_bzip2_is_nil(res.err) {
+        return GosBzip2HuffmanTreeResult { tree: t, err: res.err };
+    };
+    return GosBzip2HuffmanTreeResult { tree: t, err: go_errors_nil() };
+}
+
+// buildHuffmanNode: Go's buildHuffmanNode. Recursive,
+// non-generic (the p_sort_g precedent: non-generic
+// self-recursion checks). codes is passed with [lo, hi)
+// bounds instead of sub-slices (SLA Vecs are owned;
+// the bounds form is exactly equivalent). The caller
+// keeps the tree in `t`; children are built first and
+// their indexes are written into the parent node after
+// the recursive call returns, so no reference is held
+// across a call.
+fn __go_bzip2_build_huffman_node(t: &GosBzip2HuffmanTree, codes: &Vec<GosBzip2HuffmanCode>, lo: i64, hi: i64, level: u64) -> GosBzip2BuildNodeResult {
+    if level > 31 {
+        return GosBzip2BuildNodeResult { index: 0, err: __go_bzip2_err_equal_symbols() };
+    };
+    let test = (1 as u64) << ((31 as u64) - level);
+    let first_right = hi;
+    let i = lo;
+    while i < hi {
+        let cd = codes[i];
+        if (cd.code & test) != (0 as u64) {
+            first_right = i;
+            break;
+        };
+        i = i + 1;
+    }
+    let left_len = first_right - lo;
+    let right_len = hi - first_right;
+    if left_len == 0 || right_len == 0 {
+        if hi - lo < 2 {
+            return GosBzip2BuildNodeResult { index: 0, err: __go_bzip2_err_empty_huffman() };
+        };
+        if level == 31 {
+            return GosBzip2BuildNodeResult { index: 0, err: __go_bzip2_err_equal_symbols() };
+        };
+        if left_len == 0 {
+            return __go_bzip2_build_huffman_node(t, codes, first_right, hi, level + (1 as u64));
+        };
+        return __go_bzip2_build_huffman_node(t, codes, lo, first_right, level + (1 as u64));
+    };
+    let node_index = (t.next_node as u64);
+    t.next_node = t.next_node + 1;
+    if left_len == 1 {
+        let cd = codes[lo];
+        t.nodes[node_index].left = GO_BZIP2_INVALID_NODE;
+        t.nodes[node_index].left_value = cd.value;
+    } else {
+        let lres = __go_bzip2_build_huffman_node(t, codes, lo, first_right, level + (1 as u64));
+        if !__go_bzip2_is_nil(lres.err) {
+            return lres;
+        };
+        t.nodes[node_index].left = lres.index;
+    };
+    if right_len == 1 {
+        let cd = codes[first_right];
+        t.nodes[node_index].right = GO_BZIP2_INVALID_NODE;
+        t.nodes[node_index].right_value = cd.value;
+    } else {
+        let rres = __go_bzip2_build_huffman_node(t, codes, first_right, hi, level + (1 as u64));
+        if !__go_bzip2_is_nil(rres.err) {
+            return rres;
+        };
+        t.nodes[node_index].right = rres.index;
+    };
+    return GosBzip2BuildNodeResult { index: node_index, err: go_errors_nil() };
+}
+
+// Decode: Go's (huffmanTree).Decode. Navigates the
+// tree bit by bit. Fast path reads br.n directly when
+// bits remain (divergence D6: the & 63 mask is omitted,
+// br.bits is always < 64 here); slow path goes through
+// ReadBits.
+fn __go_bzip2_huffman_decode(t: &GosBzip2HuffmanTree, br: &GosBzip2BitReader) -> u64 {
+    let node_index = (0 as u64);
+    while true {
+        let node = t.nodes[node_index];
+        let bit = (0 as u64);
+        if br.bits > (0 as u64) {
+            br.bits = br.bits - (1 as u64);
+            let mask = (1 as u64) << br.bits;
+            if (br.n & mask) != (0 as u64) {
+                bit = (1 as u64);
+            } else {
+                bit = (0 as u64);
+            };
+        } else {
+            bit = __go_bzip2_read_bits(br, 1);
+        };
+        if bit == (1 as u64) {
+            node_index = node.left;
+        } else {
+            node_index = node.right;
+        };
+        if node_index == GO_BZIP2_INVALID_NODE {
+            if bit == (1 as u64) {
+                return node.left_value;
+            } else {
+                return node.right_value;
+            };
+        };
+    }
+    return 0;
+}
+
+// ---------- inverse Burrows-Wheeler transform ----------
+
+// Go's inverseBWT. tt and c are mutated in place
+// (the "single array" method: the output stays
+// shuffled in the bottom 8 bits of tt with the index
+// of the next byte in the top 24 bits). Returns the
+// index of the first byte.
+fn __go_bzip2_inverse_bwt(tt: &Vec<u64>, orig_ptr: u64, c: &Vec<u64>) -> u64 {
+    let sum = (0 as u64);
+    let i = 0;
+    while i < 256 {
+        sum = sum + c[i];
+        c[i] = sum - c[i];
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(tt) {
+        let b = tt[j] & (255 as u64);
+        let idx = c[b];
+        let cur = tt[idx];
+        tt[idx] = cur | ((j as u64) << 8);
+        c[b] = c[b] + (1 as u64);
+        j = j + 1;
+    }
+    return tt[orig_ptr] >> 8;
+}
+
+// ---------- reader ----------
+
+// NewReader: Go's NewReader, over the compressed bytes
+// directly (divergence D0). The CRC table is built once
+// here (divergence D3); tt is allocated in setup, when
+// the block size is known.
+fn go_bzip2_new_reader(data: Vec<u8>) -> GosBzip2Reader {
+    let c = Vec::new();
+    let i = 0;
+    while i < 256 {
+        c.push((0 as u64));
+        i = i + 1;
+    }
+    return GosBzip2Reader {
+        br: __go_bzip2_bit_reader_new(data),
+        file_crc: 0,
+        block_crc: 0,
+        want_block_crc: 0,
+        setup_done: false,
+        eof: false,
+        block_size: 0,
+        c: c,
+        tt: Vec::new(),
+        t_pos: 0,
+        pre_rle_used: 0,
+        pre_rle_len: 0,
+        last_byte: -1,
+        byte_repeats: 0,
+        repeats: 0,
+        crc_tab: __go_bzip2_crc_table(),
+    };
+}
+
+// setup: Go's (reader).setup. need_magic is true for
+// the first stream, false for a concatenated stream
+// (whose BZ was already consumed by the caller).
+fn __go_bzip2_reader_setup(r: &GosBzip2Reader, need_magic: bool) -> ptr {
+    if need_magic {
+        let magic = __go_bzip2_read_bits(&r.br, 16);
+        if magic != GO_BZIP2_FILE_MAGIC {
+            return __go_bzip2_err_bad_magic();
+        };
+    };
+    let t = __go_bzip2_read_bits(&r.br, 8);
+    if t != (104 as u64) {
+        return __go_bzip2_err_non_huffman();
+    };
+    let level = __go_bzip2_read_bits(&r.br, 8);
+    if level < (49 as u64) || level > (57 as u64) {
+        return __go_bzip2_err_bad_level();
+    };
+    r.file_crc = (0 as u64);
+    r.block_size = (100 as i64) * (1000 as i64) * ((level as i64) - (48 as i64));
+    if r.block_size > len(r.tt) {
+        let tt = Vec::new();
+        let i = 0;
+        while i < r.block_size {
+            tt.push((0 as u64));
+            i = i + 1;
+        }
+        r.tt = tt;
+    };
+    return go_errors_nil();
+}
+
+// readFromBlock: Go's (reader).readFromBlock. Emits
+// the pending RLE data into dst (up to max bytes).
+// Returns the number of bytes emitted.
+fn __go_bzip2_read_from_block(r: &GosBzip2Reader, dst: &Vec<u8>, max: i64) -> i64 {
+    let n = 0;
+    while (r.repeats > (0 as u64) || r.pre_rle_used < r.pre_rle_len) && n < max {
+        if r.repeats > (0 as u64) {
+            dst.push((r.last_byte as u8));
+            n = n + 1;
+            r.repeats = r.repeats - (1 as u64);
+            if r.repeats == (0 as u64) {
+                r.last_byte = -1;
+            };
+            continue;
+        };
+        r.t_pos = r.tt[r.t_pos];
+        let b = r.t_pos & (255 as u64);
+        r.t_pos = r.t_pos >> 8;
+        r.pre_rle_used = r.pre_rle_used + 1;
+        if r.byte_repeats == (3 as u64) {
+            r.repeats = b;
+            r.byte_repeats = (0 as u64);
+            continue;
+        };
+        if r.last_byte == (b as i64) {
+            r.byte_repeats = r.byte_repeats + (1 as u64);
+        } else {
+            r.byte_repeats = (0 as u64);
+        };
+        r.last_byte = (b as i64);
+        dst.push((b as u8));
+        n = n + 1;
+    }
+    return n;
+}
+
+// Read: Go's (reader).Read. Appends up to max
+// decompressed bytes to dst; (0, EOF) at end of stream.
+fn go_bzip2_reader_read(r: &GosBzip2Reader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if r.eof {
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    if !r.setup_done {
+        let setup_err = __go_bzip2_reader_setup(r, true);
+        let br_err = __go_bzip2_bit_reader_err(&r.br);
+        let err = setup_err;
+        if !__go_bzip2_is_nil(br_err) {
+            err = br_err;
+        };
+        if !__go_bzip2_is_nil(err) {
+            return GoIoResult { n: 0, err: err };
+        };
+        r.setup_done = true;
+    };
+    return __go_bzip2_reader_read_inner(r, dst, max);
+}
+
+// read: Go's (reader).read -- the block loop.
+fn __go_bzip2_reader_read_inner(r: &GosBzip2Reader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    while true {
+        let before = len(dst);
+        let n = __go_bzip2_read_from_block(r, dst, max);
+        if n > 0 || max == 0 {
+            r.block_crc = __go_bzip2_update_crc(r.block_crc, &r.crc_tab, __go_bzip2_slice(dst, before, before + n));
+            return GoIoResult { n: n, err: go_errors_nil() };
+        };
+        if r.block_crc != r.want_block_crc {
+            r.br.err = __go_bzip2_err_block_crc();
+            return GoIoResult { n: 0, err: r.br.err };
+        };
+        let magic = __go_bzip2_read_bits64(&r.br, 48);
+        if magic == GO_BZIP2_BLOCK_MAGIC {
+            let err = __go_bzip2_read_block(r);
+            if !__go_bzip2_is_nil(err) {
+                return GoIoResult { n: 0, err: err };
+            };
+        } else if magic == GO_BZIP2_FINAL_MAGIC {
+            let want_file_crc = __go_bzip2_read_bits64(&r.br, 32);
+            if !__go_bzip2_is_nil(r.br.err) {
+                return GoIoResult { n: 0, err: r.br.err };
+            };
+            if r.file_crc != want_file_crc {
+                r.br.err = __go_bzip2_err_file_crc();
+                return GoIoResult { n: 0, err: r.br.err };
+            };
+            if r.br.bits % (8 as u64) != (0 as u64) {
+                __go_bzip2_read_bits(&r.br, r.br.bits % (8 as u64));
+            };
+            let bres = __go_bzip2_bit_reader_read_byte(&r.br);
+            if __go_bzip2_is_eof(bres.err) {
+                r.br.err = go_io_eof();
+                r.eof = true;
+                return GoIoResult { n: 0, err: go_io_eof() };
+            };
+            if !__go_bzip2_is_nil(bres.err) {
+                r.br.err = bres.err;
+                return GoIoResult { n: 0, err: bres.err };
+            };
+            let zres = __go_bzip2_bit_reader_read_byte(&r.br);
+            if !__go_bzip2_is_nil(zres.err) {
+                if __go_bzip2_is_eof(zres.err) {
+                    r.br.err = go_io_err_unexpected_eof();
+                    return GoIoResult { n: 0, err: go_io_err_unexpected_eof() };
+                };
+                r.br.err = zres.err;
+                return GoIoResult { n: 0, err: zres.err };
+            };
+            if bres.b != (66u8) || zres.b != (90u8) {
+                return GoIoResult { n: 0, err: __go_bzip2_err_bad_magic_cont() };
+            };
+            let serr = __go_bzip2_reader_setup(r, false);
+            if !__go_bzip2_is_nil(serr) {
+                return GoIoResult { n: 0, err: serr };
+            };
+        } else {
+            return GoIoResult { n: 0, err: __go_bzip2_err_bad_magic() };
+        };
+    }
+    return GoIoResult { n: 0, err: go_io_eof() };
+}
+
+// readBlock: Go's (reader).readBlock. The block magic
+// has already been consumed by the caller.
+fn __go_bzip2_read_block(r: &GosBzip2Reader) -> ptr {
+    r.want_block_crc = __go_bzip2_read_bits64(&r.br, 32);
+    r.block_crc = (0 as u64);
+    r.file_crc = ((((r.file_crc << 1) & (4294967295 as u64)) | (r.file_crc >> 31)) ^ r.want_block_crc);
+    let randomized = __go_bzip2_read_bits(&r.br, 1);
+    if randomized != (0 as u64) {
+        return __go_bzip2_err_randomized();
+    };
+    let orig_ptr = __go_bzip2_read_bits(&r.br, 24);
+    let symbol_range_bitmap = __go_bzip2_read_bits(&r.br, 16);
+    let symbol_present = Vec::new();
+    let sp = 0;
+    while sp < 256 {
+        symbol_present.push(false);
+        sp = sp + 1;
+    }
+    let num_symbols = 0;
+    let sym_range = 0;
+    while sym_range < 16 {
+        if (symbol_range_bitmap & ((1 as u64) << ((15 - sym_range) as u64))) != (0 as u64) {
+            let bits = __go_bzip2_read_bits(&r.br, 16);
+            let symbol = 0;
+            while symbol < 16 {
+                if (bits & ((1 as u64) << ((15 - symbol) as u64))) != (0 as u64) {
+                    symbol_present[16 * sym_range + symbol] = true;
+                    num_symbols = num_symbols + 1;
+                };
+                symbol = symbol + 1;
+            }
+        };
+        sym_range = sym_range + 1;
+    }
+    if num_symbols == 0 {
+        return __go_bzip2_err_no_symbols();
+    };
+    let num_huffman_trees = __go_bzip2_read_bits(&r.br, 3) as i64;
+    if num_huffman_trees < 2 || num_huffman_trees > 6 {
+        return __go_bzip2_err_bad_tree_count();
+    };
+    let num_selectors = __go_bzip2_read_bits(&r.br, 15) as i64;
+    let tree_indexes = Vec::new();
+    let ti = 0;
+    while ti < num_selectors {
+        tree_indexes.push((0 as u64));
+        ti = ti + 1;
+    }
+    let mtf_tree = __go_bzip2_mtf_new_range(num_huffman_trees);
+    let i = 0;
+    while i < num_selectors {
+        let c = 0;
+        while true {
+            let inc = __go_bzip2_read_bits(&r.br, 1);
+            if inc == (0 as u64) {
+                break;
+            };
+            c = c + 1;
+        }
+        if c >= num_huffman_trees {
+            return __go_bzip2_err_tree_index();
+        };
+        tree_indexes[i] = (__go_bzip2_mtf_decode(&mtf_tree, c) as u64);
+        i = i + 1;
+    }
+    let symbols = Vec::new();
+    let si = 0;
+    while si < 256 {
+        if symbol_present[si] {
+            symbols.push((si as u8));
+        };
+        si = si + 1;
+    }
+    let mtf = __go_bzip2_mtf_new(symbols);
+    num_symbols = num_symbols + 2;
+    let huffman_trees = Vec::new();
+    let lengths = Vec::new();
+    let li = 0;
+    while li < num_symbols {
+        lengths.push((0 as u64));
+        li = li + 1;
+    }
+    let hi = 0;
+    while hi < num_huffman_trees {
+        let length = __go_bzip2_read_bits(&r.br, 5);
+        let j = 0;
+        while j < num_symbols {
+            while true {
+                if length < (1 as u64) || length > (20 as u64) {
+                    return __go_bzip2_err_huffman_length();
+                };
+                if !__go_bzip2_read_bit(&r.br) {
+                    break;
+                };
+                if __go_bzip2_read_bit(&r.br) {
+                    length = length - (1 as u64);
+                } else {
+                    length = length + (1 as u64);
+                };
+            }
+            lengths[j] = length;
+            j = j + 1;
+        }
+        let res = __go_bzip2_new_huffman_tree(&lengths);
+        if !__go_bzip2_is_nil(res.err) {
+            return res.err;
+        };
+        huffman_trees.push(res.tree);
+        hi = hi + 1;
+    }
+    let selector_index = 1;
+    if len(tree_indexes) == 0 {
+        return __go_bzip2_err_no_selectors();
+    };
+    if tree_indexes[0] >= (len(huffman_trees) as u64) {
+        return __go_bzip2_err_selector_range();
+    };
+    let current_tree = tree_indexes[0];
+    let ci = 0;
+    while ci < 256 {
+        r.c[ci] = (0 as u64);
+        ci = ci + 1;
+    }
+    let buf_index = 0;
+    let repeat = (0 as u64);
+    let repeat_power = (0 as u64);
+    let decoded = 0;
+    while true {
+        if decoded == 50 {
+            if selector_index >= num_selectors {
+                return __go_bzip2_err_insufficient_selectors();
+            };
+            if tree_indexes[selector_index] >= (len(huffman_trees) as u64) {
+                return __go_bzip2_err_selector_range();
+            };
+            current_tree = tree_indexes[selector_index];
+            selector_index = selector_index + 1;
+            decoded = 0;
+        };
+        let v = __go_bzip2_huffman_decode(&huffman_trees[current_tree], &r.br);
+        decoded = decoded + 1;
+        if v < (2 as u64) {
+            if repeat == (0 as u64) {
+                repeat_power = (1 as u64);
+            };
+            repeat = repeat + (repeat_power << v);
+            repeat_power = repeat_power << 1;
+            if repeat > GO_BZIP2_REPEAT_LIMIT {
+                return __go_bzip2_err_repeat_too_large();
+            };
+            continue;
+        };
+        if repeat > (0 as u64) {
+            if repeat > ((r.block_size - buf_index) as u64) {
+                return __go_bzip2_err_repeats_past_end();
+            };
+            let k = 0;
+            while k < (repeat as i64) {
+                let b = __go_bzip2_mtf_first(&mtf);
+                r.tt[buf_index] = (b as u64);
+                r.c[(b as u64)] = r.c[(b as u64)] + (1 as u64);
+                buf_index = buf_index + 1;
+                k = k + 1;
+            }
+            repeat = (0 as u64);
+        };
+        if v == ((num_symbols - 1) as u64) {
+            break;
+        };
+        let b = __go_bzip2_mtf_decode(&mtf, ((v - 1) as i64));
+        if buf_index >= r.block_size {
+            return __go_bzip2_err_data_exceeds_block();
+        };
+        r.tt[buf_index] = (b as u64);
+        r.c[(b as u64)] = r.c[(b as u64)] + (1 as u64);
+        buf_index = buf_index + 1;
+    }
+    if orig_ptr >= (buf_index as u64) {
+        return __go_bzip2_err_orig_ptr();
+    };
+    r.pre_rle_len = buf_index;
+    r.pre_rle_used = 0;
+    r.t_pos = __go_bzip2_inverse_bwt(&r.tt, orig_ptr, &r.c);
+    r.last_byte = -1;
+    r.byte_repeats = (0 as u64);
+    r.repeats = (0 as u64);
+    return go_errors_nil();
+}
+
+// ---------- corpus example ----------
+
+// Decompresses a fixed 65-byte bzip2 stream (level 9,
+// produced by Python's bz2 over the 44-byte plaintext
+// "hello bzip2 world, hello bzip2 world, hello!") and
+// checks the output byte for byte. Check-verified only
+// (not executed; build-exe is blocked by (lxxii)/(lxxiii)).
+fn go_bzip2_demo_roundtrip() -> bool {
+    let data = Vec::new();
+    data.push(66u8);
+    data.push(90u8);
+    data.push(104u8);
+    data.push(57u8);
+    data.push(49u8);
+    data.push(65u8);
+    data.push(89u8);
+    data.push(38u8);
+    data.push(83u8);
+    data.push(89u8);
+    data.push(118u8);
+    data.push(2u8);
+    data.push(114u8);
+    data.push(59u8);
+    data.push(0u8);
+    data.push(0u8);
+    data.push(9u8);
+    data.push(25u8);
+    data.push(128u8);
+    data.push(96u8);
+    data.push(4u8);
+    data.push(16u8);
+    data.push(0u8);
+    data.push(22u8);
+    data.push(100u8);
+    data.push(208u8);
+    data.push(144u8);
+    data.push(32u8);
+    data.push(0u8);
+    data.push(33u8);
+    data.push(41u8);
+    data.push(26u8);
+    data.push(52u8);
+    data.push(50u8);
+    data.push(61u8);
+    data.push(66u8);
+    data.push(152u8);
+    data.push(0u8);
+    data.push(9u8);
+    data.push(28u8);
+    data.push(193u8);
+    data.push(120u8);
+    data.push(40u8);
+    data.push(201u8);
+    data.push(68u8);
+    data.push(182u8);
+    data.push(220u8);
+    data.push(71u8);
+    data.push(142u8);
+    data.push(180u8);
+    data.push(12u8);
+    data.push(132u8);
+    data.push(81u8);
+    data.push(161u8);
+    data.push(31u8);
+    data.push(23u8);
+    data.push(114u8);
+    data.push(69u8);
+    data.push(56u8);
+    data.push(80u8);
+    data.push(144u8);
+    data.push(118u8);
+    data.push(2u8);
+    data.push(114u8);
+    data.push(59u8);
+    let expected = Vec::new();
+    expected.push(104u8);
+    expected.push(101u8);
+    expected.push(108u8);
+    expected.push(108u8);
+    expected.push(111u8);
+    expected.push(32u8);
+    expected.push(98u8);
+    expected.push(122u8);
+    expected.push(105u8);
+    expected.push(112u8);
+    expected.push(50u8);
+    expected.push(32u8);
+    expected.push(119u8);
+    expected.push(111u8);
+    expected.push(114u8);
+    expected.push(108u8);
+    expected.push(100u8);
+    expected.push(44u8);
+    expected.push(32u8);
+    expected.push(104u8);
+    expected.push(101u8);
+    expected.push(108u8);
+    expected.push(108u8);
+    expected.push(111u8);
+    expected.push(32u8);
+    expected.push(98u8);
+    expected.push(122u8);
+    expected.push(105u8);
+    expected.push(112u8);
+    expected.push(50u8);
+    expected.push(32u8);
+    expected.push(119u8);
+    expected.push(111u8);
+    expected.push(114u8);
+    expected.push(108u8);
+    expected.push(100u8);
+    expected.push(44u8);
+    expected.push(32u8);
+    expected.push(104u8);
+    expected.push(101u8);
+    expected.push(108u8);
+    expected.push(108u8);
+    expected.push(111u8);
+    expected.push(33u8);
+    let r = go_bzip2_new_reader(data);
+    let out = Vec::new();
+    while true {
+        let res = go_bzip2_reader_read(&r, &out, 64);
+        if res.n == 0 {
+            if __go_bzip2_is_eof(res.err) {
+                break;
+            };
+            return false;
+        };
+    }
+    return go_bytes_equal(out, expected);
+}

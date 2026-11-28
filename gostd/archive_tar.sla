@@ -1,0 +1,3994 @@
+// gostd archive/tar: the SLA-side model of Go's archive/tar package.
+// Organisation follows the psa_std precedent: one .sla file per Go
+// package, public entry points named go_<pkg>_<name>, private
+// helpers __go_<pkg>_<name>, panic codes listed up front.
+//
+// Oracle: Go 1.27.2 archive/tar (common.go, format.go, reader.go,
+// writer.go, strconv.go, stat_unix.go, stat_actime1.go,
+// stat_actime2.go). The oracle sources are mirrored at
+// ~/workspace/task170-work/wave2-oracle/archive_tar/ (sha-verified
+// against the box's Go tree on 2026-11-28).
+//
+// Splice position: 29 (first wave-2 package, first 待写 in census
+// order; next are archive/zip, compress/*). Depends on: errors,
+// io (GosIoReader/GosIoWriter handles, GoIoResult, EOF 900010),
+// strconv (ParseUint/ParseInt/FormatInt/Quote), bytes, strings,
+// path (Clean for IsLocal), time (GoTime), sort is NOT used --
+// PAX record keys are sorted by a local insertion sort so tar
+// stays independent of the sort package.
+//
+// Writer conventions followed (see R1400-EXEC-170.md,
+// CONTEXT-B-FIX-170.md §5/§6, LIVLV-FIX-170.md §6):
+//   * SLA text only, sla/sa as black box. No fake declaration
+//     stubs, no top-level @extern (design_sai_only, R1520).
+//   * `if` blocks used as statements end with `};`.
+//   * No `~` unary operator (use 0u64 - x / 0 - x - 1).
+//   * No bare `(*p).field` dereference (use __go_err_node).
+//   * Vec::push MOVES its argument; by-value Vec args are
+//     shared handles (pushes through them are visible).
+//   * `&v[i]` borrow form is a known trap (lix) -- avoided;
+//     sparse-entry access uses let-bound copies.
+//   * Sentinel comparison always via errors.Is (S9).
+//   * Context value keys are frontend-assigned i64 ids (n/a
+//     here, no context use).
+//
+// Seams (cross-file calls, all landed in the corpus):
+//   errors: go_errors_new_with_id / go_errors_new / go_errors_nil
+//           / go_errors_is
+//   io:     go_io_reader_read / go_io_writer_write / go_io_eof /
+//           go_io_err_unexpected_eof
+//   strconv: go_strconv_parse_uint / go_strconv_parse_int /
+//           go_strconv_format_int / go_strconv_itoa /
+//           go_strconv_quote
+//   bytes:  go_bytes_clone / go_bytes_trim /
+//           go_bytes_index_byte / go_bytes_compare /
+//           go_bytes_has_prefix / go_bytes_has_suffix /
+//           go_bytes_split / go_bytes_equal / go_bytes_last_index_byte
+//   path:   go_path_clean / go_path_split / go_path_join
+//   time:   go_time_unix (GoTime struct fields read directly;
+//           round-to-second is implemented locally in tar
+//           because time.sla has no Round)
+//
+// Public API (Go name -> SLA name):
+//   tar.NewReader(r)            -> go_archive_tar_new_reader
+//   tar.NewReader with strict   -> go_archive_tar_new_reader_strict
+//     (Go gates strict path checking behind the GODEBUG
+//      tarinsecurepath=0 setting; gostd exposes it as an
+//      explicit constructor instead of a debug flag)
+//   (*Reader).Next()            -> go_archive_tar_reader_next
+//   (*Reader).Read(b)           -> go_archive_tar_reader_read
+//   tar.NewWriter(w)            -> go_archive_tar_new_writer
+//   (*Writer).Flush()           -> go_archive_tar_writer_flush
+//   (*Writer).WriteHeader(hdr)  -> go_archive_tar_writer_write_header
+//   (*Writer).Write(b)          -> go_archive_tar_writer_write
+//   (*Writer).Close()           -> go_archive_tar_writer_close
+//
+// Deliberately OMITTED (frontend refusals, codes RESERVED not
+// attached -- the slices 77419 precedent, not the maps stub
+// precedent: no callable SLA shape exists without io/fs):
+//   77444  FileInfoHeader(fi)  -- needs io/fs FileInfo (unwritten)
+//   77445  (Header).FileInfo() -- needs io/fs FileInfo (unwritten)
+//   77448  (*Writer).AddFS(fsys) -- needs fs.FS (unwritten)
+//   77449  RESERVED (spare, next tar code)
+//   77450  RESERVED (spare, next tar code)
+//   77433  NOT claimed (cmp.sla reserves it)
+//   77419  NOT claimed (slices iterators reserve it)
+//
+// Panic codes (gostd block 77400-77499): none live in this
+// file. The three codes above are reserved only; the file
+// panics only through go_errors helpers (77401 nil-error
+// dereference, owned by errors.sla).
+//
+// Target ids claimed (frontend-assigned i64, 900047-900056;
+// 900039-900046 are comment-only "not claimed" mentions in
+// the corpus and were NOT used):
+//   900047  ErrHeader          "archive/tar: invalid tar header"
+//   900048  ErrWriteTooLong    "archive/tar: write too long"
+//   900049  ErrFieldTooLong    "archive/tar: header field too long"
+//   900050  ErrWriteAfterClose "archive/tar: write after close"
+//   900051  ErrInsecurePath   "archive/tar: insecure file path"
+//   900052  errMissData        "archive/tar: sparse file references
+//                               non-existent data"
+//   900053  errUnrefData       "archive/tar: sparse file contains
+//                               unreferenced data"
+//   900054  errWriteHole       "archive/tar: write non-NUL byte in
+//                               sparse hole"
+//   900055  errSparseTooLong   "archive/tar: sparse map too long"
+//   900056  headerError        "archive/tar: cannot encode header"
+//                               (+ "; and "-joined reasons)
+//   900010  io.EOF (reused, owned by io.sla)
+//   900011  io.ErrUnexpectedEOF (reused, owned by io.sla)
+//
+// Known divergences from Go 1.27.2 (recorded, not hidden):
+//   D1  GoTime zero: time.Time has a monotonic wall/ext split
+//       and a "zero" sentinel (year 1). GoTime is
+//       {unix_ns, mono, has_mono}; the tar file stores
+//       unix_ns == 0 as the zero time. A real pre-1970 or
+//       post-2262 time whose unix_ns happens to be 0 is
+//       indistinguishable -- same treatment as the rest of
+//       the corpus, which has no zero-time helper.
+//   D2  Writer has NO sparse support in Go 1.27.2 (the
+//       sparse writer in writer.go is commented out), so
+//       WriteHeader never emits a GNU sparse map; a
+//       Header with sparse data is written as a plain
+//       regular file (Go does the same).
+//   D3  Go 1.27.2 Header has NO sparse fields (commented
+//       out in the oracle); sparse is reader-side only.
+//       GosTarHeader therefore has no sparse field either.
+//   D4  Typeflag is stored as i64 in GosTarHeader (corpus
+//       convention: small enums are i64); the on-disk byte
+//       is hdr.typeflag as u8. Constants are i64.
+//   D5  Format detection: the oracle reads the checksum
+//       field with parseNumeric; this file does the same
+//       (octal-first, base-256 if the high bit is set).
+//   D6  readHeader's USTAR trailing-slash quirk
+//       (formatString trims a trailing '/' when the field
+//       overflows) is ported faithfully.
+//   D7  The GNU longname/longlink + PAX + sparse readers
+//       share the Reader's underlying handle; the
+//       readSpecialFile path reads through the Reader's
+//       current-file Read (Go reads through tr, i.e. the
+//       current file reader), exactly as the oracle does.
+//   D8  Writer.WriteHeader for a GNU-format header with
+//       long name/linkname emits GNU 'L'/'K' extension
+//       records; for PAX it emits 'x' records; USTAR
+//       splits long names at '/' (format: ustar).
+//
+// Corpus example: go_archive_tar_demo_header_roundtrip() at
+// the end of this file builds a USTAR block from a header
+// and parses it back without any io handle, exercising the
+// format core. A full writer->reader roundtrip needs an
+// in-memory sink with a read-back accessor, which io.sla
+// does not expose yet (GosOffsetWriter has no bytes
+// accessor); that demo belongs in the splice harness once
+// the accessor exists.
+
+@import "sa_std/vec.sa"
+
+// ---------- Constants ----------
+
+const GO_TAR_BLOCK_SIZE: i64 = 512;
+const GO_TAR_NAME_SIZE: i64 = 100;
+const GO_TAR_PREFIX_SIZE: i64 = 155;
+const GO_TAR_MAX_SPECIAL_FILE_SIZE: i64 = 1048576;
+const GO_TAR_MAX_SPARSE_ENTRIES: i64 = 1048576;
+
+// Typeflags (Go byte values, stored as i64).
+const GO_TAR_TYPE_REG: i64 = 48;
+const GO_TAR_TYPE_REG_A: i64 = 0;
+const GO_TAR_TYPE_LINK: i64 = 49;
+const GO_TAR_TYPE_SYMLINK: i64 = 50;
+const GO_TAR_TYPE_CHAR: i64 = 51;
+const GO_TAR_TYPE_BLOCK: i64 = 52;
+const GO_TAR_TYPE_DIR: i64 = 53;
+const GO_TAR_TYPE_FIFO: i64 = 54;
+const GO_TAR_TYPE_CONT: i64 = 55;
+const GO_TAR_TYPE_X_HEADER: i64 = 120;
+const GO_TAR_TYPE_X_GLOBAL_HEADER: i64 = 103;
+const GO_TAR_TYPE_GNU_SPARSE: i64 = 83;
+const GO_TAR_TYPE_GNU_LONG_NAME: i64 = 76;
+const GO_TAR_TYPE_GNU_LONG_LINK: i64 = 75;
+
+// Formats (bitmask, Go values).
+const GO_TAR_FORMAT_UNKNOWN: i64 = 0;
+const GO_TAR_FORMAT_V7: i64 = 1;
+const GO_TAR_FORMAT_USTAR: i64 = 2;
+const GO_TAR_FORMAT_PAX: i64 = 4;
+const GO_TAR_FORMAT_GNU: i64 = 8;
+const GO_TAR_FORMAT_STAR: i64 = 16;
+
+// Target ids (see header).
+const GO_TAR_ID_ERR_HEADER: i64 = 900047;
+const GO_TAR_ID_ERR_WRITE_TOO_LONG: i64 = 900048;
+const GO_TAR_ID_ERR_FIELD_TOO_LONG: i64 = 900049;
+const GO_TAR_ID_ERR_WRITE_AFTER_CLOSE: i64 = 900050;
+const GO_TAR_ID_ERR_INSECURE_PATH: i64 = 900051;
+const GO_TAR_ID_ERR_MISS_DATA: i64 = 900052;
+const GO_TAR_ID_ERR_UNREF_DATA: i64 = 900053;
+const GO_TAR_ID_ERR_WRITE_HOLE: i64 = 900054;
+const GO_TAR_ID_ERR_SPARSE_TOO_LONG: i64 = 900055;
+const GO_TAR_ID_ERR_CANNOT_ENCODE: i64 = 900056;
+const GO_TAR_ID_EOF: i64 = 900010;
+const GO_TAR_ID_UNEXPECTED_EOF: i64 = 900011;
+
+// ---------- Structs ----------
+
+// A single PAX extended-header record (key=value).
+struct GosTarPaxRecord {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+// One sparse-file map entry: [offset, offset+length).
+struct GosTarSparseEntry {
+    offset: i64,
+    length: i64,
+}
+
+// tar.Header. Typeflag is i64 (see D4). Times are GoTime;
+// the zero time is unix_ns == 0 (see D1).
+struct GosTarHeader {
+    typeflag: i64,
+    name: Vec<u8>,
+    linkname: Vec<u8>,
+    size: i64,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    uname: Vec<u8>,
+    gname: Vec<u8>,
+    mod_time: GoTime,
+    access_time: GoTime,
+    change_time: GoTime,
+    devmajor: i64,
+    devminor: i64,
+    xattrs: Vec<GosTarPaxRecord>,
+    pax_records: Vec<GosTarPaxRecord>,
+    format: i64,
+}
+
+// tar.Reader. nb is the physical bytes remaining in the
+// current file; the logical remaining count is derived
+// (__go_tar_logical_remaining): for a sparse file the
+// last hole's end minus the position, otherwise nb.
+// err is sticky: once set, Next/Read keep returning it.
+struct GosTarReader {
+    r: GosIoReader,
+    pad: i64,
+    nb: i64,
+    err: ptr,
+    sparse_on: bool,
+    sparse_holes: Vec<GosTarSparseEntry>,
+    sparse_pos: i64,
+    strict_path: bool,
+}
+
+// tar.Writer. nb is the logical bytes remaining to write
+// for the current file; pad is the zero padding still owed
+// after it. err is sticky; closed marks Close() done.
+struct GosTarWriter {
+    w: GosIoWriter,
+    pad: i64,
+    nb: i64,
+    err: ptr,
+    closed: bool,
+    hdr: GosTarHeader,
+}
+
+// Next()/readHeader result: a header plus an error.
+struct GoTarNextResult {
+    hdr: GosTarHeader,
+    err: ptr,
+}
+
+// ---------- Error constructors ----------
+// Every tar error is a GosError built through
+// go_errors_new_with_id (frontend-assigned identity, S9:
+// sentinel comparison via errors.Is). Messages are built
+// by pushing byte literals -- SLA has no Str->Vec<u8>
+// conversion (see the corpus-wide convention in hex.sla).
+
+fn __go_tar_msg_prefix(out: &Vec<u8>) -> void {
+    out.push(97u8);
+    out.push(114u8);
+    out.push(99u8);
+    out.push(104u8);
+    out.push(105u8);
+    out.push(118u8);
+    out.push(101u8);
+    out.push(47u8);
+    out.push(116u8);
+    out.push(97u8);
+    out.push(114u8);
+    out.push(58u8);
+    out.push(32u8);
+    return;
+}
+
+fn __go_tar_err_header() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(105u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(104u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_HEADER);
+}
+
+fn __go_tar_err_write_too_long() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(119u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_WRITE_TOO_LONG);
+}
+
+fn __go_tar_err_field_too_long() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(104u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(101u8);
+    msg.push(108u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_FIELD_TOO_LONG);
+}
+
+fn __go_tar_err_write_after_close() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(119u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(97u8);
+    msg.push(102u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_WRITE_AFTER_CLOSE);
+}
+
+fn __go_tar_err_insecure_path() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(117u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(112u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(104u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_INSECURE_PATH);
+}
+
+fn __go_tar_err_miss_data() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(115u8);
+    msg.push(112u8);
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(102u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(99u8);
+    msg.push(101u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(110u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(45u8);
+    msg.push(101u8);
+    msg.push(120u8);
+    msg.push(105u8);
+    msg.push(115u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(100u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(97u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_MISS_DATA);
+}
+
+fn __go_tar_err_unref_data() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(115u8);
+    msg.push(112u8);
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(97u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(115u8);
+    msg.push(32u8);
+    msg.push(117u8);
+    msg.push(110u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(102u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(99u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(100u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(97u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_UNREF_DATA);
+}
+
+fn __go_tar_err_write_hole() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(119u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(110u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(45u8);
+    msg.push(78u8);
+    msg.push(85u8);
+    msg.push(76u8);
+    msg.push(32u8);
+    msg.push(98u8);
+    msg.push(121u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(115u8);
+    msg.push(112u8);
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(104u8);
+    msg.push(111u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_WRITE_HOLE);
+}
+
+fn __go_tar_err_sparse_too_long() -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(115u8);
+    msg.push(112u8);
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(109u8);
+    msg.push(97u8);
+    msg.push(112u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_SPARSE_TOO_LONG);
+}
+
+// headerError: "archive/tar: cannot encode header" plus
+// "; and "-joined non-empty reasons (Go filters empties;
+// with no reasons the prefix stands alone).
+fn __go_tar_err_cannot_encode(reasons: Vec<Vec<u8>>) -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(99u8);
+    msg.push(97u8);
+    msg.push(110u8);
+    msg.push(110u8);
+    msg.push(111u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(104u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    let kept = 0;
+    let i = 0;
+    while i < len(reasons) {
+        if len(reasons[i]) > 0 {
+            if kept == 0 {
+                msg.push(58u8);
+                msg.push(32u8);
+            } else {
+                msg.push(59u8);
+                msg.push(32u8);
+                msg.push(97u8);
+                msg.push(110u8);
+                msg.push(100u8);
+                msg.push(32u8);
+            };
+            __go_tar_append(&msg, reasons[i]);
+            kept = kept + 1;
+        };
+        i = i + 1;
+    }
+    return go_errors_new_with_id(msg, GO_TAR_ID_ERR_CANNOT_ENCODE);
+}
+
+// Flush's missed-bytes error: "archive/tar: missed writing N bytes".
+// Built with target 0 (Go returns a plain fmt.Errorf here, no
+// sentinel identity).
+fn __go_tar_err_missed_writing(n: i64) -> ptr {
+    let msg = Vec::new();
+    __go_tar_msg_prefix(&msg);
+    msg.push(109u8);
+    msg.push(105u8);
+    msg.push(115u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(119u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    msg.push(32u8);
+    __go_tar_append(&msg, go_strconv_format_int(n, 10));
+    msg.push(32u8);
+    msg.push(98u8);
+    msg.push(121u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(115u8);
+    return go_errors_new(msg);
+}
+
+// Is err the io.EOF sentinel? (S9: via errors.Is.)
+fn __go_tar_is_eof(err: ptr) -> bool {
+    return go_errors_is(err, go_io_eof());
+}
+
+// Is err nil? (go_errors_nil() is 0 as ptr.)
+fn __go_tar_is_nil(err: ptr) -> bool {
+    return err == go_errors_nil();
+}
+
+// ---------- Small helpers ----------
+
+fn __go_tar_min(a: i64, b: i64) -> i64 {
+    if a < b { return a; };
+    return b;
+}
+
+fn __go_tar_max(a: i64, b: i64) -> i64 {
+    if a > b { return a; };
+    return b;
+}
+
+// Append src onto dst (Vec is a shared handle; the push is
+// visible to the caller -- same pattern as __go_err_append).
+fn __go_tar_append(dst: &Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+// Sub-slice copy: v[start..end].
+fn __go_tar_slice(v: Vec<u8>, start: i64, end: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = start;
+    while i < end {
+        out.push(v[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __go_tar_zero_block() -> Vec<u8> {
+    let blk = Vec::new();
+    let i = 0;
+    while i < GO_TAR_BLOCK_SIZE {
+        blk.push(0u8);
+        i = i + 1;
+    }
+    return blk;
+}
+
+fn __go_tar_block_is_zero(blk: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(blk) {
+        if blk[i] != 0u8 { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// blockPadding: -offset & (blockSize-1).
+fn __go_tar_block_padding(offset: i64) -> i64 {
+    return (0 - offset) & (GO_TAR_BLOCK_SIZE - 1);
+}
+
+fn __go_tar_is_header_only_type(flag: i64) -> bool {
+    if flag == GO_TAR_TYPE_LINK { return true; };
+    if flag == GO_TAR_TYPE_SYMLINK { return true; };
+    if flag == GO_TAR_TYPE_CHAR { return true; };
+    if flag == GO_TAR_TYPE_BLOCK { return true; };
+    if flag == GO_TAR_TYPE_DIR { return true; };
+    if flag == GO_TAR_TYPE_FIFO { return true; };
+    return false;
+}
+
+fn __go_tar_has_nul(s: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(s) {
+        if s[i] == 0u8 { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+fn __go_tar_is_ascii(s: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(s) {
+        if (s[i] as i64) >= 128 { return false; };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Replace every non-ASCII byte with '?'.
+fn __go_tar_to_ascii(s: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(s) {
+        if (s[i] as i64) >= 128 {
+            out.push(63u8);
+        } else {
+            out.push(s[i]);
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// parseString: bytes up to the first NUL.
+fn __go_tar_parse_string(b: Vec<u8>) -> Vec<u8> {
+    let i = 0;
+    while i < len(b) {
+        if b[i] == 0u8 {
+            return __go_tar_slice(b, 0, i);
+        };
+        i = i + 1;
+    }
+    return go_bytes_clone(b);
+}
+
+// Time helpers. GoTime has no zero sentinel in the corpus;
+// the zero time is unix_ns == 0 (divergence D1).
+fn __go_tar_time_is_zero(t: GoTime) -> bool {
+    return t.unix_ns == 0;
+}
+
+// Floor-split unix_ns into (sec, nsec in [0, 1e9)).
+fn __go_tar_time_split(t: GoTime) -> (i64, i64) {
+    let sec = t.unix_ns / 1000000000;
+    let ns = t.unix_ns % 1000000000;
+    if ns < 0 {
+        sec = sec - 1;
+        ns = ns + 1000000000;
+    };
+    return (sec, ns);
+}
+
+fn __go_tar_time_trunc_sec(t: GoTime) -> GoTime {
+    let (sec, _ns) = __go_tar_time_split(t);
+    return go_time_unix(sec, 0);
+}
+
+// filepath.IsLocal, Unix-only: the cleaned path must be
+// non-empty, relative, and contain no leading "..".
+fn __go_tar_is_local(name: Vec<u8>) -> bool {
+    if len(name) == 0 { return false; };
+    let clean = go_path_clean(name);
+    if len(clean) == 0 { return false; };
+    if clean[0] == 47u8 { return false; };
+    if go_bytes_equal(clean, __go_tar_dotdot()) { return false; };
+    let dotdot_slash = __go_tar_dotdot_slash();
+    if go_bytes_has_prefix(clean, dotdot_slash) { return false; };
+    return true;
+}
+
+fn __go_tar_dotdot() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(46u8);
+    v.push(46u8);
+    return v;
+}
+
+fn __go_tar_dotdot_slash() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(46u8);
+    v.push(46u8);
+    v.push(47u8);
+    return v;
+}
+
+// PAX record lookup: returns (value, found).
+fn __go_tar_pax_get(recs: Vec<GosTarPaxRecord>, key: Vec<u8>) -> (Vec<u8>, bool) {
+    let i = 0;
+    while i < len(recs) {
+        if go_bytes_equal(recs[i].key, key) {
+            return (go_bytes_clone(recs[i].value), true);
+        };
+        i = i + 1;
+    }
+    return (Vec::new(), false);
+}
+
+// PAX record set: returns a new record list with key
+// overwritten (or appended). Functional style -- avoids
+// assigning to a field of an indexed element.
+fn __go_tar_pax_set(recs: Vec<GosTarPaxRecord>, key: Vec<u8>, value: Vec<u8>) -> Vec<GosTarPaxRecord> {
+    let out = Vec::new();
+    let i = 0;
+    let replaced = false;
+    while i < len(recs) {
+        if go_bytes_equal(recs[i].key, key) {
+            out.push(GosTarPaxRecord { key: go_bytes_clone(recs[i].key), value: go_bytes_clone(value) });
+            replaced = true;
+        } else {
+            out.push(GosTarPaxRecord { key: go_bytes_clone(recs[i].key), value: go_bytes_clone(recs[i].value) });
+        };
+        i = i + 1;
+    }
+    if replaced == false {
+        out.push(GosTarPaxRecord { key: key, value: value });
+    };
+    return out;
+}
+
+// Zero GosTarHeader.
+fn __go_tar_header_new() -> GosTarHeader {
+    return GosTarHeader {
+        typeflag: 0,
+        name: Vec::new(),
+        linkname: Vec::new(),
+        size: 0,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        uname: Vec::new(),
+        gname: Vec::new(),
+        mod_time: go_time_unix(0, 0),
+        access_time: go_time_unix(0, 0),
+        change_time: go_time_unix(0, 0),
+        devmajor: 0,
+        devminor: 0,
+        xattrs: Vec::new(),
+        pax_records: Vec::new(),
+        format: 0,
+    };
+}
+
+// Split a long name into (prefix, suffix) for USTAR
+// (writer.go splitUSTARPath, verbatim logic). Returns
+// (prefix, suffix, ok); ok is false when the name fits
+// in the name field already, is non-ASCII, or cannot be
+// split at a '/'.
+fn __go_tar_split_ustar_path(name: Vec<u8>) -> (Vec<u8>, Vec<u8>, bool) {
+    let length = len(name);
+    if length <= GO_TAR_NAME_SIZE {
+        return (Vec::new(), Vec::new(), false);
+    };
+    if __go_tar_is_ascii(name) == false {
+        return (Vec::new(), Vec::new(), false);
+    };
+    if length > GO_TAR_PREFIX_SIZE + 1 {
+        length = GO_TAR_PREFIX_SIZE + 1;
+    } else if name[length - 1] == 47u8 {
+        length = length - 1;
+    };
+    let i = go_bytes_last_index_byte(__go_tar_slice(name, 0, length), 47u8);
+    let nlen = len(name) - i - 1;
+    let plen = i;
+    if i <= 0 || nlen > GO_TAR_NAME_SIZE || nlen == 0 || plen > GO_TAR_PREFIX_SIZE {
+        return (Vec::new(), Vec::new(), false);
+    };
+    return (__go_tar_slice(name, 0, i), __go_tar_slice(name, i + 1, len(name)), true);
+}
+
+// ---------- Numeric fields ----------
+// Field offsets (from the oracle's headerV7/headerGNU/
+// headerSTAR/headerUSTAR layouts):
+//   name 0:100, mode 100:8, uid 108:8, gid 116:8, size 124:12,
+//   modTime 136:12, chksum 148:8, typeFlag 156:1, linkName 157:100,
+//   magic 257:6, version 263:2, uname 265:32, gname 297:32,
+//   devMajor 329:8, devMinor 337:8,
+//   GNU atime 345:12, GNU ctime 357:12, GNU sparse 386:97,
+//   GNU realSize 483:12,
+//   STAR prefix 345:131, STAR atime 476:12, STAR ctime 488:12,
+//   STAR trailer 508:4, USTAR prefix 345:155.
+
+fn __go_tar_parse_octal(b: Vec<u8>) -> (i64, ptr) {
+    let cutset = Vec::new();
+    cutset.push(32u8);
+    cutset.push(0u8);
+    let s = go_bytes_trim(b, cutset);
+    if len(s) == 0 {
+        return (0, go_errors_nil());
+    };
+    let r = go_strconv_parse_uint(__go_tar_parse_string(s), 8, 64);
+    if __go_tar_is_nil(r.err) == false {
+        return (0, __go_tar_err_header());
+    };
+    return (r.v as i64, go_errors_nil());
+}
+
+fn __go_tar_parse_numeric(b: Vec<u8>) -> (i64, ptr) {
+    if len(b) == 0 {
+        return (0, __go_tar_err_header());
+    };
+    if ((b[0] as i64) & 128) != 0 {
+        let inv: u64 = 0;
+        if ((b[0] as i64) & 64) != 0 {
+            inv = 0u64 - 1;
+        };
+        let x: u64 = 0;
+        let i = 0;
+        while i < len(b) {
+            let c: u64 = (b[i] as u64) ^ inv;
+            if i == 0 {
+                c = c & 127u64;
+            };
+            if (x >> 56) > 0 {
+                return (0, __go_tar_err_header());
+            };
+            x = (x << 8) | c;
+            i = i + 1;
+        }
+        if (x >> 63) > 0 {
+            return (0, __go_tar_err_header());
+        };
+        if inv != 0 {
+            return (0 - (x as i64) - 1, go_errors_nil());
+        };
+        return (x as i64, go_errors_nil());
+    };
+    return __go_tar_parse_octal(b);
+}
+
+fn __go_tar_fits_in_octal(n: i64, x: i64) -> bool {
+    if n >= 22 {
+        return x >= 0;
+    };
+    let oct_bits = (n - 1) * 3;
+    let limit = (1u64 << (oct_bits as u64)) as i64;
+    return x >= 0 && x < limit;
+}
+
+fn __go_tar_fits_in_base256(n: i64, x: i64) -> bool {
+    if n >= 9 {
+        return true;
+    };
+    let bin_bits = (n - 1) * 8;
+    let limit = (1u64 << (bin_bits as u64)) as i64;
+    return x >= (0 - limit) && x < limit;
+}
+
+// formatString: copy s into blk[off..off+field_len), NUL
+// terminate if it fits; ErrFieldTooLong otherwise, but the
+// copy still happens (truncated). The trailing-slash quirk:
+// when s overflows and the last field byte is '/', trim
+// trailing slashes from s and store the trimmed value, but
+// still return the error.
+fn __go_tar_format_string(blk: &Vec<u8>, off: i64, field_len: i64, s: Vec<u8>) -> ptr {
+    let err = go_errors_nil();
+    let n = len(s);
+    if n > field_len {
+        err = __go_tar_err_field_too_long();
+    };
+    let m = __go_tar_min(n, field_len);
+    let i = 0;
+    while i < m {
+        blk[off + i] = s[i];
+        i = i + 1;
+    }
+    if n < field_len {
+        blk[off + n] = 0u8;
+    };
+    if n > field_len && blk[off + field_len - 1] == 47u8 {
+        let t = field_len - 1;
+        while t > 0 {
+            if s[t - 1] == 47u8 {
+                t = t - 1;
+            } else {
+                break;
+            };
+        }
+        let j = 0;
+        while j < t {
+            blk[off + j] = s[j];
+            j = j + 1;
+        }
+        blk[off + t] = 0u8;
+    };
+    return err;
+}
+
+// formatOctal: '0'-pad s to field_len-1 digits, then
+// formatString (which NUL-terminates the last byte).
+fn __go_tar_format_octal(blk: &Vec<u8>, off: i64, field_len: i64, x: i64) -> ptr {
+    let err = go_errors_nil();
+    let v = x;
+    if __go_tar_fits_in_octal(field_len, x) == false {
+        v = 0;
+        err = __go_tar_err_field_too_long();
+    };
+    let s = go_strconv_format_int(v, 8);
+    let pad = field_len - 1 - len(s);
+    let full = Vec::new();
+    let i = 0;
+    while i < pad {
+        full.push(48u8);
+        i = i + 1;
+    }
+    __go_tar_append(&full, s);
+    let e2 = __go_tar_format_string(blk, off, field_len, full);
+    if __go_tar_is_nil(e2) == false {
+        return e2;
+    };
+    return err;
+}
+
+// formatNumeric: octal when it fits, else base-256 with
+// the 0x80 flag bit on the first byte, else octal zero
+// plus ErrFieldTooLong (Go's last-resort path).
+fn __go_tar_format_numeric(blk: &Vec<u8>, off: i64, field_len: i64, x: i64) -> ptr {
+    if __go_tar_fits_in_octal(field_len, x) {
+        return __go_tar_format_octal(blk, off, field_len, x);
+    };
+    if __go_tar_fits_in_base256(field_len, x) {
+        let ux = x as u64;
+        let i = field_len - 1;
+        while i >= 0 {
+            blk[off + i] = (ux & 255u64) as u8;
+            ux = ux >> 8;
+            i = i - 1;
+        }
+        blk[off] = ((blk[off] as u64) | 128u64) as u8;
+        return go_errors_nil();
+    };
+    let _e = __go_tar_format_octal(blk, off, field_len, 0);
+    return __go_tar_err_field_too_long();
+}
+
+// ---------- Checksum and format detection ----------
+
+fn __go_tar_compute_checksum(blk: &Vec<u8>) -> (i64, i64) {
+    let unsigned = 0;
+    let signed = 0;
+    let i = 0;
+    while i < len(blk) {
+        if i >= 148 && i < 156 {
+            unsigned = unsigned + 32;
+            signed = signed + 32;
+        } else {
+            let b = blk[i] as i64;
+            unsigned = unsigned + b;
+            if b >= 128 {
+                signed = signed + (b - 256);
+            } else {
+                signed = signed + b;
+            };
+        };
+        i = i + 1;
+    }
+    return (unsigned, signed);
+}
+
+fn __go_tar_magic_ustar() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(117u8);
+    v.push(115u8);
+    v.push(116u8);
+    v.push(97u8);
+    v.push(114u8);
+    v.push(0u8);
+    return v;
+}
+
+fn __go_tar_version_ustar() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(48u8);
+    v.push(48u8);
+    return v;
+}
+
+fn __go_tar_magic_gnu() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(117u8);
+    v.push(115u8);
+    v.push(116u8);
+    v.push(97u8);
+    v.push(114u8);
+    v.push(32u8);
+    return v;
+}
+
+fn __go_tar_version_gnu() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(32u8);
+    v.push(0u8);
+    return v;
+}
+
+fn __go_tar_trailer_star() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(116u8);
+    v.push(97u8);
+    v.push(114u8);
+    v.push(0u8);
+    return v;
+}
+
+// getFormat: verify the checksum, then guess the format
+// from the magic values. FormatUnknown on checksum failure.
+fn __go_tar_get_format(blk: Vec<u8>) -> i64 {
+    let (value, perr) = __go_tar_parse_octal(__go_tar_slice(blk, 148, 156));
+    let (chksum1, chksum2) = __go_tar_compute_checksum(&blk);
+    if __go_tar_is_nil(perr) == false {
+        return GO_TAR_FORMAT_UNKNOWN;
+    };
+    if value != chksum1 && value != chksum2 {
+        return GO_TAR_FORMAT_UNKNOWN;
+    };
+    let magic = __go_tar_slice(blk, 257, 263);
+    let version = __go_tar_slice(blk, 263, 265);
+    let trailer = __go_tar_slice(blk, 508, 512);
+    if go_bytes_equal(magic, __go_tar_magic_ustar()) && go_bytes_equal(trailer, __go_tar_trailer_star()) {
+        return GO_TAR_FORMAT_STAR;
+    };
+    if go_bytes_equal(magic, __go_tar_magic_ustar()) {
+        return GO_TAR_FORMAT_USTAR | GO_TAR_FORMAT_PAX;
+    };
+    if go_bytes_equal(magic, __go_tar_magic_gnu()) && go_bytes_equal(version, __go_tar_version_gnu()) {
+        return GO_TAR_FORMAT_GNU;
+    };
+    return GO_TAR_FORMAT_V7;
+}
+
+// setFormat: write the magic values for the format, then
+// update the checksum field (6 octal digits, NUL, space).
+// A V7 format writes nothing. Any other unknown format
+// panics -- same as Go's panic("invalid format"); the
+// panic code is the generic invalid-format code 77400
+// (gostd block base, no tar code is attached to it).
+fn __go_tar_set_format(blk: &Vec<u8>, format: i64) -> void {
+    if (format & GO_TAR_FORMAT_V7) != 0 {
+    } else if (format & GO_TAR_FORMAT_GNU) != 0 {
+        __go_tar_put_bytes(blk, 257, __go_tar_magic_gnu());
+        __go_tar_put_bytes(blk, 263, __go_tar_version_gnu());
+    } else if (format & GO_TAR_FORMAT_STAR) != 0 {
+        __go_tar_put_bytes(blk, 257, __go_tar_magic_ustar());
+        __go_tar_put_bytes(blk, 263, __go_tar_version_ustar());
+        __go_tar_put_bytes(blk, 508, __go_tar_trailer_star());
+    } else if (format & (GO_TAR_FORMAT_USTAR | GO_TAR_FORMAT_PAX)) != 0 {
+        __go_tar_put_bytes(blk, 257, __go_tar_magic_ustar());
+        __go_tar_put_bytes(blk, 263, __go_tar_version_ustar());
+    } else {
+        panic(77400);
+    };
+    let (chksum, _signed) = __go_tar_compute_checksum(blk);
+    __go_tar_format_octal(blk, 148, 7, chksum);
+    blk[155] = 32u8;
+    return;
+}
+
+// Copy src bytes into blk at off.
+fn __go_tar_put_bytes(blk: &Vec<u8>, off: i64, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        blk[off + i] = src[i];
+        i = i + 1;
+    }
+    return;
+}
+
+// ---------- PAX records ----------
+// PAX key ids for __go_tar_pax_key (SLA has no string
+// literals, so keys are built by pushing byte codes).
+const GO_TAR_KEY_PATH: i64 = 0;
+const GO_TAR_KEY_LINKPATH: i64 = 1;
+const GO_TAR_KEY_SIZE: i64 = 2;
+const GO_TAR_KEY_UID: i64 = 3;
+const GO_TAR_KEY_GID: i64 = 4;
+const GO_TAR_KEY_UNAME: i64 = 5;
+const GO_TAR_KEY_GNAME: i64 = 6;
+const GO_TAR_KEY_MTIME: i64 = 7;
+const GO_TAR_KEY_ATIME: i64 = 8;
+const GO_TAR_KEY_CTIME: i64 = 9;
+const GO_TAR_KEY_GNU_MAJOR: i64 = 10;
+const GO_TAR_KEY_GNU_MINOR: i64 = 11;
+const GO_TAR_KEY_GNU_NAME: i64 = 12;
+const GO_TAR_KEY_GNU_SIZE: i64 = 13;
+const GO_TAR_KEY_GNU_REALSIZE: i64 = 14;
+const GO_TAR_KEY_GNU_MAP: i64 = 15;
+const GO_TAR_KEY_GNU_NUMBLOCKS: i64 = 16;
+const GO_TAR_KEY_GNU_OFFSET: i64 = 17;
+const GO_TAR_KEY_GNU_NUMBYTES: i64 = 18;
+const GO_TAR_KEY_GNU_PREFIX: i64 = 19;
+const GO_TAR_KEY_SCHILY_XATTR: i64 = 20;
+
+fn __go_tar_pax_key(id: i64) -> Vec<u8> {
+    let v = Vec::new();
+    if id == GO_TAR_KEY_PATH {
+        v.push(112u8);
+        v.push(97u8);
+        v.push(116u8);
+        v.push(104u8);
+    } else if id == GO_TAR_KEY_LINKPATH {
+        v.push(108u8);
+        v.push(105u8);
+        v.push(110u8);
+        v.push(107u8);
+        v.push(112u8);
+        v.push(97u8);
+        v.push(116u8);
+        v.push(104u8);
+    } else if id == GO_TAR_KEY_SIZE {
+        v.push(115u8);
+        v.push(105u8);
+        v.push(122u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_UID {
+        v.push(117u8);
+        v.push(105u8);
+        v.push(100u8);
+    } else if id == GO_TAR_KEY_GID {
+        v.push(103u8);
+        v.push(105u8);
+        v.push(100u8);
+    } else if id == GO_TAR_KEY_UNAME {
+        v.push(117u8);
+        v.push(110u8);
+        v.push(97u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_GNAME {
+        v.push(103u8);
+        v.push(110u8);
+        v.push(97u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_MTIME {
+        v.push(109u8);
+        v.push(116u8);
+        v.push(105u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_ATIME {
+        v.push(97u8);
+        v.push(116u8);
+        v.push(105u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_CTIME {
+        v.push(99u8);
+        v.push(116u8);
+        v.push(105u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_GNU_MAJOR {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(109u8);
+        v.push(97u8);
+        v.push(106u8);
+        v.push(111u8);
+        v.push(114u8);
+    } else if id == GO_TAR_KEY_GNU_MINOR {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(109u8);
+        v.push(105u8);
+        v.push(110u8);
+        v.push(111u8);
+        v.push(114u8);
+    } else if id == GO_TAR_KEY_GNU_NAME {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(110u8);
+        v.push(97u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_GNU_SIZE {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(115u8);
+        v.push(105u8);
+        v.push(122u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_GNU_REALSIZE {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(114u8);
+        v.push(101u8);
+        v.push(97u8);
+        v.push(108u8);
+        v.push(115u8);
+        v.push(105u8);
+        v.push(122u8);
+        v.push(101u8);
+    } else if id == GO_TAR_KEY_GNU_MAP {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(109u8);
+        v.push(97u8);
+        v.push(112u8);
+    } else if id == GO_TAR_KEY_GNU_NUMBLOCKS {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(110u8);
+        v.push(117u8);
+        v.push(109u8);
+        v.push(98u8);
+        v.push(108u8);
+        v.push(111u8);
+        v.push(99u8);
+        v.push(107u8);
+        v.push(115u8);
+    } else if id == GO_TAR_KEY_GNU_OFFSET {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(111u8);
+        v.push(102u8);
+        v.push(102u8);
+        v.push(115u8);
+        v.push(101u8);
+        v.push(116u8);
+    } else if id == GO_TAR_KEY_GNU_NUMBYTES {
+        __go_tar_append(&v, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX));
+        v.push(110u8);
+        v.push(117u8);
+        v.push(109u8);
+        v.push(98u8);
+        v.push(121u8);
+        v.push(116u8);
+        v.push(101u8);
+        v.push(115u8);
+    } else if id == GO_TAR_KEY_GNU_PREFIX {
+        v.push(71u8);
+        v.push(78u8);
+        v.push(85u8);
+        v.push(46u8);
+        v.push(115u8);
+        v.push(112u8);
+        v.push(97u8);
+        v.push(114u8);
+        v.push(115u8);
+        v.push(101u8);
+        v.push(46u8);
+    } else if id == GO_TAR_KEY_SCHILY_XATTR {
+        v.push(83u8);
+        v.push(67u8);
+        v.push(72u8);
+        v.push(73u8);
+        v.push(76u8);
+        v.push(89u8);
+        v.push(46u8);
+        v.push(120u8);
+        v.push(97u8);
+        v.push(116u8);
+        v.push(116u8);
+        v.push(114u8);
+        v.push(46u8);
+    };
+    return v;
+}
+
+// parsePAXTime: "%d.%d" with optional sub-second part.
+// Negative times get the negative correction (Go semantics).
+fn __go_tar_parse_pax_time(s: Vec<u8>) -> (GoTime, ptr) {
+    let idx = go_bytes_index_byte(s, 46u8);
+    let ss = Vec::new();
+    let sn = Vec::new();
+    if idx < 0 {
+        ss = go_bytes_clone(s);
+    } else {
+        ss = __go_tar_slice(s, 0, idx);
+        sn = __go_tar_slice(s, idx + 1, len(s));
+    };
+    let r = go_strconv_parse_int(ss, 10, 64);
+    if __go_tar_is_nil(r.err) == false {
+        return (go_time_unix(0, 0), __go_tar_err_header());
+    };
+    let secs = r.v;
+    if len(sn) == 0 {
+        return (go_time_unix(secs, 0), go_errors_nil());
+    };
+    let nano = Vec::new();
+    let i = 0;
+    while i < 9 {
+        nano.push(48u8);
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(sn) {
+        let c = sn[j];
+        if c < 48u8 || c > 57u8 {
+            return (go_time_unix(0, 0), __go_tar_err_header());
+        };
+        if j < 9 {
+            nano[j] = c;
+        };
+        j = j + 1;
+    }
+    let rn = go_strconv_parse_int(nano, 10, 64);
+    if __go_tar_is_nil(rn.err) == false {
+        return (go_time_unix(0, 0), __go_tar_err_header());
+    };
+    let nsecs = rn.v;
+    if len(ss) > 0 && ss[0] == 45u8 {
+        return (go_time_unix(secs, 0 - nsecs), go_errors_nil());
+    };
+    return (go_time_unix(secs, nsecs), go_errors_nil());
+}
+
+// formatPAXTime: seconds, or seconds.fraction with
+// trailing zeros trimmed. Negative times get the sign
+// correction (Go semantics).
+fn __go_tar_format_pax_time(t: GoTime) -> Vec<u8> {
+    let (secs, nsecs) = __go_tar_time_split(t);
+    if nsecs == 0 {
+        return go_strconv_format_int(secs, 10);
+    };
+    let sign = Vec::new();
+    if secs < 0 {
+        sign.push(45u8);
+        secs = 0 - (secs + 1);
+        nsecs = 0 - (nsecs - 1000000000);
+    };
+    let frac = go_strconv_format_int(nsecs, 10);
+    let pad = 9 - len(frac);
+    let full = Vec::new();
+    let i = 0;
+    while i < pad {
+        full.push(48u8);
+        i = i + 1;
+    }
+    __go_tar_append(&full, frac);
+    let out = Vec::new();
+    __go_tar_append(&out, sign);
+    __go_tar_append(&out, go_strconv_format_int(secs, 10));
+    out.push(46u8);
+    __go_tar_append(&out, full);
+    while len(out) > 0 {
+        if out[len(out) - 1] == 48u8 {
+            out.pop();
+        } else {
+            break;
+        };
+    }
+    return out;
+}
+
+// parsePAXRecord: "N key=value\n" -> (record, remainder, err).
+fn __go_tar_parse_pax_record(s: Vec<u8>) -> (GosTarPaxRecord, Vec<u8>, ptr) {
+    let empty_rec = GosTarPaxRecord { key: Vec::new(), value: Vec::new() };
+    let idx = go_bytes_index_byte(s, 32u8);
+    if idx < 0 {
+        return (empty_rec, go_bytes_clone(s), __go_tar_err_header());
+    };
+    let n_str = __go_tar_slice(s, 0, idx);
+    let rest = __go_tar_slice(s, idx + 1, len(s));
+    let r = go_strconv_parse_int(n_str, 10, 64);
+    if __go_tar_is_nil(r.err) == false {
+        return (empty_rec, go_bytes_clone(s), __go_tar_err_header());
+    };
+    let n = r.v;
+    if n < 5 || n > len(s) {
+        return (empty_rec, go_bytes_clone(s), __go_tar_err_header());
+    };
+    n = n - (len(n_str) + 1);
+    if n <= 0 {
+        return (empty_rec, go_bytes_clone(s), __go_tar_err_header());
+    };
+    let rec = __go_tar_slice(rest, 0, n - 1);
+    if rest[n - 1] != 10u8 {
+        return (empty_rec, go_bytes_clone(s), __go_tar_err_header());
+    };
+    let rem = __go_tar_slice(rest, n, len(rest));
+    let kidx = go_bytes_index_byte(rec, 61u8);
+    if kidx < 0 {
+        return (empty_rec, go_bytes_clone(s), __go_tar_err_header());
+    };
+    let k = __go_tar_slice(rec, 0, kidx);
+    let v = __go_tar_slice(rec, kidx + 1, len(rec));
+    if __go_tar_valid_pax_record(k, v) == false {
+        return (empty_rec, go_bytes_clone(s), __go_tar_err_header());
+    };
+    return (GosTarPaxRecord { key: k, value: v }, rem, go_errors_nil());
+}
+
+// formatPAXRecord: build "N key=value\n" with the size
+// field accounting for its own width (two-pass).
+fn __go_tar_format_pax_record(k: Vec<u8>, v: Vec<u8>) -> (Vec<u8>, ptr) {
+    if __go_tar_valid_pax_record(k, v) == false {
+        return (Vec::new(), __go_tar_err_header());
+    };
+    let size = len(k) + len(v) + 3;
+    size = size + len(go_strconv_itoa(size));
+    let record = __go_tar_build_pax_record(size, k, v);
+    if len(record) != size {
+        size = len(record);
+        record = __go_tar_build_pax_record(size, k, v);
+    };
+    return (record, go_errors_nil());
+}
+
+fn __go_tar_build_pax_record(size: i64, k: Vec<u8>, v: Vec<u8>) -> Vec<u8> {
+    let out = Vec::new();
+    __go_tar_append(&out, go_strconv_itoa(size));
+    out.push(32u8);
+    __go_tar_append(&out, k);
+    out.push(61u8);
+    __go_tar_append(&out, v);
+    out.push(10u8);
+    return out;
+}
+
+// validPAXRecord: non-empty key without '=', and no NUL
+// in the value for path-like keys, no NUL in the key
+// otherwise.
+fn __go_tar_valid_pax_record(k: Vec<u8>, v: Vec<u8>) -> bool {
+    if len(k) == 0 {
+        return false;
+    };
+    if go_bytes_index_byte(k, 61u8) >= 0 {
+        return false;
+    };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_PATH)) || go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_LINKPATH)) || go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_UNAME)) || go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_GNAME)) {
+        return __go_tar_has_nul(v) == false;
+    };
+    return __go_tar_has_nul(k) == false;
+}
+
+// ---------- Sparse helpers ----------
+
+fn __go_tar_sparse_end(e: GosTarSparseEntry) -> i64 {
+    return e.offset + e.length;
+}
+
+fn __go_tar_validate_sparse_entries(sp: Vec<GosTarSparseEntry>, size: i64) -> bool {
+    if size < 0 {
+        return false;
+    };
+    let pre = GosTarSparseEntry { offset: 0, length: 0 };
+    let i = 0;
+    while i < len(sp) {
+        let cur = sp[i];
+        if cur.offset < 0 || cur.length < 0 {
+            return false;
+        };
+        if cur.offset > (9223372036854775807 - cur.length) {
+            return false;
+        };
+        if __go_tar_sparse_end(cur) > size {
+            return false;
+        };
+        if __go_tar_sparse_end(pre) > cur.offset {
+            return false;
+        };
+        pre = cur;
+        i = i + 1;
+    }
+    return true;
+}
+
+// alignSparseEntries: round data-fragment edges to block
+// boundaries (start up, end down, unless end == size).
+fn __go_tar_align_sparse_entries(src: Vec<GosTarSparseEntry>, size: i64) -> Vec<GosTarSparseEntry> {
+    let dst = Vec::new();
+    let i = 0;
+    while i < len(src) {
+        let s = src[i];
+        let pos = s.offset + __go_tar_block_padding(s.offset);
+        let end = __go_tar_sparse_end(s);
+        if end != size {
+            end = end - __go_tar_block_padding(0 - end);
+        };
+        if pos < end {
+            dst.push(GosTarSparseEntry { offset: pos, length: end - pos });
+        };
+        i = i + 1;
+    }
+    return dst;
+}
+
+// invertSparseEntries: data fragments -> hole fragments
+// (the complement within [0, size)). The final fragment
+// is always appended, even when empty.
+fn __go_tar_invert_sparse_entries(src: Vec<GosTarSparseEntry>, size: i64) -> Vec<GosTarSparseEntry> {
+    let dst = Vec::new();
+    let pre = GosTarSparseEntry { offset: 0, length: 0 };
+    let i = 0;
+    while i < len(src) {
+        let cur = src[i];
+        if cur.length == 0 {
+            i = i + 1;
+            continue;
+        };
+        pre.length = cur.offset - pre.offset;
+        if pre.length > 0 {
+            dst.push(GosTarSparseEntry { offset: pre.offset, length: pre.length });
+        };
+        pre.offset = __go_tar_sparse_end(cur);
+        i = i + 1;
+    }
+    pre.length = size - pre.offset;
+    dst.push(GosTarSparseEntry { offset: pre.offset, length: pre.length });
+    return dst;
+}
+
+// appendSparseEntry: append unless the map is full.
+fn __go_tar_append_sparse_entry(spd: Vec<GosTarSparseEntry>, ent: GosTarSparseEntry) -> (Vec<GosTarSparseEntry>, ptr) {
+    if len(spd) >= GO_TAR_MAX_SPARSE_ENTRIES {
+        return (Vec::new(), __go_tar_err_sparse_too_long());
+    };
+    spd.push(ent);
+    return (spd, go_errors_nil());
+}
+
+// Drop the first hole (sparse reader advances past a
+// fragment, keeping the last one). Uses let-bound copies
+// -- no &v[i] borrow form (lix).
+fn __go_tar_holes_tail(holes: Vec<GosTarSparseEntry>) -> Vec<GosTarSparseEntry> {
+    let out = Vec::new();
+    let i = 1;
+    while i < len(holes) {
+        out.push(holes[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------- allowedFormats helpers ----------
+// Field-name ids for __go_tar_field_name.
+const GO_TAR_FIELD_NAME: i64 = 0;
+const GO_TAR_FIELD_LINKNAME: i64 = 1;
+const GO_TAR_FIELD_UNAME: i64 = 2;
+const GO_TAR_FIELD_GNAME: i64 = 3;
+const GO_TAR_FIELD_MODE: i64 = 4;
+const GO_TAR_FIELD_UID: i64 = 5;
+const GO_TAR_FIELD_GID: i64 = 6;
+const GO_TAR_FIELD_SIZE: i64 = 7;
+const GO_TAR_FIELD_DEVMAJOR: i64 = 8;
+const GO_TAR_FIELD_DEVMINOR: i64 = 9;
+const GO_TAR_FIELD_MODTIME: i64 = 10;
+const GO_TAR_FIELD_ACCESSTIME: i64 = 11;
+const GO_TAR_FIELD_CHANGETIME: i64 = 12;
+
+fn __go_tar_field_name(id: i64) -> Vec<u8> {
+    let v = Vec::new();
+    if id == GO_TAR_FIELD_NAME {
+        v.push(78u8);
+        v.push(97u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_LINKNAME {
+        v.push(76u8);
+        v.push(105u8);
+        v.push(110u8);
+        v.push(107u8);
+        v.push(110u8);
+        v.push(97u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_UNAME {
+        v.push(85u8);
+        v.push(110u8);
+        v.push(97u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_GNAME {
+        v.push(71u8);
+        v.push(110u8);
+        v.push(97u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_MODE {
+        v.push(77u8);
+        v.push(111u8);
+        v.push(100u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_UID {
+        v.push(85u8);
+        v.push(105u8);
+        v.push(100u8);
+    } else if id == GO_TAR_FIELD_GID {
+        v.push(71u8);
+        v.push(105u8);
+        v.push(100u8);
+    } else if id == GO_TAR_FIELD_SIZE {
+        v.push(83u8);
+        v.push(105u8);
+        v.push(122u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_DEVMAJOR {
+        v.push(68u8);
+        v.push(101u8);
+        v.push(118u8);
+        v.push(109u8);
+        v.push(97u8);
+        v.push(106u8);
+        v.push(111u8);
+        v.push(114u8);
+    } else if id == GO_TAR_FIELD_DEVMINOR {
+        v.push(68u8);
+        v.push(101u8);
+        v.push(118u8);
+        v.push(109u8);
+        v.push(105u8);
+        v.push(110u8);
+        v.push(111u8);
+        v.push(114u8);
+    } else if id == GO_TAR_FIELD_MODTIME {
+        v.push(77u8);
+        v.push(111u8);
+        v.push(100u8);
+        v.push(84u8);
+        v.push(105u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_ACCESSTIME {
+        v.push(65u8);
+        v.push(99u8);
+        v.push(99u8);
+        v.push(101u8);
+        v.push(115u8);
+        v.push(115u8);
+        v.push(84u8);
+        v.push(105u8);
+        v.push(109u8);
+        v.push(101u8);
+    } else if id == GO_TAR_FIELD_CHANGETIME {
+        v.push(67u8);
+        v.push(104u8);
+        v.push(97u8);
+        v.push(110u8);
+        v.push(103u8);
+        v.push(101u8);
+        v.push(84u8);
+        v.push(105u8);
+        v.push(109u8);
+        v.push(101u8);
+    };
+    return v;
+}
+
+// Reason prefix ids: 0 GNU, 1 USTAR, 2 PAX.
+fn __go_tar_reason_prefix(id: i64) -> Vec<u8> {
+    let v = Vec::new();
+    if id == 0 {
+        v.push(71u8);
+        v.push(78u8);
+        v.push(85u8);
+    } else if id == 1 {
+        v.push(85u8);
+        v.push(83u8);
+        v.push(84u8);
+        v.push(65u8);
+        v.push(82u8);
+    } else if id == 2 {
+        v.push(80u8);
+        v.push(65u8);
+        v.push(88u8);
+    };
+    v.push(32u8);
+    v.push(99u8);
+    v.push(97u8);
+    v.push(110u8);
+    v.push(110u8);
+    v.push(111u8);
+    v.push(116u8);
+    v.push(32u8);
+    v.push(101u8);
+    v.push(110u8);
+    v.push(99u8);
+    v.push(111u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(32u8);
+    return v;
+}
+
+// Build "GNU|USTAR|PAX cannot encode <name>=<value>".
+fn __go_tar_why_reason(fmt_id: i64, name: Vec<u8>, value: Vec<u8>) -> Vec<u8> {
+    let out = __go_tar_reason_prefix(fmt_id);
+    __go_tar_append(&out, name);
+    out.push(61u8);
+    __go_tar_append(&out, value);
+    return out;
+}
+
+// Accumulator for allowedFormats (the Go closures'
+// captured state, as a struct mutated through &).
+struct GoTarAllowState {
+    format: i64,
+    pax: Vec<GosTarPaxRecord>,
+    why_no_ustar: Vec<u8>,
+    why_no_pax: Vec<u8>,
+    why_no_gnu: Vec<u8>,
+    why_only_pax: Vec<u8>,
+    why_only_gnu: Vec<u8>,
+    prefer_pax: bool,
+}
+
+fn __go_tar_allow_new() -> GoTarAllowState {
+    return GoTarAllowState {
+        format: GO_TAR_FORMAT_USTAR | GO_TAR_FORMAT_PAX | GO_TAR_FORMAT_GNU,
+        pax: Vec::new(),
+        why_no_ustar: Vec::new(),
+        why_no_pax: Vec::new(),
+        why_no_gnu: Vec::new(),
+        why_only_pax: Vec::new(),
+        why_only_gnu: Vec::new(),
+        prefer_pax: false,
+    };
+}
+
+// Format bit helpers (Go's Format.has/mayOnlyBe/
+// mustNotBe/mayBe). mustNotBe uses ~bit == -1-bit.
+fn __go_tar_fmt_must_not_be(st: &GoTarAllowState, bit: i64) -> void {
+    st.format = st.format & (0 - 1 - bit);
+    return;
+}
+
+fn __go_tar_fmt_may_only_be(st: &GoTarAllowState, bits: i64) -> void {
+    st.format = st.format & bits;
+    return;
+}
+
+// verifyString (common.go allowedFormats closure).
+// pax_key is a GO_TAR_KEY_* id, or -1 for paxNone.
+fn __go_tar_verify_string(st: &GoTarAllowState, hdr_pax: Vec<GosTarPaxRecord>, s: Vec<u8>, size: i64, field_id: i64, pax_key: i64) -> void {
+    let name = __go_tar_field_name(field_id);
+    let too_long = len(s) > size;
+    let allow_long_gnu = pax_key == GO_TAR_KEY_PATH || pax_key == GO_TAR_KEY_LINKPATH;
+    if __go_tar_has_nul(s) || (too_long && allow_long_gnu == false) {
+        st.why_no_gnu = __go_tar_why_reason(0, name, go_strconv_quote(s));
+        __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_GNU);
+    };
+    if __go_tar_is_ascii(s) == false || too_long {
+        let can_split_ustar = pax_key == GO_TAR_KEY_PATH;
+        let (_pre, _suf, ok) = __go_tar_split_ustar_path(s);
+        if can_split_ustar == false || ok == false {
+            st.why_no_ustar = __go_tar_why_reason(1, name, go_strconv_quote(s));
+            __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_USTAR);
+        };
+        if pax_key == 0 - 1 {
+            st.why_no_pax = __go_tar_why_reason(2, name, go_strconv_quote(s));
+            __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_PAX);
+        } else {
+            st.pax = __go_tar_pax_set(st.pax, __go_tar_pax_key(pax_key), go_bytes_clone(s));
+        };
+    };
+    if pax_key != 0 - 1 {
+        let (v, ok) = __go_tar_pax_get(hdr_pax, __go_tar_pax_key(pax_key));
+        if ok && go_bytes_equal(v, s) {
+            st.pax = __go_tar_pax_set(st.pax, __go_tar_pax_key(pax_key), v);
+        };
+    };
+    return;
+}
+
+// verifyNumeric (common.go allowedFormats closure).
+fn __go_tar_verify_numeric(st: &GoTarAllowState, hdr_pax: Vec<GosTarPaxRecord>, n: i64, size: i64, field_id: i64, pax_key: i64) -> void {
+    let name = __go_tar_field_name(field_id);
+    if __go_tar_fits_in_base256(size, n) == false {
+        st.why_no_gnu = __go_tar_why_reason(0, name, go_strconv_format_int(n, 10));
+        __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_GNU);
+    };
+    if __go_tar_fits_in_octal(size, n) == false {
+        st.why_no_ustar = __go_tar_why_reason(1, name, go_strconv_format_int(n, 10));
+        __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_USTAR);
+        if pax_key == 0 - 1 {
+            st.why_no_pax = __go_tar_why_reason(2, name, go_strconv_format_int(n, 10));
+            __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_PAX);
+        } else {
+            st.pax = __go_tar_pax_set(st.pax, __go_tar_pax_key(pax_key), go_strconv_format_int(n, 10));
+        };
+    };
+    if pax_key != 0 - 1 {
+        let (v, ok) = __go_tar_pax_get(hdr_pax, __go_tar_pax_key(pax_key));
+        if ok && go_bytes_equal(v, go_strconv_format_int(n, 10)) {
+            st.pax = __go_tar_pax_set(st.pax, __go_tar_pax_key(pax_key), v);
+        };
+    };
+    return;
+}
+
+// verifyTime (common.go allowedFormats closure).
+// Time reasons render the instant in PAX form: Go's %v
+// renders a wall-clock string which time.sla cannot
+// produce (recorded divergence, see manifest).
+fn __go_tar_verify_time(st: &GoTarAllowState, hdr_pax: Vec<GosTarPaxRecord>, ts: GoTime, size: i64, field_id: i64, pax_key: i64) -> void {
+    if __go_tar_time_is_zero(ts) {
+        return;
+    };
+    let name = __go_tar_field_name(field_id);
+    let (sec, nsec) = __go_tar_time_split(ts);
+    if __go_tar_fits_in_base256(size, sec) == false {
+        st.why_no_gnu = __go_tar_why_reason(0, name, __go_tar_format_pax_time(ts));
+        __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_GNU);
+    };
+    let is_mtime = pax_key == GO_TAR_KEY_MTIME;
+    let fits_octal = __go_tar_fits_in_octal(size, sec);
+    if (is_mtime && fits_octal == false) || is_mtime == false {
+        st.why_no_ustar = __go_tar_why_reason(1, name, __go_tar_format_pax_time(ts));
+        __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_USTAR);
+    };
+    let needs_nano = nsec != 0;
+    if is_mtime == false || fits_octal == false || needs_nano {
+        st.prefer_pax = true;
+        if pax_key == 0 - 1 {
+            st.why_no_pax = __go_tar_why_reason(2, name, __go_tar_format_pax_time(ts));
+            __go_tar_fmt_must_not_be(st, GO_TAR_FORMAT_PAX);
+        } else {
+            st.pax = __go_tar_pax_set(st.pax, __go_tar_pax_key(pax_key), __go_tar_format_pax_time(ts));
+        };
+    };
+    if pax_key != 0 - 1 {
+        let (v, ok) = __go_tar_pax_get(hdr_pax, __go_tar_pax_key(pax_key));
+        if ok && go_bytes_equal(v, __go_tar_format_pax_time(ts)) {
+            st.pax = __go_tar_pax_set(st.pax, __go_tar_pax_key(pax_key), v);
+        };
+    };
+    return;
+}
+
+// Is key a basic PAX key (path/linkpath/size/uid/gid/
+// uname/gname/mtime/atime/ctime)?
+fn __go_tar_is_basic_key(k: Vec<u8>) -> bool {
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_PATH)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_LINKPATH)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_SIZE)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_UID)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_GID)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_UNAME)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_GNAME)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_MTIME)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_ATIME)) { return true; };
+    if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_CTIME)) { return true; };
+    return false;
+}
+
+// allowedFormats: which formats can encode this header,
+// plus the PAX records for fields that cannot be encoded
+// directly. Returns (format, paxHdrs, err); format is
+// FormatUnknown when the header cannot be encoded.
+fn __go_tar_allowed_formats(hdr: &GosTarHeader) -> (i64, Vec<GosTarPaxRecord>, ptr) {
+    let st = __go_tar_allow_new();
+    let hdr_pax = hdr.pax_records;
+
+    __go_tar_verify_string(&st, hdr_pax, hdr.name, 100, GO_TAR_FIELD_NAME, GO_TAR_KEY_PATH);
+    __go_tar_verify_string(&st, hdr_pax, hdr.linkname, 100, GO_TAR_FIELD_LINKNAME, GO_TAR_KEY_LINKPATH);
+    __go_tar_verify_string(&st, hdr_pax, hdr.uname, 32, GO_TAR_FIELD_UNAME, GO_TAR_KEY_UNAME);
+    __go_tar_verify_string(&st, hdr_pax, hdr.gname, 32, GO_TAR_FIELD_GNAME, GO_TAR_KEY_GNAME);
+    __go_tar_verify_numeric(&st, hdr_pax, hdr.mode, 8, GO_TAR_FIELD_MODE, 0 - 1);
+    __go_tar_verify_numeric(&st, hdr_pax, hdr.uid, 8, GO_TAR_FIELD_UID, GO_TAR_KEY_UID);
+    __go_tar_verify_numeric(&st, hdr_pax, hdr.gid, 8, GO_TAR_FIELD_GID, GO_TAR_KEY_GID);
+    __go_tar_verify_numeric(&st, hdr_pax, hdr.size, 12, GO_TAR_FIELD_SIZE, GO_TAR_KEY_SIZE);
+    __go_tar_verify_numeric(&st, hdr_pax, hdr.devmajor, 8, GO_TAR_FIELD_DEVMAJOR, 0 - 1);
+    __go_tar_verify_numeric(&st, hdr_pax, hdr.devminor, 8, GO_TAR_FIELD_DEVMINOR, 0 - 1);
+    __go_tar_verify_time(&st, hdr_pax, hdr.mod_time, 12, GO_TAR_FIELD_MODTIME, GO_TAR_KEY_MTIME);
+    __go_tar_verify_time(&st, hdr_pax, hdr.access_time, 12, GO_TAR_FIELD_ACCESSTIME, GO_TAR_KEY_ATIME);
+    __go_tar_verify_time(&st, hdr_pax, hdr.change_time, 12, GO_TAR_FIELD_CHANGETIME, GO_TAR_KEY_CTIME);
+
+    // Header-only type checks.
+    if hdr.typeflag == GO_TAR_TYPE_REG || hdr.typeflag == GO_TAR_TYPE_CHAR || hdr.typeflag == GO_TAR_TYPE_BLOCK || hdr.typeflag == GO_TAR_TYPE_FIFO || hdr.typeflag == GO_TAR_TYPE_GNU_SPARSE {
+        if go_bytes_has_suffix(hdr.name, __go_tar_slash()) {
+            let reasons = Vec::new();
+            reasons.push(__go_tar_msg_trailing_slash());
+            return (GO_TAR_FORMAT_UNKNOWN, Vec::new(), __go_tar_err_cannot_encode(reasons));
+        };
+    } else if hdr.typeflag == GO_TAR_TYPE_X_HEADER || hdr.typeflag == GO_TAR_TYPE_GNU_LONG_NAME || hdr.typeflag == GO_TAR_TYPE_GNU_LONG_LINK {
+        let reasons = Vec::new();
+        reasons.push(__go_tar_msg_manual_encode());
+        return (GO_TAR_FORMAT_UNKNOWN, Vec::new(), __go_tar_err_cannot_encode(reasons));
+    } else if hdr.typeflag == GO_TAR_TYPE_X_GLOBAL_HEADER {
+        if __go_tar_is_global_only(hdr) == false {
+            let reasons = Vec::new();
+            reasons.push(__go_tar_msg_only_pax_records());
+            return (GO_TAR_FORMAT_UNKNOWN, Vec::new(), __go_tar_err_cannot_encode(reasons));
+        };
+        st.why_only_pax = __go_tar_msg_only_pax_global();
+        __go_tar_fmt_may_only_be(&st, GO_TAR_FORMAT_PAX);
+    };
+    if __go_tar_is_header_only_type(hdr.typeflag) == false && hdr.size < 0 {
+        let reasons = Vec::new();
+        reasons.push(__go_tar_msg_negative_size());
+        return (GO_TAR_FORMAT_UNKNOWN, Vec::new(), __go_tar_err_cannot_encode(reasons));
+    };
+
+    // Xattrs ride as SCHILY.xattr.* PAX records.
+    if len(hdr.xattrs) > 0 {
+        let i = 0;
+        while i < len(hdr.xattrs) {
+            let xk = __go_tar_pax_key(GO_TAR_KEY_SCHILY_XATTR);
+            __go_tar_append(&xk, hdr.xattrs[i].key);
+            st.pax = __go_tar_pax_set(st.pax, xk, go_bytes_clone(hdr.xattrs[i].value));
+            i = i + 1;
+        }
+        st.why_only_pax = __go_tar_msg_only_pax_xattrs();
+        __go_tar_fmt_may_only_be(&st, GO_TAR_FORMAT_PAX);
+    };
+
+    // Caller-supplied PAX records: keep existing ones,
+    // copy all for global headers, copy non-basic,
+    // non-GNU.sparse ones otherwise.
+    if len(hdr.pax_records) > 0 {
+        let i = 0;
+        while i < len(hdr.pax_records) {
+            let k = hdr.pax_records[i].key;
+            let v = hdr.pax_records[i].value;
+            let (_old, exists) = __go_tar_pax_get(st.pax, k);
+            if exists == false {
+                if hdr.typeflag == GO_TAR_TYPE_X_GLOBAL_HEADER {
+                    st.pax = __go_tar_pax_set(st.pax, go_bytes_clone(k), go_bytes_clone(v));
+                } else if __go_tar_is_basic_key(k) == false && go_bytes_has_prefix(k, __go_tar_pax_key(GO_TAR_KEY_GNU_PREFIX)) == false {
+                    st.pax = __go_tar_pax_set(st.pax, go_bytes_clone(k), go_bytes_clone(v));
+                };
+            };
+            i = i + 1;
+        }
+        st.why_only_pax = __go_tar_msg_only_pax_recs();
+        __go_tar_fmt_may_only_be(&st, GO_TAR_FORMAT_PAX);
+    };
+
+    // Every accumulated PAX record must itself be valid.
+    let j = 0;
+    while j < len(st.pax) {
+        if __go_tar_valid_pax_record(st.pax[j].key, st.pax[j].value) == false {
+            let bad = Vec::new();
+            __go_tar_append(&bad, st.pax[j].key);
+            bad.push(32u8);
+            bad.push(61u8);
+            bad.push(32u8);
+            __go_tar_append(&bad, st.pax[j].value);
+            let full = __go_tar_msg_invalid_pax_record();
+            __go_tar_append(&full, go_strconv_quote(bad));
+            let reasons2 = Vec::new();
+            reasons2.push(full);
+            return (GO_TAR_FORMAT_UNKNOWN, Vec::new(), __go_tar_err_cannot_encode(reasons2));
+        };
+        j = j + 1;
+    }
+
+    // Desired format: PAX implies USTAR is allowed too,
+    // unless PAX was specifically preferred.
+    if hdr.format != GO_TAR_FORMAT_UNKNOWN {
+        let want = hdr.format;
+        if (want & GO_TAR_FORMAT_PAX) != 0 && st.prefer_pax == false {
+            want = want | GO_TAR_FORMAT_USTAR;
+        };
+        st.format = st.format & want;
+    };
+    if st.format == GO_TAR_FORMAT_UNKNOWN {
+        let reasons = Vec::new();
+        if hdr.format == GO_TAR_FORMAT_USTAR {
+            reasons.push(__go_tar_msg_format_ustar());
+            reasons.push(go_bytes_clone(st.why_no_ustar));
+            reasons.push(go_bytes_clone(st.why_only_pax));
+            reasons.push(go_bytes_clone(st.why_only_gnu));
+        } else if hdr.format == GO_TAR_FORMAT_PAX {
+            reasons.push(__go_tar_msg_format_pax());
+            reasons.push(go_bytes_clone(st.why_no_pax));
+            reasons.push(go_bytes_clone(st.why_only_gnu));
+        } else if hdr.format == GO_TAR_FORMAT_GNU {
+            reasons.push(__go_tar_msg_format_gnu());
+            reasons.push(go_bytes_clone(st.why_no_gnu));
+            reasons.push(go_bytes_clone(st.why_only_pax));
+        } else {
+            reasons.push(go_bytes_clone(st.why_no_ustar));
+            reasons.push(go_bytes_clone(st.why_no_pax));
+            reasons.push(go_bytes_clone(st.why_no_gnu));
+            reasons.push(go_bytes_clone(st.why_only_pax));
+            reasons.push(go_bytes_clone(st.why_only_gnu));
+        };
+        return (GO_TAR_FORMAT_UNKNOWN, st.pax, __go_tar_err_cannot_encode(reasons));
+    };
+    return (st.format, st.pax, go_errors_nil());
+}
+
+// A global header may only carry Name/Typeflag/Xattrs/
+// PAXRecords/Format; every other field must be zero.
+fn __go_tar_is_global_only(hdr: &GosTarHeader) -> bool {
+    if len(hdr.linkname) > 0 { return false; };
+    if hdr.size != 0 { return false; };
+    if hdr.mode != 0 { return false; };
+    if hdr.uid != 0 { return false; };
+    if hdr.gid != 0 { return false; };
+    if len(hdr.uname) > 0 { return false; };
+    if len(hdr.gname) > 0 { return false; };
+    if __go_tar_time_is_zero(hdr.mod_time) == false { return false; };
+    if __go_tar_time_is_zero(hdr.access_time) == false { return false; };
+    if __go_tar_time_is_zero(hdr.change_time) == false { return false; };
+    if hdr.devmajor != 0 { return false; };
+    if hdr.devminor != 0 { return false; };
+    return true;
+}
+
+fn __go_tar_slash() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(47u8);
+    return v;
+}
+
+fn __go_tar_msg_trailing_slash() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(102u8);
+    v.push(105u8);
+    v.push(108u8);
+    v.push(101u8);
+    v.push(110u8);
+    v.push(97u8);
+    v.push(109u8);
+    v.push(101u8);
+    v.push(32u8);
+    v.push(109u8);
+    v.push(97u8);
+    v.push(121u8);
+    v.push(32u8);
+    v.push(110u8);
+    v.push(111u8);
+    v.push(116u8);
+    v.push(32u8);
+    v.push(104u8);
+    v.push(97u8);
+    v.push(118u8);
+    v.push(101u8);
+    v.push(32u8);
+    v.push(116u8);
+    v.push(114u8);
+    v.push(97u8);
+    v.push(105u8);
+    v.push(108u8);
+    v.push(105u8);
+    v.push(110u8);
+    v.push(103u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(108u8);
+    v.push(97u8);
+    v.push(115u8);
+    v.push(104u8);
+    return v;
+}
+
+fn __go_tar_msg_manual_encode() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(99u8);
+    v.push(97u8);
+    v.push(110u8);
+    v.push(110u8);
+    v.push(111u8);
+    v.push(116u8);
+    v.push(32u8);
+    v.push(109u8);
+    v.push(97u8);
+    v.push(110u8);
+    v.push(117u8);
+    v.push(97u8);
+    v.push(108u8);
+    v.push(108u8);
+    v.push(121u8);
+    v.push(32u8);
+    v.push(101u8);
+    v.push(110u8);
+    v.push(99u8);
+    v.push(111u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(32u8);
+    v.push(84u8);
+    v.push(121u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(88u8);
+    v.push(72u8);
+    v.push(101u8);
+    v.push(97u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(114u8);
+    v.push(44u8);
+    v.push(32u8);
+    v.push(84u8);
+    v.push(121u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(71u8);
+    v.push(78u8);
+    v.push(85u8);
+    v.push(76u8);
+    v.push(111u8);
+    v.push(110u8);
+    v.push(103u8);
+    v.push(78u8);
+    v.push(97u8);
+    v.push(109u8);
+    v.push(101u8);
+    v.push(44u8);
+    v.push(32u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(32u8);
+    v.push(84u8);
+    v.push(121u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(71u8);
+    v.push(78u8);
+    v.push(85u8);
+    v.push(76u8);
+    v.push(111u8);
+    v.push(110u8);
+    v.push(103u8);
+    v.push(76u8);
+    v.push(105u8);
+    v.push(110u8);
+    v.push(107u8);
+    v.push(32u8);
+    v.push(104u8);
+    v.push(101u8);
+    v.push(97u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(114u8);
+    v.push(115u8);
+    return v;
+}
+
+fn __go_tar_msg_only_pax_records() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(111u8);
+    v.push(110u8);
+    v.push(108u8);
+    v.push(121u8);
+    v.push(32u8);
+    v.push(80u8);
+    v.push(65u8);
+    v.push(88u8);
+    v.push(82u8);
+    v.push(101u8);
+    v.push(99u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(100u8);
+    v.push(115u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(104u8);
+    v.push(111u8);
+    v.push(117u8);
+    v.push(108u8);
+    v.push(100u8);
+    v.push(32u8);
+    v.push(98u8);
+    v.push(101u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(101u8);
+    v.push(116u8);
+    v.push(32u8);
+    v.push(102u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(32u8);
+    v.push(84u8);
+    v.push(121u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(88u8);
+    v.push(71u8);
+    v.push(108u8);
+    v.push(111u8);
+    v.push(98u8);
+    v.push(97u8);
+    v.push(108u8);
+    v.push(72u8);
+    v.push(101u8);
+    v.push(97u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(114u8);
+    return v;
+}
+
+fn __go_tar_msg_negative_size() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(110u8);
+    v.push(101u8);
+    v.push(103u8);
+    v.push(97u8);
+    v.push(116u8);
+    v.push(105u8);
+    v.push(118u8);
+    v.push(101u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(105u8);
+    v.push(122u8);
+    v.push(101u8);
+    v.push(32u8);
+    v.push(111u8);
+    v.push(110u8);
+    v.push(32u8);
+    v.push(104u8);
+    v.push(101u8);
+    v.push(97u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(114u8);
+    v.push(45u8);
+    v.push(111u8);
+    v.push(110u8);
+    v.push(108u8);
+    v.push(121u8);
+    v.push(32u8);
+    v.push(116u8);
+    v.push(121u8);
+    v.push(112u8);
+    v.push(101u8);
+    return v;
+}
+
+fn __go_tar_msg_only_pax_global() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(111u8);
+    v.push(110u8);
+    v.push(108u8);
+    v.push(121u8);
+    v.push(32u8);
+    v.push(80u8);
+    v.push(65u8);
+    v.push(88u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(117u8);
+    v.push(112u8);
+    v.push(112u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(116u8);
+    v.push(115u8);
+    v.push(32u8);
+    v.push(84u8);
+    v.push(121u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(88u8);
+    v.push(71u8);
+    v.push(108u8);
+    v.push(111u8);
+    v.push(98u8);
+    v.push(97u8);
+    v.push(108u8);
+    v.push(72u8);
+    v.push(101u8);
+    v.push(97u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(114u8);
+    return v;
+}
+
+fn __go_tar_msg_only_pax_xattrs() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(111u8);
+    v.push(110u8);
+    v.push(108u8);
+    v.push(121u8);
+    v.push(32u8);
+    v.push(80u8);
+    v.push(65u8);
+    v.push(88u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(117u8);
+    v.push(112u8);
+    v.push(112u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(116u8);
+    v.push(115u8);
+    v.push(32u8);
+    v.push(88u8);
+    v.push(97u8);
+    v.push(116u8);
+    v.push(116u8);
+    v.push(114u8);
+    v.push(115u8);
+    return v;
+}
+
+fn __go_tar_msg_only_pax_recs() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(111u8);
+    v.push(110u8);
+    v.push(108u8);
+    v.push(121u8);
+    v.push(32u8);
+    v.push(80u8);
+    v.push(65u8);
+    v.push(88u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(117u8);
+    v.push(112u8);
+    v.push(112u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(116u8);
+    v.push(115u8);
+    v.push(32u8);
+    v.push(80u8);
+    v.push(65u8);
+    v.push(88u8);
+    v.push(82u8);
+    v.push(101u8);
+    v.push(99u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(100u8);
+    v.push(115u8);
+    return v;
+}
+
+fn __go_tar_msg_invalid_pax_record() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(105u8);
+    v.push(110u8);
+    v.push(118u8);
+    v.push(97u8);
+    v.push(108u8);
+    v.push(105u8);
+    v.push(100u8);
+    v.push(32u8);
+    v.push(80u8);
+    v.push(65u8);
+    v.push(88u8);
+    v.push(32u8);
+    v.push(114u8);
+    v.push(101u8);
+    v.push(99u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(100u8);
+    v.push(58u8);
+    v.push(32u8);
+    return v;
+}
+
+fn __go_tar_msg_format_ustar() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(70u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(109u8);
+    v.push(97u8);
+    v.push(116u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(99u8);
+    v.push(105u8);
+    v.push(102u8);
+    v.push(105u8);
+    v.push(101u8);
+    v.push(115u8);
+    v.push(32u8);
+    v.push(85u8);
+    v.push(83u8);
+    v.push(84u8);
+    v.push(65u8);
+    v.push(82u8);
+    return v;
+}
+
+fn __go_tar_msg_format_pax() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(70u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(109u8);
+    v.push(97u8);
+    v.push(116u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(99u8);
+    v.push(105u8);
+    v.push(102u8);
+    v.push(105u8);
+    v.push(101u8);
+    v.push(115u8);
+    v.push(32u8);
+    v.push(80u8);
+    v.push(65u8);
+    v.push(88u8);
+    return v;
+}
+
+fn __go_tar_msg_format_gnu() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(70u8);
+    v.push(111u8);
+    v.push(114u8);
+    v.push(109u8);
+    v.push(97u8);
+    v.push(116u8);
+    v.push(32u8);
+    v.push(115u8);
+    v.push(112u8);
+    v.push(101u8);
+    v.push(99u8);
+    v.push(105u8);
+    v.push(102u8);
+    v.push(105u8);
+    v.push(101u8);
+    v.push(115u8);
+    v.push(32u8);
+    v.push(71u8);
+    v.push(78u8);
+    v.push(85u8);
+    return v;
+}
+
+// ---------- Reader internals ----------
+
+// tryReadFull on a raw GosIoReader: loop until n bytes
+// are appended to dst or an error arrives; EOF on an
+// exactly-full read is cleared (Go semantics).
+fn __go_tar_try_read_raw(r: &GosIoReader, dst: &Vec<u8>, n: i64) -> (i64, ptr) {
+    let start = len(dst);
+    let err = go_errors_nil();
+    while len(dst) - start < n && __go_tar_is_nil(err) {
+        let res = go_io_reader_read(r, dst, n - (len(dst) - start));
+        err = res.err;
+    }
+    let read = len(dst) - start;
+    if read == n && __go_tar_is_eof(err) {
+        err = go_errors_nil();
+    };
+    return (read, err);
+}
+
+// io.ReadFull semantics on a raw reader: EOF when 0
+// bytes were read, UnexpectedEOF on a partial read.
+fn __go_tar_read_full_raw(r: &GosIoReader, dst: &Vec<u8>, n: i64) -> (i64, ptr) {
+    let (m, e) = __go_tar_try_read_raw(r, dst, n);
+    if __go_tar_is_eof(e) {
+        if m == 0 {
+            return (0, go_io_eof());
+        };
+        return (m, go_io_err_unexpected_eof());
+    };
+    return (m, e);
+}
+
+// mustReadFull on a raw reader: EOF always becomes
+// UnexpectedEOF.
+fn __go_tar_must_read_raw(r: &GosIoReader, dst: &Vec<u8>, n: i64) -> (i64, ptr) {
+    let (m, e) = __go_tar_try_read_raw(r, dst, n);
+    if __go_tar_is_eof(e) {
+        return (m, go_io_err_unexpected_eof());
+    };
+    return (m, e);
+}
+
+// One clamped read from the current file (regFileReader
+// semantics): at most tr.nb bytes, tr.nb updated, EOF
+// when the file ends, UnexpectedEOF on truncation.
+fn __go_tar_reg_read_once(tr: &GosTarReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    let m = __go_tar_min(max, tr.nb);
+    if m <= 0 {
+        if tr.nb == 0 {
+            return GoIoResult { n: 0, err: go_io_eof() };
+        };
+        return GoIoResult { n: 0, err: go_errors_nil() };
+    };
+    let res = go_io_reader_read(&tr.r, dst, m);
+    tr.nb = tr.nb - res.n;
+    if __go_tar_is_eof(res.err) && tr.nb > 0 {
+        return GoIoResult { n: res.n, err: go_io_err_unexpected_eof() };
+    };
+    if __go_tar_is_nil(res.err) && tr.nb == 0 {
+        return GoIoResult { n: res.n, err: go_io_eof() };
+    };
+    return res;
+}
+
+// tryReadFull through the current-file reader.
+fn __go_tar_try_read_reg(tr: &GosTarReader, dst: &Vec<u8>, n: i64) -> (i64, ptr) {
+    let start = len(dst);
+    let err = go_errors_nil();
+    while len(dst) - start < n && __go_tar_is_nil(err) {
+        let res = __go_tar_reg_read_once(tr, dst, n - (len(dst) - start));
+        err = res.err;
+    }
+    let read = len(dst) - start;
+    if read == n && __go_tar_is_eof(err) {
+        err = go_errors_nil();
+    };
+    return (read, err);
+}
+
+// mustReadFull through the current-file reader.
+fn __go_tar_must_read_reg(tr: &GosTarReader, dst: &Vec<u8>, n: i64) -> (i64, ptr) {
+    let (m, e) = __go_tar_try_read_reg(tr, dst, n);
+    if __go_tar_is_eof(e) {
+        return (m, go_io_err_unexpected_eof());
+    };
+    return (m, e);
+}
+
+// discard: read and drop n bytes (no Seek in the corpus
+// io handles). EOF on a short discard becomes
+// UnexpectedEOF; EOF on a complete discard is nil.
+fn __go_tar_discard(r: &GosIoReader, n: i64) -> ptr {
+    let skipped = 0;
+    let err = go_errors_nil();
+    while skipped < n && __go_tar_is_nil(err) {
+        let scratch = Vec::new();
+        let want = __go_tar_min(n - skipped, GO_TAR_BLOCK_SIZE);
+        let res = go_io_reader_read(r, &scratch, want);
+        skipped = skipped + res.n;
+        err = res.err;
+    }
+    if __go_tar_is_nil(err) {
+        return go_errors_nil();
+    };
+    if __go_tar_is_eof(err) {
+        if skipped < n {
+            return go_io_err_unexpected_eof();
+        };
+        return go_errors_nil();
+    };
+    return err;
+}
+
+// readSpecialFile: read the whole current file (through
+// the Reader's Read), capped at maxSpecialFileSize.
+fn __go_tar_read_special_file(tr: &GosTarReader) -> (Vec<u8>, ptr) {
+    let buf = Vec::new();
+    let err = go_errors_nil();
+    while __go_tar_is_nil(err) {
+        let res = go_archive_tar_reader_read(tr, &buf, GO_TAR_BLOCK_SIZE);
+        err = res.err;
+        if len(buf) > GO_TAR_MAX_SPECIAL_FILE_SIZE {
+            return (Vec::new(), __go_tar_err_field_too_long());
+        };
+    }
+    if __go_tar_is_eof(err) {
+        return (buf, go_errors_nil());
+    };
+    return (buf, err);
+}
+
+// parsePAX: parse the extended-header file into records.
+// GNU sparse 0.0 offset/numbytes pairs are collected and
+// re-exposed as a single GNU.sparse.map record.
+fn __go_tar_parse_pax(tr: &GosTarReader) -> (Vec<GosTarPaxRecord>, ptr) {
+    let (buf, err) = __go_tar_read_special_file(tr);
+    if __go_tar_is_nil(err) == false {
+        return (Vec::new(), err);
+    };
+    let sbuf = buf;
+    let sparse_map = Vec::new();
+    let pax = Vec::new();
+    while len(sbuf) > 0 {
+        let (rec, rem, perr) = __go_tar_parse_pax_record(sbuf);
+        if __go_tar_is_nil(perr) == false {
+            return (Vec::new(), __go_tar_err_header());
+        };
+        sbuf = rem;
+        if go_bytes_equal(rec.key, __go_tar_pax_key(GO_TAR_KEY_GNU_OFFSET)) || go_bytes_equal(rec.key, __go_tar_pax_key(GO_TAR_KEY_GNU_NUMBYTES)) {
+            let expect_offset = len(sparse_map) % 2 == 0;
+            if (expect_offset && go_bytes_equal(rec.key, __go_tar_pax_key(GO_TAR_KEY_GNU_OFFSET)) == false) || (expect_offset == false && go_bytes_equal(rec.key, __go_tar_pax_key(GO_TAR_KEY_GNU_NUMBYTES)) == false) || go_bytes_index_byte(rec.value, 44u8) >= 0 {
+                return (Vec::new(), __go_tar_err_header());
+            };
+            sparse_map.push(go_bytes_clone(rec.value));
+        } else {
+            pax = __go_tar_pax_set(pax, rec.key, rec.value);
+        };
+    }
+    if len(sparse_map) > 0 {
+        let joined = Vec::new();
+        let i = 0;
+        while i < len(sparse_map) {
+            if i > 0 {
+                joined.push(44u8);
+            };
+            __go_tar_append(&joined, sparse_map[i]);
+            i = i + 1;
+        }
+        pax = __go_tar_pax_set(pax, __go_tar_pax_key(GO_TAR_KEY_GNU_MAP), joined);
+    };
+    return (pax, go_errors_nil());
+}
+
+// readGNUSparseMap1x0: the 1.0 sparse map lives in the
+// current file as newline-terminated decimal fields:
+// count, then (offset, length) pairs. Reads happen in
+// whole 512-byte blocks (feedTokens).
+fn __go_tar_read_gnu_sparse_map_1x0(tr: &GosTarReader) -> (Vec<GosTarSparseEntry>, ptr) {
+    let buf = Vec::new();
+    let cnt_newline = 0;
+    let total_size = 0;
+    let err = go_errors_nil();
+    // feedTokens(1): read blocks until 1 newline is buffered.
+    while cnt_newline < 1 && __go_tar_is_nil(err) {
+        total_size = total_size + GO_TAR_BLOCK_SIZE;
+        if total_size > GO_TAR_MAX_SPECIAL_FILE_SIZE {
+            return (Vec::new(), __go_tar_err_sparse_too_long());
+        };
+        let blk = Vec::new();
+        let (_m, e) = __go_tar_must_read_reg(tr, &blk, GO_TAR_BLOCK_SIZE);
+        err = e;
+        if __go_tar_is_nil(err) {
+            __go_tar_append(&buf, blk);
+            let i = 0;
+            while i < len(blk) {
+                if blk[i] == 10u8 {
+                    cnt_newline = cnt_newline + 1;
+                };
+                i = i + 1;
+            }
+        };
+    }
+    if __go_tar_is_nil(err) == false {
+        return (Vec::new(), err);
+    };
+    let (tok, rest) = __go_tar_next_token(buf);
+    buf = rest;
+    cnt_newline = cnt_newline - 1;
+    let rn = go_strconv_parse_int(tok, 10, 64);
+    if __go_tar_is_nil(rn.err) == false {
+        return (Vec::new(), __go_tar_err_header());
+    };
+    let num_entries = rn.v;
+    if num_entries < 0 || num_entries > 4611686018427387903 {
+        return (Vec::new(), __go_tar_err_header());
+    };
+    // feedTokens(2*numEntries).
+    while cnt_newline < 2 * num_entries && __go_tar_is_nil(err) {
+        total_size = total_size + GO_TAR_BLOCK_SIZE;
+        if total_size > GO_TAR_MAX_SPECIAL_FILE_SIZE {
+            return (Vec::new(), __go_tar_err_sparse_too_long());
+        };
+        let blk = Vec::new();
+        let (_m2, e2) = __go_tar_must_read_reg(tr, &blk, GO_TAR_BLOCK_SIZE);
+        err = e2;
+        if __go_tar_is_nil(err) {
+            __go_tar_append(&buf, blk);
+            let i = 0;
+            while i < len(blk) {
+                if blk[i] == 10u8 {
+                    cnt_newline = cnt_newline + 1;
+                };
+                i = i + 1;
+            }
+        };
+    }
+    if __go_tar_is_nil(err) == false {
+        return (Vec::new(), err);
+    };
+    let spd = Vec::new();
+    let i = 0;
+    while i < num_entries {
+        let (tok_off, rest1) = __go_tar_next_token(buf);
+        buf = rest1;
+        cnt_newline = cnt_newline - 1;
+        let (tok_len, rest2) = __go_tar_next_token(buf);
+        buf = rest2;
+        cnt_newline = cnt_newline - 1;
+        let r1 = go_strconv_parse_int(tok_off, 10, 64);
+        let r2 = go_strconv_parse_int(tok_len, 10, 64);
+        if __go_tar_is_nil(r1.err) == false || __go_tar_is_nil(r2.err) == false {
+            return (Vec::new(), __go_tar_err_header());
+        };
+        let (spd2, aerr) = __go_tar_append_sparse_entry(spd, GosTarSparseEntry { offset: r1.v, length: r2.v });
+        if __go_tar_is_nil(aerr) == false {
+            return (Vec::new(), aerr);
+        };
+        spd = spd2;
+        i = i + 1;
+    }
+    return (spd, go_errors_nil());
+}
+
+// nextToken: split buf at the first newline, returning
+// (token without the newline, remainder).
+fn __go_tar_next_token(buf: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    let idx = go_bytes_index_byte(buf, 10u8);
+    if idx < 0 {
+        return (go_bytes_clone(buf), Vec::new());
+    };
+    return (__go_tar_slice(buf, 0, idx), __go_tar_slice(buf, idx + 1, len(buf)));
+}
+
+// readGNUSparseMap0x1: the 0.1 map lives in the PAX
+// records as GNU.sparse.numblocks + GNU.sparse.map
+// (comma-separated offset,length pairs).
+fn __go_tar_read_gnu_sparse_map_0x1(pax: Vec<GosTarPaxRecord>) -> (Vec<GosTarSparseEntry>, ptr) {
+    let (num_str, _found) = __go_tar_pax_get(pax, __go_tar_pax_key(GO_TAR_KEY_GNU_NUMBLOCKS));
+    let rn = go_strconv_parse_int(num_str, 10, 64);
+    if __go_tar_is_nil(rn.err) == false {
+        return (Vec::new(), __go_tar_err_header());
+    };
+    let num_entries = rn.v;
+    if num_entries < 0 || num_entries > 4611686018427387903 {
+        return (Vec::new(), __go_tar_err_header());
+    };
+    let (map_str, _f2) = __go_tar_pax_get(pax, __go_tar_pax_key(GO_TAR_KEY_GNU_MAP));
+    let comma = Vec::new();
+    comma.push(44u8);
+    let parts = go_bytes_split(map_str, comma);
+    if len(parts) == 1 && len(parts[0]) == 0 {
+        parts = Vec::new();
+    };
+    if len(parts) != 2 * num_entries {
+        return (Vec::new(), __go_tar_err_header());
+    };
+    let spd = Vec::new();
+    let i = 0;
+    while i + 1 < len(parts) {
+        let r1 = go_strconv_parse_int(parts[i], 10, 64);
+        let r2 = go_strconv_parse_int(parts[i + 1], 10, 64);
+        if __go_tar_is_nil(r1.err) == false || __go_tar_is_nil(r2.err) == false {
+            return (Vec::new(), __go_tar_err_header());
+        };
+        let (spd2, aerr) = __go_tar_append_sparse_entry(spd, GosTarSparseEntry { offset: r1.v, length: r2.v });
+        if __go_tar_is_nil(aerr) == false {
+            return (Vec::new(), aerr);
+        };
+        spd = spd2;
+        i = i + 2;
+    }
+    return (spd, go_errors_nil());
+}
+
+// Logical bytes remaining in the current file: for a
+// sparse file the last hole's end minus the position,
+// otherwise the physical remaining count.
+fn __go_tar_logical_remaining(tr: &GosTarReader) -> i64 {
+    if tr.sparse_on {
+        let last = tr.sparse_holes[len(tr.sparse_holes) - 1];
+        return __go_tar_sparse_end(last) - tr.sparse_pos;
+    };
+    return tr.nb;
+}
+
+fn __go_tar_zero() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(48u8);
+    return v;
+}
+
+fn __go_tar_one() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(49u8);
+    return v;
+}
+
+// readOldGNUSparseMap: the old GNU sparse map lives in
+// the header block itself (up to 4 entries) plus extension
+// headers read from the raw reader. Returns
+// (entries, found, err); found is always true here
+// (the typeflag selects this path).
+fn __go_tar_read_old_gnu_sparse_map(tr: &GosTarReader, hdr: &GosTarHeader, blk: Vec<u8>) -> (Vec<GosTarSparseEntry>, bool, ptr) {
+    if __go_tar_get_format(blk) != GO_TAR_FORMAT_GNU {
+        return (Vec::new(), false, __go_tar_err_header());
+    };
+    hdr.format = hdr.format & GO_TAR_FORMAT_GNU;
+    let (real_size, perr) = __go_tar_parse_numeric(__go_tar_slice(blk, 483, 495));
+    if __go_tar_is_nil(perr) == false {
+        return (Vec::new(), false, perr);
+    };
+    hdr.size = real_size;
+    let cur = __go_tar_slice(blk, 386, 483);
+    let spd = Vec::new();
+    let total_size = len(cur);
+    while total_size < GO_TAR_MAX_SPECIAL_FILE_SIZE {
+        let max_entries = len(cur) / 24;
+        let perr2 = go_errors_nil();
+        let i = 0;
+        while i < max_entries {
+            let off_field = __go_tar_slice(cur, i * 24, i * 24 + 12);
+            if off_field[0] == 0u8 {
+                break;
+            };
+            let (off, e1) = __go_tar_parse_numeric(off_field);
+            let (ln, e2) = __go_tar_parse_numeric(__go_tar_slice(cur, i * 24 + 12, i * 24 + 24));
+            if __go_tar_is_nil(e1) == false {
+                perr2 = e1;
+                break;
+            };
+            if __go_tar_is_nil(e2) == false {
+                perr2 = e2;
+                break;
+            };
+            let (spd2, aerr) = __go_tar_append_sparse_entry(spd, GosTarSparseEntry { offset: off, length: ln });
+            if __go_tar_is_nil(aerr) == false {
+                perr2 = aerr;
+                break;
+            };
+            spd = spd2;
+            i = i + 1;
+        }
+        if __go_tar_is_nil(perr2) == false {
+            return (Vec::new(), false, perr2);
+        };
+        if cur[max_entries * 24] > 0u8 {
+            let ext = Vec::new();
+            let (_m, e) = __go_tar_must_read_raw(&tr.r, &ext, GO_TAR_BLOCK_SIZE);
+            if __go_tar_is_nil(e) == false {
+                return (Vec::new(), false, e);
+            };
+            cur = ext;
+            total_size = total_size + len(cur);
+            continue;
+        };
+        return (spd, true, go_errors_nil());
+    }
+    return (Vec::new(), false, __go_tar_err_sparse_too_long());
+}
+
+// readGNUSparsePAXHeaders: identify the GNU sparse PAX
+// version and read the map. Returns (entries, found,
+// err); found is false when this is not a sparse file.
+fn __go_tar_read_gnu_sparse_pax_headers(tr: &GosTarReader, hdr: &GosTarHeader) -> (Vec<GosTarSparseEntry>, bool, ptr) {
+    let (major, _f1) = __go_tar_pax_get(hdr.pax_records, __go_tar_pax_key(GO_TAR_KEY_GNU_MAJOR));
+    let (minor, _f2) = __go_tar_pax_get(hdr.pax_records, __go_tar_pax_key(GO_TAR_KEY_GNU_MINOR));
+    let is_1x0 = false;
+    if go_bytes_equal(major, __go_tar_zero()) && (go_bytes_equal(minor, __go_tar_zero()) || go_bytes_equal(minor, __go_tar_one())) {
+        is_1x0 = false;
+    } else if go_bytes_equal(major, __go_tar_one()) && go_bytes_equal(minor, __go_tar_zero()) {
+        is_1x0 = true;
+    } else if len(major) > 0 || len(minor) > 0 {
+        return (Vec::new(), false, go_errors_nil());
+    } else {
+        let (mapv, _mf) = __go_tar_pax_get(hdr.pax_records, __go_tar_pax_key(GO_TAR_KEY_GNU_MAP));
+        if len(mapv) == 0 {
+            return (Vec::new(), false, go_errors_nil());
+        };
+        is_1x0 = false;
+    };
+    hdr.format = hdr.format & GO_TAR_FORMAT_PAX;
+    let (name_v, _nf) = __go_tar_pax_get(hdr.pax_records, __go_tar_pax_key(GO_TAR_KEY_GNU_NAME));
+    if len(name_v) > 0 {
+        hdr.name = name_v;
+    };
+    let (size_v, _sf) = __go_tar_pax_get(hdr.pax_records, __go_tar_pax_key(GO_TAR_KEY_GNU_SIZE));
+    let size_s = size_v;
+    if len(size_s) == 0 {
+        let (rs, _rf) = __go_tar_pax_get(hdr.pax_records, __go_tar_pax_key(GO_TAR_KEY_GNU_REALSIZE));
+        size_s = rs;
+    };
+    if len(size_s) > 0 {
+        let r = go_strconv_parse_int(size_s, 10, 64);
+        if __go_tar_is_nil(r.err) == false {
+            return (Vec::new(), false, __go_tar_err_header());
+        };
+        hdr.size = r.v;
+    };
+    if is_1x0 {
+        let (spd, e) = __go_tar_read_gnu_sparse_map_1x0(tr);
+        return (spd, true, e);
+    };
+    let (spd, e) = __go_tar_read_gnu_sparse_map_0x1(hdr.pax_records);
+    return (spd, true, e);
+}
+
+// mergePAX: apply PAX records onto a header. Empty
+// values keep the USTAR value. Any parse failure yields
+// ErrHeader (the field is still assigned its parsed
+// value, 0 on failure, as in Go).
+fn __go_tar_merge_pax(hdr: &GosTarHeader, pax: Vec<GosTarPaxRecord>) -> ptr {
+    let i = 0;
+    while i < len(pax) {
+        let k = pax[i].key;
+        let v = pax[i].value;
+        if len(v) == 0 {
+            i = i + 1;
+            continue;
+        };
+        let err = go_errors_nil();
+        if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_PATH)) {
+            hdr.name = go_bytes_clone(v);
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_LINKPATH)) {
+            hdr.linkname = go_bytes_clone(v);
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_UNAME)) {
+            hdr.uname = go_bytes_clone(v);
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_GNAME)) {
+            hdr.gname = go_bytes_clone(v);
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_UID)) {
+            let r = go_strconv_parse_int(v, 10, 64);
+            hdr.uid = r.v;
+            err = r.err;
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_GID)) {
+            let r = go_strconv_parse_int(v, 10, 64);
+            hdr.gid = r.v;
+            err = r.err;
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_ATIME)) {
+            let (t, e) = __go_tar_parse_pax_time(v);
+            hdr.access_time = t;
+            err = e;
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_MTIME)) {
+            let (t, e) = __go_tar_parse_pax_time(v);
+            hdr.mod_time = t;
+            err = e;
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_CTIME)) {
+            let (t, e) = __go_tar_parse_pax_time(v);
+            hdr.change_time = t;
+            err = e;
+        } else if go_bytes_equal(k, __go_tar_pax_key(GO_TAR_KEY_SIZE)) {
+            let r = go_strconv_parse_int(v, 10, 64);
+            hdr.size = r.v;
+            err = r.err;
+        } else if go_bytes_has_prefix(k, __go_tar_pax_key(GO_TAR_KEY_SCHILY_XATTR)) {
+            let xk = __go_tar_slice(k, len(__go_tar_pax_key(GO_TAR_KEY_SCHILY_XATTR)), len(k));
+            hdr.xattrs = __go_tar_pax_set(hdr.xattrs, xk, go_bytes_clone(v));
+        };
+        if __go_tar_is_nil(err) == false {
+            return __go_tar_err_header();
+        };
+        i = i + 1;
+    }
+    hdr.pax_records = pax;
+    return go_errors_nil();
+}
+
+// readHeader: read the next 512-byte header block and
+// unpack it. Returns (header, raw block, err); err is
+// io.EOF only on a clean end of archive (0 bytes, 1 zero
+// block + EOF, or 2 zero blocks).
+fn __go_tar_read_header(tr: &GosTarReader) -> (GosTarHeader, Vec<u8>, ptr) {
+    let blk = Vec::new();
+    let (_m, e) = __go_tar_read_full_raw(&tr.r, &blk, GO_TAR_BLOCK_SIZE);
+    if __go_tar_is_nil(e) == false {
+        return (__go_tar_header_new(), Vec::new(), e);
+    };
+    if __go_tar_block_is_zero(blk) {
+        let blk2 = Vec::new();
+        let (_m2, e2) = __go_tar_read_full_raw(&tr.r, &blk2, GO_TAR_BLOCK_SIZE);
+        if __go_tar_is_nil(e2) == false {
+            return (__go_tar_header_new(), Vec::new(), e2);
+        };
+        if __go_tar_block_is_zero(blk2) {
+            return (__go_tar_header_new(), Vec::new(), go_io_eof());
+        };
+        return (__go_tar_header_new(), Vec::new(), __go_tar_err_header());
+    };
+    let format = __go_tar_get_format(blk);
+    if format == GO_TAR_FORMAT_UNKNOWN {
+        return (__go_tar_header_new(), Vec::new(), __go_tar_err_header());
+    };
+    let hdr = __go_tar_header_new();
+    let perr = go_errors_nil();
+    hdr.typeflag = blk[156] as i64;
+    hdr.name = __go_tar_parse_string(__go_tar_slice(blk, 0, 100));
+    hdr.linkname = __go_tar_parse_string(__go_tar_slice(blk, 157, 257));
+    let (v_size, e_size) = __go_tar_parse_numeric(__go_tar_slice(blk, 124, 136));
+    hdr.size = v_size;
+    if __go_tar_is_nil(perr) && __go_tar_is_nil(e_size) == false {
+        perr = e_size;
+    };
+    let (v_mode, e_mode) = __go_tar_parse_numeric(__go_tar_slice(blk, 100, 108));
+    hdr.mode = v_mode;
+    if __go_tar_is_nil(perr) && __go_tar_is_nil(e_mode) == false {
+        perr = e_mode;
+    };
+    let (v_uid, e_uid) = __go_tar_parse_numeric(__go_tar_slice(blk, 108, 116));
+    hdr.uid = v_uid;
+    if __go_tar_is_nil(perr) && __go_tar_is_nil(e_uid) == false {
+        perr = e_uid;
+    };
+    let (v_gid, e_gid) = __go_tar_parse_numeric(__go_tar_slice(blk, 116, 124));
+    hdr.gid = v_gid;
+    if __go_tar_is_nil(perr) && __go_tar_is_nil(e_gid) == false {
+        perr = e_gid;
+    };
+    let (v_mtime, e_mtime) = __go_tar_parse_numeric(__go_tar_slice(blk, 136, 148));
+    hdr.mod_time = go_time_unix(v_mtime, 0);
+    if __go_tar_is_nil(perr) && __go_tar_is_nil(e_mtime) == false {
+        perr = e_mtime;
+    };
+    let prefix = Vec::new();
+    if format > GO_TAR_FORMAT_V7 {
+        hdr.uname = __go_tar_parse_string(__go_tar_slice(blk, 265, 297));
+        hdr.gname = __go_tar_parse_string(__go_tar_slice(blk, 297, 329));
+        let (v_dmaj, e_dmaj) = __go_tar_parse_numeric(__go_tar_slice(blk, 329, 337));
+        hdr.devmajor = v_dmaj;
+        if __go_tar_is_nil(perr) && __go_tar_is_nil(e_dmaj) == false {
+            perr = e_dmaj;
+        };
+        let (v_dmin, e_dmin) = __go_tar_parse_numeric(__go_tar_slice(blk, 337, 345));
+        hdr.devminor = v_dmin;
+        if __go_tar_is_nil(perr) && __go_tar_is_nil(e_dmin) == false {
+            perr = e_dmin;
+        };
+        if (format & (GO_TAR_FORMAT_USTAR | GO_TAR_FORMAT_PAX)) != 0 {
+            hdr.format = format;
+            prefix = __go_tar_parse_string(__go_tar_slice(blk, 345, 500));
+            let non_ascii = false;
+            let i = 0;
+            while i < len(blk) {
+                if (blk[i] as i64) >= 128 {
+                    non_ascii = true;
+                };
+                i = i + 1;
+            }
+            if non_ascii {
+                hdr.format = GO_TAR_FORMAT_UNKNOWN;
+            };
+            if blk[135] != 0u8 || blk[107] != 0u8 || blk[115] != 0u8 || blk[123] != 0u8 || blk[147] != 0u8 || blk[336] != 0u8 || blk[344] != 0u8 {
+                hdr.format = GO_TAR_FORMAT_UNKNOWN;
+            };
+        } else if (format & GO_TAR_FORMAT_STAR) != 0 {
+            prefix = __go_tar_parse_string(__go_tar_slice(blk, 345, 476));
+            let (v_at, e_at) = __go_tar_parse_numeric(__go_tar_slice(blk, 476, 488));
+            hdr.access_time = go_time_unix(v_at, 0);
+            if __go_tar_is_nil(perr) && __go_tar_is_nil(e_at) == false {
+                perr = e_at;
+            };
+            let (v_ct, e_ct) = __go_tar_parse_numeric(__go_tar_slice(blk, 488, 500));
+            hdr.change_time = go_time_unix(v_ct, 0);
+            if __go_tar_is_nil(perr) && __go_tar_is_nil(e_ct) == false {
+                perr = e_ct;
+            };
+        } else if (format & GO_TAR_FORMAT_GNU) != 0 {
+            hdr.format = format;
+            let perr2 = go_errors_nil();
+            if blk[345] != 0u8 {
+                let (v_at, e_at) = __go_tar_parse_numeric(__go_tar_slice(blk, 345, 357));
+                hdr.access_time = go_time_unix(v_at, 0);
+                if __go_tar_is_nil(perr2) && __go_tar_is_nil(e_at) == false {
+                    perr2 = e_at;
+                };
+            };
+            if blk[357] != 0u8 {
+                let (v_ct, e_ct) = __go_tar_parse_numeric(__go_tar_slice(blk, 357, 369));
+                hdr.change_time = go_time_unix(v_ct, 0);
+                if __go_tar_is_nil(perr2) && __go_tar_is_nil(e_ct) == false {
+                    perr2 = e_ct;
+                };
+            };
+            // Pre-Go1.8 fallback: unparsable atime/ctime
+            // plus an ASCII prefix means the file was
+            // written by the buggy writer; treat the
+            // fields as a USTAR prefix instead.
+            if __go_tar_is_nil(perr2) == false {
+                hdr.access_time = go_time_unix(0, 0);
+                hdr.change_time = go_time_unix(0, 0);
+                let pfx = __go_tar_parse_string(__go_tar_slice(blk, 345, 500));
+                if __go_tar_is_ascii(pfx) {
+                    prefix = pfx;
+                };
+                hdr.format = GO_TAR_FORMAT_UNKNOWN;
+            };
+        };
+    };
+    if len(prefix) > 0 {
+        let joined = go_bytes_clone(prefix);
+        joined.push(47u8);
+        __go_tar_append(&joined, hdr.name);
+        hdr.name = joined;
+    };
+    return (hdr, blk, perr);
+}
+
+// handleRegularFile: set up the current file reader
+// (physical bytes = nb, padding owed after it).
+fn __go_tar_handle_regular_file(tr: &GosTarReader, hdr: &GosTarHeader) -> ptr {
+    let nb = hdr.size;
+    if __go_tar_is_header_only_type(hdr.typeflag) {
+        nb = 0;
+    };
+    if nb < 0 {
+        return __go_tar_err_header();
+    };
+    tr.pad = __go_tar_block_padding(nb);
+    tr.nb = nb;
+    tr.sparse_on = false;
+    tr.sparse_holes = Vec::new();
+    tr.sparse_pos = 0;
+    return go_errors_nil();
+}
+
+// handleSparseFile: detect a sparse format and install
+// the hole reader. The dense byte count (tr.nb) is
+// untouched; the logical size comes from the sparse map.
+fn __go_tar_handle_sparse_file(tr: &GosTarReader, hdr: &GosTarHeader, raw_blk: Vec<u8>) -> ptr {
+    let spd = Vec::new();
+    let found = false;
+    let err = go_errors_nil();
+    if hdr.typeflag == GO_TAR_TYPE_GNU_SPARSE {
+        let (s, f, e) = __go_tar_read_old_gnu_sparse_map(tr, hdr, raw_blk);
+        spd = s;
+        found = f;
+        err = e;
+    } else {
+        let (s, f, e) = __go_tar_read_gnu_sparse_pax_headers(tr, hdr);
+        spd = s;
+        found = f;
+        err = e;
+    };
+    if __go_tar_is_nil(err) && found {
+        if __go_tar_is_header_only_type(hdr.typeflag) || __go_tar_validate_sparse_entries(spd, hdr.size) == false {
+            return __go_tar_err_header();
+        };
+        let holes = __go_tar_invert_sparse_entries(spd, hdr.size);
+        tr.sparse_on = true;
+        tr.sparse_holes = holes;
+        tr.sparse_pos = 0;
+    };
+    return err;
+}
+
+// Internal Next loop: iterate past meta headers (PAX,
+// GNU long name/link) until a normal file is found.
+fn __go_tar_next(tr: &GosTarReader) -> GoTarNextResult {
+    let pax = Vec::new();
+    let gnu_long_name = Vec::new();
+    let gnu_long_link = Vec::new();
+    let format = GO_TAR_FORMAT_USTAR | GO_TAR_FORMAT_PAX | GO_TAR_FORMAT_GNU;
+    while true {
+        let derr = __go_tar_discard(&tr.r, tr.nb);
+        if __go_tar_is_nil(derr) == false {
+            return GoTarNextResult { hdr: __go_tar_header_new(), err: derr };
+        };
+        let pad_scratch = Vec::new();
+        let (_m, perr) = __go_tar_try_read_raw(&tr.r, &pad_scratch, tr.pad);
+        if __go_tar_is_nil(perr) == false {
+            return GoTarNextResult { hdr: __go_tar_header_new(), err: perr };
+        };
+        tr.pad = 0;
+        let (hdr, raw_blk, herr) = __go_tar_read_header(tr);
+        if __go_tar_is_nil(herr) == false {
+            return GoTarNextResult { hdr: __go_tar_header_new(), err: herr };
+        };
+        let hferr = __go_tar_handle_regular_file(tr, &hdr);
+        if __go_tar_is_nil(hferr) == false {
+            return GoTarNextResult { hdr: __go_tar_header_new(), err: hferr };
+        };
+        format = format & hdr.format;
+        if hdr.typeflag == GO_TAR_TYPE_X_HEADER || hdr.typeflag == GO_TAR_TYPE_X_GLOBAL_HEADER {
+            format = format & GO_TAR_FORMAT_PAX;
+            let (p, e) = __go_tar_parse_pax(tr);
+            if __go_tar_is_nil(e) == false {
+                return GoTarNextResult { hdr: __go_tar_header_new(), err: e };
+            };
+            pax = p;
+            if hdr.typeflag == GO_TAR_TYPE_X_GLOBAL_HEADER {
+                let _me = __go_tar_merge_pax(&hdr, pax);
+                let out = __go_tar_header_new();
+                out.name = go_bytes_clone(hdr.name);
+                out.typeflag = hdr.typeflag;
+                out.xattrs = hdr.xattrs;
+                out.pax_records = hdr.pax_records;
+                out.format = format;
+                return GoTarNextResult { hdr: out, err: go_errors_nil() };
+            };
+            continue;
+        };
+        if hdr.typeflag == GO_TAR_TYPE_GNU_LONG_NAME || hdr.typeflag == GO_TAR_TYPE_GNU_LONG_LINK {
+            format = format & GO_TAR_FORMAT_GNU;
+            let (realname, e) = __go_tar_read_special_file(tr);
+            if __go_tar_is_nil(e) == false {
+                return GoTarNextResult { hdr: __go_tar_header_new(), err: e };
+            };
+            if hdr.typeflag == GO_TAR_TYPE_GNU_LONG_NAME {
+                gnu_long_name = __go_tar_parse_string(realname);
+            } else {
+                gnu_long_link = __go_tar_parse_string(realname);
+            };
+            continue;
+        };
+        let merr = __go_tar_merge_pax(&hdr, pax);
+        if __go_tar_is_nil(merr) == false {
+            return GoTarNextResult { hdr: __go_tar_header_new(), err: merr };
+        };
+        if len(gnu_long_name) > 0 {
+            hdr.name = go_bytes_clone(gnu_long_name);
+        };
+        if len(gnu_long_link) > 0 {
+            hdr.linkname = go_bytes_clone(gnu_long_link);
+        };
+        if hdr.typeflag == GO_TAR_TYPE_REG_A {
+            if go_bytes_has_suffix(hdr.name, __go_tar_slash()) {
+                hdr.typeflag = GO_TAR_TYPE_DIR;
+            } else {
+                hdr.typeflag = GO_TAR_TYPE_REG;
+            };
+        };
+        let hferr2 = __go_tar_handle_regular_file(tr, &hdr);
+        if __go_tar_is_nil(hferr2) == false {
+            return GoTarNextResult { hdr: __go_tar_header_new(), err: hferr2 };
+        };
+        let sferr = __go_tar_handle_sparse_file(tr, &hdr, raw_blk);
+        if __go_tar_is_nil(sferr) == false {
+            return GoTarNextResult { hdr: __go_tar_header_new(), err: sferr };
+        };
+        if (format & GO_TAR_FORMAT_USTAR) != 0 && (format & GO_TAR_FORMAT_PAX) != 0 {
+            format = format & GO_TAR_FORMAT_USTAR;
+        };
+        hdr.format = format;
+        return GoTarNextResult { hdr: hdr, err: go_errors_nil() };
+    }
+}
+
+// Sparse-file Read: data fragments come from the dense
+// stream, hole fragments are NUL bytes.
+fn __go_tar_sparse_read(tr: &GosTarReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    let remaining = __go_tar_logical_remaining(tr);
+    let finished = max >= remaining;
+    let m = __go_tar_min(max, remaining);
+    let start = len(dst);
+    let end_pos = tr.sparse_pos + m;
+    let err = go_errors_nil();
+    while end_pos > tr.sparse_pos && __go_tar_is_nil(err) {
+        let hole = tr.sparse_holes[0];
+        let hole_start = hole.offset;
+        let hole_end = __go_tar_sparse_end(hole);
+        let nf = 0;
+        if tr.sparse_pos < hole_start {
+            let frag = __go_tar_min(m - (len(dst) - start), hole_start - tr.sparse_pos);
+            let (got, e) = __go_tar_try_read_reg(tr, dst, frag);
+            nf = got;
+            err = e;
+        } else {
+            let frag = __go_tar_min(m - (len(dst) - start), hole_end - tr.sparse_pos);
+            let i = 0;
+            while i < frag {
+                dst.push(0u8);
+                i = i + 1;
+            }
+            nf = frag;
+        };
+        tr.sparse_pos = tr.sparse_pos + nf;
+        if tr.sparse_pos >= hole_end && len(tr.sparse_holes) > 1 {
+            tr.sparse_holes = __go_tar_holes_tail(tr.sparse_holes);
+        };
+    }
+    let n = len(dst) - start;
+    if __go_tar_is_eof(err) {
+        return GoIoResult { n: n, err: __go_tar_err_miss_data() };
+    };
+    if __go_tar_is_nil(err) == false {
+        return GoIoResult { n: n, err: err };
+    };
+    if __go_tar_logical_remaining(tr) == 0 && tr.nb > 0 {
+        return GoIoResult { n: n, err: __go_tar_err_unref_data() };
+    };
+    if finished {
+        return GoIoResult { n: n, err: go_io_eof() };
+    };
+    return GoIoResult { n: n, err: go_errors_nil() };
+}
+
+// Read from the current file (sparse or regular).
+fn __go_tar_read_current(tr: &GosTarReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if tr.sparse_on {
+        return __go_tar_sparse_read(tr, dst, max);
+    };
+    return __go_tar_reg_read_once(tr, dst, max);
+}
+
+// ---------- Public reader API ----------
+
+// tar.NewReader(r): a Reader over r. Non-strict: insecure
+// paths are returned as-is (Go's default GODEBUG).
+fn go_archive_tar_new_reader(r: GosIoReader) -> GosTarReader {
+    return GosTarReader {
+        r: r,
+        pad: 0,
+        nb: 0,
+        err: go_errors_nil(),
+        sparse_on: false,
+        sparse_holes: Vec::new(),
+        sparse_pos: 0,
+        strict_path: false,
+    };
+}
+
+// tar.NewReader with strict path checking (Go's
+// GODEBUG tarinsecurepath=0): Next returns
+// ErrInsecurePath for non-local names.
+fn go_archive_tar_new_reader_strict(r: GosIoReader) -> GosTarReader {
+    let tr = go_archive_tar_new_reader(r);
+    tr.strict_path = true;
+    return tr;
+}
+
+// (*Reader).Next: advance to the next file. The error
+// is sticky (kept in tr.err); an insecure-path error
+// from strict mode is NOT sticky, matching Go.
+fn go_archive_tar_reader_next(tr: &GosTarReader) -> GoTarNextResult {
+    if __go_tar_is_nil(tr.err) == false {
+        return GoTarNextResult { hdr: __go_tar_header_new(), err: tr.err };
+    };
+    let res = __go_tar_next(tr);
+    tr.err = res.err;
+    if __go_tar_is_nil(res.err) && tr.strict_path && __go_tar_is_local(res.hdr.name) == false {
+        return GoTarNextResult { hdr: res.hdr, err: __go_tar_err_insecure_path() };
+    };
+    return res;
+}
+
+// (*Reader).Read: read up to max bytes of the current
+// file into dst (appended). Non-EOF errors are sticky.
+fn go_archive_tar_reader_read(tr: &GosTarReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if __go_tar_is_nil(tr.err) == false {
+        return GoIoResult { n: 0, err: tr.err };
+    };
+    let res = __go_tar_read_current(tr, dst, max);
+    if __go_tar_is_nil(res.err) == false && __go_tar_is_eof(res.err) == false {
+        tr.err = res.err;
+    };
+    return res;
+}
+
+// ---------- Writer internals ----------
+
+// Round a GoTime to the nearest second (Go's
+// Time.Round(time.Second): half away from zero).
+fn __go_tar_time_round_sec(t: GoTime) -> GoTime {
+    let ns = t.unix_ns;
+    if ns >= 0 {
+        let (sec, rem) = __go_tar_time_split(t);
+        if rem >= 500000000 {
+            return go_time_unix(sec + 1, 0);
+        };
+        return go_time_unix(sec, 0);
+    };
+    let a = 0 - ns;
+    let sec_a = a / 1000000000;
+    let rem_a = a % 1000000000;
+    if rem_a >= 500000000 {
+        return go_time_unix(0 - (sec_a + 1), 0);
+    };
+    return go_time_unix(0 - sec_a, 0);
+}
+
+// Template string field: plain formatString, or
+// toASCII+formatString when ascii is set (PAX path).
+fn __go_tar_template_str(blk: &Vec<u8>, off: i64, field_len: i64, s: Vec<u8>, ascii: bool) -> ptr {
+    if ascii {
+        return __go_tar_format_string(blk, off, field_len, __go_tar_to_ascii(s));
+    };
+    return __go_tar_format_string(blk, off, field_len, s);
+}
+
+// Template numeric field: octal (mode 0) or numeric (1).
+fn __go_tar_template_num(blk: &Vec<u8>, off: i64, field_len: i64, x: i64, mode: i64) -> ptr {
+    if mode == 0 {
+        return __go_tar_format_octal(blk, off, field_len, x);
+    };
+    return __go_tar_format_numeric(blk, off, field_len, x);
+}
+
+// templateV7Plus: fill the V7 + shared USTAR/PAX/GNU
+// fields of a fresh zero block. Returns (block, err);
+// the error is ErrFieldTooLong if any field failed
+// (all such errors share the one sentinel).
+fn __go_tar_template_v7plus(hdr: GosTarHeader, str_ascii: bool, num_mode: i64) -> (Vec<u8>, ptr) {
+    let blk = __go_tar_zero_block();
+    let failed = false;
+    let mod_time = hdr.mod_time;
+    if __go_tar_time_is_zero(mod_time) {
+        mod_time = go_time_unix(0, 0);
+    };
+    let (mod_sec, _mns) = __go_tar_time_split(mod_time);
+    blk[156] = hdr.typeflag as u8;
+    if __go_tar_is_nil(__go_tar_template_str(&blk, 0, 100, hdr.name, str_ascii)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_str(&blk, 157, 100, hdr.linkname, str_ascii)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_num(&blk, 100, 8, hdr.mode, num_mode)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_num(&blk, 108, 8, hdr.uid, num_mode)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_num(&blk, 116, 8, hdr.gid, num_mode)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_num(&blk, 124, 12, hdr.size, num_mode)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_num(&blk, 136, 12, mod_sec, num_mode)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_str(&blk, 265, 32, hdr.uname, str_ascii)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_str(&blk, 297, 32, hdr.gname, str_ascii)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_num(&blk, 329, 8, hdr.devmajor, num_mode)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_template_num(&blk, 337, 8, hdr.devminor, num_mode)) == false {
+        failed = true;
+    };
+    if failed {
+        return (blk, __go_tar_err_field_too_long());
+    };
+    return (blk, go_errors_nil());
+}
+
+// writeRawHeader: flush, write the block, set up the
+// writer for a file of the given size (0 for
+// header-only types). The block-write error is returned
+// without setting tw.err (the caller assigns it).
+fn __go_tar_write_raw_header(tw: &GosTarWriter, blk: Vec<u8>, size: i64, flag: i64) -> ptr {
+    let ferr = go_archive_tar_writer_flush(tw);
+    if __go_tar_is_nil(ferr) == false {
+        return ferr;
+    };
+    let res = go_io_writer_write(&tw.w, blk);
+    if __go_tar_is_nil(res.err) == false {
+        return res.err;
+    };
+    let sz = size;
+    if __go_tar_is_header_only_type(flag) {
+        sz = 0;
+    };
+    tw.nb = sz;
+    tw.pad = __go_tar_block_padding(sz);
+    return go_errors_nil();
+}
+
+// writeRawFile: a minimal file with default fields
+// (BSD/GNU tar style), used for PAX records and GNU
+// long names/links.
+fn __go_tar_write_raw_file(tw: &GosTarWriter, name: Vec<u8>, data: Vec<u8>, flag: i64, format: i64) -> ptr {
+    let nm = __go_tar_to_ascii(name);
+    if len(nm) > GO_TAR_NAME_SIZE {
+        nm = __go_tar_slice(nm, 0, GO_TAR_NAME_SIZE);
+    };
+    let end = len(nm);
+    while end > 0 {
+        if nm[end - 1] == 47u8 {
+            end = end - 1;
+        } else {
+            break;
+        };
+    }
+    nm = __go_tar_slice(nm, 0, end);
+    let blk = __go_tar_zero_block();
+    let failed = false;
+    blk[156] = flag as u8;
+    if __go_tar_is_nil(__go_tar_format_string(&blk, 0, 100, nm)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_format_octal(&blk, 100, 8, 0)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_format_octal(&blk, 108, 8, 0)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_format_octal(&blk, 116, 8, 0)) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_format_octal(&blk, 124, 12, len(data))) == false {
+        failed = true;
+    };
+    if __go_tar_is_nil(__go_tar_format_octal(&blk, 136, 12, 0)) == false {
+        failed = true;
+    };
+    __go_tar_set_format(&blk, format);
+    if failed {
+        return __go_tar_err_field_too_long();
+    };
+    let herr = __go_tar_write_raw_header(tw, blk, len(data), flag);
+    if __go_tar_is_nil(herr) == false {
+        return herr;
+    };
+    let res = go_archive_tar_writer_write(tw, data);
+    return res.err;
+}
+
+// Insertion sort of PAX records by key (Go sorts keys
+// for deterministic output; the sort package is NOT
+// used so tar stays independent of it).
+fn __go_tar_sort_pax_keys(pax: Vec<GosTarPaxRecord>) -> Vec<GosTarPaxRecord> {
+    let out = Vec::new();
+    let i = 0;
+    while i < len(pax) {
+        let rec = pax[i];
+        let j = 0;
+        while j < len(out) {
+            let cur_key = out[j].key;
+            if go_bytes_compare(rec.key, cur_key) < 0 {
+                break;
+            };
+            j = j + 1;
+        }
+        let next = Vec::new();
+        let k = 0;
+        while k < j {
+            next.push(out[k]);
+            k = k + 1;
+        }
+        next.push(rec);
+        while k < len(out) {
+            next.push(out[k]);
+            k = k + 1;
+        }
+        out = next;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __go_tar_long_link_name() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(46u8);
+    v.push(47u8);
+    v.push(46u8);
+    v.push(47u8);
+    v.push(64u8);
+    v.push(76u8);
+    v.push(111u8);
+    v.push(110u8);
+    v.push(103u8);
+    v.push(76u8);
+    v.push(105u8);
+    v.push(110u8);
+    v.push(107u8);
+    return v;
+}
+
+fn __go_tar_global_head_name() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(71u8);
+    v.push(108u8);
+    v.push(111u8);
+    v.push(98u8);
+    v.push(97u8);
+    v.push(108u8);
+    v.push(72u8);
+    v.push(101u8);
+    v.push(97u8);
+    v.push(100u8);
+    v.push(46u8);
+    v.push(48u8);
+    v.push(46u8);
+    v.push(48u8);
+    return v;
+}
+
+fn __go_tar_pax_headers_dir() -> Vec<u8> {
+    let v = Vec::new();
+    v.push(80u8);
+    v.push(97u8);
+    v.push(120u8);
+    v.push(72u8);
+    v.push(101u8);
+    v.push(97u8);
+    v.push(100u8);
+    v.push(101u8);
+    v.push(114u8);
+    v.push(115u8);
+    v.push(46u8);
+    v.push(48u8);
+    return v;
+}
+
+// writeUSTARHeader: split a long name at '/' and pack
+// the main header.
+fn __go_tar_write_ustar_header(tw: &GosTarWriter, hdr: GosTarHeader) -> ptr {
+    let name_prefix = Vec::new();
+    let (pre, suf, ok) = __go_tar_split_ustar_path(hdr.name);
+    if ok {
+        name_prefix = pre;
+        hdr.name = suf;
+    };
+    let (blk, e1) = __go_tar_template_v7plus(hdr, false, 0);
+    let e2 = __go_tar_format_string(&blk, 345, 155, name_prefix);
+    __go_tar_set_format(&blk, GO_TAR_FORMAT_USTAR);
+    if __go_tar_is_nil(e1) == false {
+        return e1;
+    };
+    if __go_tar_is_nil(e2) == false {
+        return e2;
+    };
+    return __go_tar_write_raw_header(tw, blk, hdr.size, hdr.typeflag);
+}
+
+// writePAXHeader: emit the 'x' (or 'g') extended
+// header file, then pack the main header with
+// ASCII-folded strings.
+fn __go_tar_write_pax_header(tw: &GosTarWriter, hdr: GosTarHeader, pax: Vec<GosTarPaxRecord>) -> ptr {
+    let real_name = hdr.name;
+    let is_global = hdr.typeflag == GO_TAR_TYPE_X_GLOBAL_HEADER;
+    if len(pax) > 0 || is_global {
+        let buf = Vec::new();
+        let sorted = __go_tar_sort_pax_keys(pax);
+        let i = 0;
+        while i < len(sorted) {
+            let (rec, e) = __go_tar_format_pax_record(sorted[i].key, sorted[i].value);
+            if __go_tar_is_nil(e) == false {
+                return e;
+            };
+            __go_tar_append(&buf, rec);
+            i = i + 1;
+        }
+        let name = Vec::new();
+        let flag = 0;
+        if is_global {
+            name = go_bytes_clone(real_name);
+            if len(name) == 0 {
+                name = __go_tar_global_head_name();
+            };
+            flag = GO_TAR_TYPE_X_GLOBAL_HEADER;
+        } else {
+            let sp = go_path_split(real_name);
+            let elems = Vec::new();
+            elems.push(sp.dir);
+            elems.push(__go_tar_pax_headers_dir());
+            elems.push(sp.file);
+            name = go_path_join(elems);
+            flag = GO_TAR_TYPE_X_HEADER;
+        };
+        if len(buf) > GO_TAR_MAX_SPECIAL_FILE_SIZE {
+            return __go_tar_err_field_too_long();
+        };
+        let err = __go_tar_write_raw_file(tw, name, buf, flag, GO_TAR_FORMAT_PAX);
+        if __go_tar_is_nil(err) == false || is_global {
+            return err;
+        };
+    };
+    let (blk, _e) = __go_tar_template_v7plus(hdr, true, 0);
+    __go_tar_set_format(&blk, GO_TAR_FORMAT_PAX);
+    return __go_tar_write_raw_header(tw, blk, hdr.size, hdr.typeflag);
+}
+
+// writeGNUHeader: long names/links via 'L'/'K' files,
+// then pack the main header with numeric fields.
+fn __go_tar_write_gnu_header(tw: &GosTarWriter, hdr: GosTarHeader) -> ptr {
+    if len(hdr.name) > GO_TAR_NAME_SIZE {
+        let data = go_bytes_clone(hdr.name);
+        data.push(0u8);
+        let err = __go_tar_write_raw_file(tw, __go_tar_long_link_name(), data, GO_TAR_TYPE_GNU_LONG_NAME, GO_TAR_FORMAT_GNU);
+        if __go_tar_is_nil(err) == false {
+            return err;
+        };
+    };
+    if len(hdr.linkname) > GO_TAR_NAME_SIZE {
+        let data = go_bytes_clone(hdr.linkname);
+        data.push(0u8);
+        let err = __go_tar_write_raw_file(tw, __go_tar_long_link_name(), data, GO_TAR_TYPE_GNU_LONG_LINK, GO_TAR_FORMAT_GNU);
+        if __go_tar_is_nil(err) == false {
+            return err;
+        };
+    };
+    let (blk, _e) = __go_tar_template_v7plus(hdr, false, 1);
+    if __go_tar_time_is_zero(hdr.access_time) == false {
+        let (sec, _ns) = __go_tar_time_split(hdr.access_time);
+        let _f1 = __go_tar_format_numeric(&blk, 345, 12, sec);
+    };
+    if __go_tar_time_is_zero(hdr.change_time) == false {
+        let (sec, _ns) = __go_tar_time_split(hdr.change_time);
+        let _f2 = __go_tar_format_numeric(&blk, 357, 12, sec);
+    };
+    __go_tar_set_format(&blk, GO_TAR_FORMAT_GNU);
+    return __go_tar_write_raw_header(tw, blk, hdr.size, hdr.typeflag);
+}
+
+// regFileWriter.Write: at most tw.nb bytes; overlong
+// writes are truncated and report ErrWriteTooLong.
+fn __go_tar_reg_write(tw: &GosTarWriter, p: Vec<u8>) -> GoIoResult {
+    let overwrite = len(p) > tw.nb;
+    let data = p;
+    if overwrite {
+        data = __go_tar_slice(p, 0, tw.nb);
+    };
+    let n = 0;
+    let err = go_errors_nil();
+    if len(data) > 0 {
+        let res = go_io_writer_write(&tw.w, data);
+        n = res.n;
+        err = res.err;
+        tw.nb = tw.nb - res.n;
+    };
+    if __go_tar_is_nil(err) == false {
+        return GoIoResult { n: n, err: err };
+    };
+    if overwrite {
+        return GoIoResult { n: n, err: __go_tar_err_write_too_long() };
+    };
+    return GoIoResult { n: n, err: go_errors_nil() };
+}
+
+fn __go_tar_is_write_too_long(err: ptr) -> bool {
+    return go_errors_is(err, __go_tar_err_write_too_long());
+}
+
+fn __go_tar_is_write_after_close(err: ptr) -> bool {
+    return go_errors_is(err, __go_tar_err_write_after_close());
+}
+
+// ---------- Public writer API ----------
+
+// tar.NewWriter(w).
+fn go_archive_tar_new_writer(w: GosIoWriter) -> GosTarWriter {
+    return GosTarWriter {
+        w: w,
+        pad: 0,
+        nb: 0,
+        err: go_errors_nil(),
+        closed: false,
+        hdr: __go_tar_header_new(),
+    };
+}
+
+// (*Writer).Flush: finish the current file's padding.
+// The missed-writing error is NOT sticky (Go returns it
+// without setting tw.err).
+fn go_archive_tar_writer_flush(tw: &GosTarWriter) -> ptr {
+    if __go_tar_is_nil(tw.err) == false {
+        return tw.err;
+    };
+    if tw.nb > 0 {
+        return __go_tar_err_missed_writing(tw.nb);
+    };
+    if tw.pad > 0 {
+        let zeros = __go_tar_slice(__go_tar_zero_block(), 0, tw.pad);
+        let res = go_io_writer_write(&tw.w, zeros);
+        if __go_tar_is_nil(res.err) == false {
+            tw.err = res.err;
+            return tw.err;
+        };
+    };
+    tw.pad = 0;
+    return go_errors_nil();
+}
+
+// (*Writer).WriteHeader: flush, promote TypeRegA,
+// round ModTime and drop atime/ctime when the format
+// is not explicitly chosen, then dispatch on the
+// allowed formats (USTAR, then PAX, then GNU). The
+// no-format error is non-fatal (tw.err stays nil).
+fn go_archive_tar_writer_write_header(tw: &GosTarWriter, hdr: GosTarHeader) -> ptr {
+    let ferr = go_archive_tar_writer_flush(tw);
+    if __go_tar_is_nil(ferr) == false {
+        return ferr;
+    };
+    tw.hdr = hdr;
+    if tw.hdr.typeflag == GO_TAR_TYPE_REG_A {
+        if go_bytes_has_suffix(tw.hdr.name, __go_tar_slash()) {
+            tw.hdr.typeflag = GO_TAR_TYPE_DIR;
+        } else {
+            tw.hdr.typeflag = GO_TAR_TYPE_REG;
+        };
+    };
+    if tw.hdr.format == GO_TAR_FORMAT_UNKNOWN {
+        tw.hdr.mod_time = __go_tar_time_round_sec(tw.hdr.mod_time);
+        tw.hdr.access_time = go_time_unix(0, 0);
+        tw.hdr.change_time = go_time_unix(0, 0);
+    };
+    let (allowed, pax, aerr) = __go_tar_allowed_formats(&tw.hdr);
+    let h = tw.hdr;
+    if (allowed & GO_TAR_FORMAT_USTAR) != 0 {
+        tw.err = __go_tar_write_ustar_header(tw, h);
+        return tw.err;
+    };
+    if (allowed & GO_TAR_FORMAT_PAX) != 0 {
+        tw.err = __go_tar_write_pax_header(tw, h, pax);
+        return tw.err;
+    };
+    if (allowed & GO_TAR_FORMAT_GNU) != 0 {
+        tw.err = __go_tar_write_gnu_header(tw, h);
+        return tw.err;
+    };
+    return aerr;
+}
+
+// (*Writer).Write: write file data. ErrWriteTooLong is
+// NOT sticky; any other error is.
+fn go_archive_tar_writer_write(tw: &GosTarWriter, p: Vec<u8>) -> GoIoResult {
+    if __go_tar_is_nil(tw.err) == false {
+        return GoIoResult { n: 0, err: tw.err };
+    };
+    let res = __go_tar_reg_write(tw, p);
+    if __go_tar_is_nil(res.err) == false && __go_tar_is_write_too_long(res.err) == false {
+        tw.err = res.err;
+    };
+    return res;
+}
+
+// (*Writer).Close: flush, write the two zero blocks,
+// then mark the writer closed (later calls fail with
+// ErrWriteAfterClose; Close itself stays nil).
+fn go_archive_tar_writer_close(tw: &GosTarWriter) -> ptr {
+    if __go_tar_is_write_after_close(tw.err) {
+        return go_errors_nil();
+    };
+    if __go_tar_is_nil(tw.err) == false {
+        return tw.err;
+    };
+    let err = go_archive_tar_writer_flush(tw);
+    let i = 0;
+    while i < 2 && __go_tar_is_nil(err) {
+        let zeros = __go_tar_zero_block();
+        let res = go_io_writer_write(&tw.w, zeros);
+        err = res.err;
+        i = i + 1;
+    }
+    tw.err = __go_tar_err_write_after_close();
+    tw.closed = true;
+    return err;
+}
+
+// ---------- Corpus example ----------
+// go_archive_tar_demo_header_roundtrip builds a USTAR
+// header block from a header and verifies it parses
+// back: format detection, checksum, and the name field.
+// No io handle is needed; a full writer->reader
+// roundtrip needs an in-memory sink with a read-back
+// accessor, which io.sla does not expose yet (see the
+// file header). Returns true when every check holds.
+fn go_archive_tar_demo_header_roundtrip() -> bool {
+    let hdr = __go_tar_header_new();
+    hdr.typeflag = GO_TAR_TYPE_REG;
+    let name = Vec::new();
+    name.push(104u8);
+    name.push(101u8);
+    name.push(108u8);
+    name.push(108u8);
+    name.push(111u8);
+    name.push(46u8);
+    name.push(116u8);
+    name.push(120u8);
+    name.push(116u8);
+    hdr.name = name;
+    hdr.size = 5;
+    hdr.mode = 420;
+    hdr.mod_time = go_time_unix(1700000000, 0);
+    let (blk, e) = __go_tar_template_v7plus(hdr, false, 0);
+    if __go_tar_is_nil(e) == false {
+        return false;
+    };
+    __go_tar_set_format(&blk, GO_TAR_FORMAT_USTAR);
+    if __go_tar_get_format(blk) != (GO_TAR_FORMAT_USTAR | GO_TAR_FORMAT_PAX) {
+        return false;
+    };
+    let (chk, _s) = __go_tar_compute_checksum(&blk);
+    let (stored, e2) = __go_tar_parse_octal(__go_tar_slice(blk, 148, 156));
+    if __go_tar_is_nil(e2) == false {
+        return false;
+    };
+    if chk != stored {
+        return false;
+    };
+    let back = __go_tar_parse_string(__go_tar_slice(blk, 0, 100));
+    let want = Vec::new();
+    want.push(104u8);
+    want.push(101u8);
+    want.push(108u8);
+    want.push(108u8);
+    want.push(111u8);
+    want.push(46u8);
+    want.push(116u8);
+    want.push(120u8);
+    want.push(116u8);
+    if go_bytes_equal(back, want) == false {
+        return false;
+    };
+    let (sz, e3) = __go_tar_parse_numeric(__go_tar_slice(blk, 124, 136));
+    if __go_tar_is_nil(e3) == false {
+        return false;
+    };
+    if sz != 5 {
+        return false;
+    };
+    return true;
+}

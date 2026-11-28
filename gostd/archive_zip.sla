@@ -1,0 +1,2393 @@
+// gostd archive/zip: the SLA-side model of Go's archive/zip
+// package (Go 1.27.2), over byte strings (Vec<u8>).
+// Organisation follows the psa_std precedent: public
+// entry points go_archive_zip_*, private helpers
+// __go_zip_*.
+//
+// Oracle: Go 1.27.2 archive/zip (reader.go, writer.go,
+// struct.go, register.go), mirrored from the box Go
+// tree /usr/local/go/src/archive/zip/ into
+// wave2-oracle/archive_zip/ (reader.go sha d35e8e55...,
+// writer.go sha a76c310e..., struct.go sha b2ee362b...,
+// register.go sha 79c2b8c3... -- all four match the
+// box exactly).
+//
+// This file is number 30 in the splice order: the 28
+// landed corpus files, then archive/tar (29), then
+// this file (30). It is written against the fresh
+// 603232ac plugin (with the B1 hashmap import); the
+// installed plugin 0.1.8 fails earlier in the splice
+// (raw 1009 in fmt) and never reaches this file.
+//
+// API map (Go -> gostd):
+//   NewReader(r io.ReaderAt, size) -> NewReader over
+//     the archive bytes directly: gostd has no
+//     ReaderAt handle; go_io_read_full IS the SLA
+//     random-access primitive. Divergence D0: the
+//     caller hands over the whole archive as Vec<u8>.
+//   NewReaderStrict -> go_archive_zip_new_reader_strict
+//     (enforces the insecure-path check that Go gates
+//     behind GODEBUG zipinsecurepath=0, off by default
+//     in Go 1.27; the non-strict form does NOT enforce
+//     it, matching Go's default).
+//   Reader.File, Reader.Comment, File.Open,
+//   File.OpenRaw, File.DataOffset, FileHeader fields,
+//   Writer.Create/CreateHeader/CreateRaw/Write/Close/
+//   CloseFile/Flush/SetOffset/SetComment/Copy.
+//   Store (method 0) is fully implemented for read
+//   and write. Deflate (method 8) returns
+//   ErrAlgorithm (900058) until compress/flate lands
+//   -- see divergence D2 below.
+//   Reader.RegisterDecompressor, Writer.RegisterCompressor
+//   and the package-level Register* functions are
+//   OMITTED: they take function values, and
+//   closure->fn_ptr adaptation is impossible in
+//   current SLA (LANG-PROPOSAL-closure-fnptr.md).
+//   FileInfoHeader, (FileHeader).FileInfo,
+//   (FileHeader).Mode, (FileHeader).SetMode,
+//   OpenReader, Reader.Open and the whole fs.FS
+//   surface (initFileList, openLookup, openReadDir,
+//   openDir, fileListEntry) are OMITTED: they need
+//   io/fs FileInfo/FileMode, which gostd does not
+//   model yet. Writer.AddFS is omitted for the same
+//   reason. Writer.CreateHeader's duplicate-FileHeader
+//   check is SKIPPED: Go compares pointers, which is
+//   unrepresentable in SLA values (value-equality
+//   would over-catch).
+//
+// Divergences:
+//   D0: NewReader takes Vec<u8>, not (ReaderAt, size).
+//   D1: GoTime has no zero sentinel and no location.
+//     A zero MS-DOS date/time (1980-01-01 00:00:00)
+//     decodes to go_time_unix(315532800, 0), not a
+//     zero time; Modified keeps UTC (Go attaches a
+//     fixed-offset zone estimated from the extended
+//     timestamp delta -- the instant is identical,
+//     only the Location differs).
+//   D2: Deflate is a documented seam, NOT implemented:
+//     File.Open on a Deflate entry returns
+//     ErrAlgorithm; Writer.CreateHeader with
+//     Method=8 returns ErrAlgorithm. Store and
+//     CreateRaw/Copy work fully. Until compress/flate
+//     lands, this package is Store-only.
+//   D2b: Writer.Create defaults to Store in gostd
+//     (Go defaults to Deflate, which is unimplemented
+//     until compress/flate lands; a Create that always
+//     errors would make the writer unusable).
+//   D3: Writer.Flush is a no-op returning nil:
+//     GosIoWriter has no buffering, so there is
+//     nothing to flush (Go flushes a bufio.Writer).
+//   D4: Read errors are sticky per Go's checksumReader:
+//     after EOF or a verification error, further
+//     reads return (0, the same error).
+//   D5: SetOffset panics (77453) if any bytes have
+//     been written -- the only live Go panic in the
+//     implemented surface. The panic message is
+//     "zip: SetOffset called after data was written".
+//   D6: Headers are values, not pointers. Go mutates
+//     the caller's FileHeader in CreateHeader even
+//     when it fails (UTF-8 flag, versions, ext-time);
+//     gostd leaves the caller's header unchanged on
+//     error. Likewise the duplicate-FileHeader check
+//     (pointer comparison in Go) is skipped, and a
+//     failed local-header write leaves no dir entry
+//     (Go appends to dir before writing the header).
+//
+// Panic codes (gostd block 77400-77499):
+//   77453  LIVE: Writer.SetOffset after data written
+//          (Go panics the same way).
+//   77454  RESERVED: FileInfoHeader (needs io/fs)
+//   77455  RESERVED: (FileHeader).FileInfo
+//   77456  RESERVED: (FileHeader).Mode
+//   77457  RESERVED: (FileHeader).SetMode
+//   77458  RESERVED: OpenReader (needs os)
+//   77459  RESERVED: Reader.Open / fs.FS surface
+//   77460  RESERVED: Reader.RegisterDecompressor
+//   77461  RESERVED: Writer.RegisterCompressor
+//   77462  RESERVED: package RegisterDecompressor
+//   77463  RESERVED: package RegisterCompressor
+//   77464  RESERVED: Writer.AddFS (needs io/fs)
+//   (77400 is tar's live code; 77415 bufio, 77418
+//   context, 77419 slices-reserved, 77422/77424 log,
+//   77433 cmp-reserved, 77443 maps, 77444/77445/77448
+//   tar-reserved; 77453-77464 verified free
+//   corpus-wide 2026-11-28.)
+//
+// Error target ids (gostd block 900000-900099):
+//   900057  ErrFormat ("zip: not a valid zip file")
+//   900058  ErrAlgorithm ("zip: unsupported
+//           compression algorithm")
+//   900059  ErrChecksum ("zip: checksum error")
+//   900060  ErrInsecurePath ("zip: insecure file path")
+//   900061  errLongName ("zip: FileHeader.Name too long")
+//   900062  errLongExtra ("zip: FileHeader.Extra too long")
+//   900063  invalid comment length
+//           ("zip: invalid comment length")
+//   900064  writer closed twice
+//           ("zip: writer closed twice")
+//   900065  write to closed file
+//           ("zip: write to closed file")
+//   900066  file closed twice
+//           ("zip: file closed twice")
+//   900067  write to directory ("zip: write to directory")
+//   900068  Writer.Comment too long
+//           ("zip: Writer.Comment too long")
+//   900069  invalid duplicate FileHeader
+//           ("archive/zip: invalid duplicate FileHeader")
+//   (900010 io.EOF and 900011 io.ErrUnexpectedEOF are
+//   reused from io.sla; 900047-900056 are tar's;
+//   900057-900069 verified free corpus-wide
+//   2026-11-28.)
+//
+// Seams used (all in the landed corpus):
+//   io.sla: GoIoResult, GoIoBytes, go_io_read_full,
+//     GosSectionReader + go_io_section_reader_read_at
+//     (not needed -- direct Vec access is used),
+//     GosIoWriter + go_io_writer_write, go_io_eof(),
+//     go_io_err_unexpected_eof(), ids 900010/900011.
+//   crc32.sla: go_crc32_checksum_ieee,
+//     go_crc32_ieee_table, go_crc32_update.
+//   time.sla: GoTime, go_time_unix, accessors
+//     go_time_year/month/day/hour/minute/second,
+//     go_time_unix_sec.
+//   errors.sla: go_errors_new_with_id,
+//     go_errors_is, go_errors_nil.
+//   utf8.sla: go_utf8_decode_rune, go_utf8_valid_rune,
+//     go_utf8_rune_error.
+//   bytes.sla: go_bytes_clone (Vec<u8> copies).
+//
+// Corpus example at the end of this file:
+//   go_archive_zip_demo_roundtrip writes a three-file
+//   Store archive into an in-memory multi-writer sink
+//   (io.sla's GosMultiWriter -- writes through the
+//   indexed sink are visible to the caller), reads it
+//   back, verifies names, contents, the directory
+//   flag, the comment, the ModTime, and the CRC, then
+//   exercises Writer.Copy into a second archive.
+//   Returns true when every check holds.
+
+@import "sa_std/vec.sa";
+
+// ---------- constants ----------
+
+const GO_ZIP_SIG_LOCAL: u64 = 67324752;
+const GO_ZIP_SIG_CENTRAL: u64 = 33639248;
+const GO_ZIP_SIG_EOCD: u64 = 101010256;
+const GO_ZIP_SIG_ZIP64_EOCD: u64 = 101075792;
+const GO_ZIP_SIG_ZIP64_LOCATOR: u64 = 117853008;
+const GO_ZIP_SIG_DATA_DESC: u64 = 134695760;
+const GO_ZIP_SIG_DIGITAL: u64 = 84233040;
+
+const GO_ZIP_METHOD_STORE: u64 = 0;
+const GO_ZIP_METHOD_DEFLATE: u64 = 8;
+
+const GO_ZIP_FLAG_ENCRYPTED: u64 = 1;
+const GO_ZIP_FLAG_DESC: u64 = 8;
+const GO_ZIP_FLAG_UTF8: u64 = 2048;
+
+const GO_ZIP_VERSION_20: u64 = 20;
+const GO_ZIP_VERSION_45: u64 = 45;
+const GO_ZIP_VERSION_46: u64 = 46;
+
+const GO_ZIP_CREATOR_UNIX: u64 = 768;
+const GO_ZIP_CREATOR_FAT: u64 = 0;
+
+const GO_ZIP_EXTRA_ZIP64: u64 = 1;
+const GO_ZIP_EXTRA_NTFS: u64 = 10;
+const GO_ZIP_EXTRA_UNIX: u64 = 13;
+const GO_ZIP_EXTRA_EXT_TIME: u64 = 21589;
+const GO_ZIP_EXTRA_INFOZIP_UNIX: u64 = 22613;
+
+const GO_ZIP_U16MAX: u64 = 65535;
+const GO_ZIP_U32MAX: u64 = 4294967295;
+const GO_ZIP_LOCAL_HEADER_LEN: i64 = 30;
+const GO_ZIP_CENTRAL_HEADER_LEN: i64 = 46;
+const GO_ZIP_EOCD_LEN: i64 = 22;
+const GO_ZIP_ZIP64_EOCD_LEN: i64 = 56;
+const GO_ZIP_ZIP64_LOCATOR_LEN: i64 = 20;
+const GO_ZIP_DESC_LEN: i64 = 16;
+
+const GO_ZIP_PANIC_SET_OFFSET: i64 = 77453;
+
+// ---------- structs ----------
+
+// Go's archive/zip.FileHeader, flattened: wire-sized
+// fields are u64 (SLA has no u16/u32); Modified is a
+// GoTime; the raw MS-DOS date/time words are kept
+// for roundtripping. header_offset lives on
+// GosZipFile, not here (as in Go).
+struct GosZipFileHeader {
+    name: Vec<u8>,
+    comment: Vec<u8>,
+    extra: Vec<u8>,
+    creator_version: u64,
+    reader_version: u64,
+    flags: u64,
+    method: u64,
+    modified_time: u64,
+    modified_date: u64,
+    modified: GoTime,
+    modified_set: bool,
+    crc32: u64,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    external_attrs: u64,
+    disk_number: u64,
+    non_utf8: bool,
+}
+
+// Go's archive/zip.File: the header plus the offset
+// of its local header in the archive.
+struct GosZipFile {
+    header: GosZipFileHeader,
+    header_offset: i64,
+}
+
+// One central-directory entry as written by the
+// Writer: the finalised header plus its local-header
+// offset.
+struct GosZipDirEntry {
+    header: GosZipFileHeader,
+    offset: i64,
+}
+
+// Go's archive/zip.Reader: the archive bytes, the
+// parsed files, the archive comment, and the base
+// offset (nonzero for self-extracting archives).
+struct GosZipReader {
+    data: Vec<u8>,
+    files: Vec<GosZipFile>,
+    comment: Vec<u8>,
+    base_offset: i64,
+}
+
+// Result of NewReader / NewReaderStrict.
+struct GoZipReaderResult {
+    reader: GosZipReader,
+    err: ptr,
+}
+
+// Go's checksumReader (File.Open result): reads the
+// stored bytes, verifies size and CRC32 at EOF.
+// is_dir + dir_err model Go's dirReader: a directory
+// entry returns (0, ErrFormat) when it claims
+// uncompressed data, else (0, EOF), on every read.
+struct GosZipFileReader {
+    data: Vec<u8>,
+    start: i64,
+    pos: i64,
+    end: i64,
+    header: GosZipFileHeader,
+    desc_pos: i64,
+    has_desc: bool,
+    nread: i64,
+    is_dir: bool,
+    dir_err: ptr,
+    err: ptr,
+}
+
+struct GoZipFileReaderResult {
+    reader: GosZipFileReader,
+    err: ptr,
+}
+
+// Go's File.OpenRaw result: the raw compressed bytes,
+// no decompression, no CRC check.
+struct GosZipRawReader {
+    data: Vec<u8>,
+    pos: i64,
+    end: i64,
+    err: ptr,
+}
+
+struct GoZipRawReaderResult {
+    reader: GosZipRawReader,
+    err: ptr,
+}
+
+// Result of File.DataOffset.
+struct GoZipHeaderResult {
+    offset: i64,
+    err: ptr,
+}
+
+// Writer state for the currently open file.
+struct GosZipWriterState {
+    header: GosZipFileHeader,
+    offset: i64,
+    raw: bool,
+    is_dir: bool,
+    closed: bool,
+    crc: u64,
+    raw_count: i64,
+    comp_count: i64,
+}
+
+// Go's archive/zip.Writer: sink, central-directory
+// entries, current-file state, comment, byte count,
+// zip64 flag, and the IEEE CRC table (built once).
+struct GosZipWriter {
+    sink: GosIoWriter,
+    dir: Vec<GosZipDirEntry>,
+    last: GosZipWriterState,
+    last_open: bool,
+    closed: bool,
+    comment: Vec<u8>,
+    count: i64,
+    used_zip64: bool,
+    crc_tab: Vec<u64>,
+}
+
+// Parsed end-of-central-directory record.
+struct GosZipDirEnd {
+    records: u64,
+    size: u64,
+    offset: u64,
+    comment: Vec<u8>,
+    end_offset: i64,
+    base_offset: i64,
+    err: ptr,
+}
+
+// Parsed central-directory header.
+struct GoZipDirHeaderResult {
+    file: GosZipFile,
+    next_pos: i64,
+    err: ptr,
+}
+
+// Extra-field parse result: the header with fields
+// possibly overridden, plus the best Modified time
+// and the (possibly overridden) header offset.
+// err is nil on success, ErrFormat on a malformed
+// zip64 extra.
+struct GoZipExtraResult {
+    header: GosZipFileHeader,
+    modified: GoTime,
+    has_modified: bool,
+    header_offset: i64,
+    err: ptr,
+}
+
+// MS-DOS date/time pair.
+struct GoZipMsDos {
+    date: u64,
+    time: u64,
+}
+
+// ---------- error constructors ----------
+// Go's exported ErrFormat / ErrAlgorithm / ErrChecksum
+// plus the package's internal errors. Each message is
+// built byte-by-byte (SLA has no string literals);
+// sentinel comparison is via go_errors_is against
+// the target id, as in errors.sla.
+
+fn __go_zip_is_nil(e: ptr) -> bool {
+    return e == go_errors_nil();
+}
+
+fn __go_zip_is_eof(e: ptr) -> bool {
+    return go_errors_is(e, go_io_eof());
+}
+
+fn __go_zip_is_unexpected_eof(e: ptr) -> bool {
+    return go_errors_is(e, go_io_err_unexpected_eof());
+}
+
+fn go_archive_zip_err_format() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(110u8);
+    msg.push(111u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(97u8);
+    msg.push(32u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(105u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900057 as i64));
+}
+
+fn go_archive_zip_err_algorithm() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(117u8);
+    msg.push(110u8);
+    msg.push(115u8);
+    msg.push(117u8);
+    msg.push(112u8);
+    msg.push(112u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(109u8);
+    msg.push(112u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(115u8);
+    msg.push(115u8);
+    msg.push(105u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(32u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(103u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(104u8);
+    msg.push(109u8);
+    return go_errors_new_with_id(msg, (900058 as i64));
+}
+
+fn go_archive_zip_err_checksum() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(104u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(107u8);
+    msg.push(115u8);
+    msg.push(117u8);
+    msg.push(109u8);
+    msg.push(32u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(114u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    return go_errors_new_with_id(msg, (900059 as i64));
+}
+
+fn go_archive_zip_err_insecure_path() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(117u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(112u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(104u8);
+    return go_errors_new_with_id(msg, (900060 as i64));
+}
+
+fn __go_zip_err_long_name() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(70u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(72u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(46u8);
+    msg.push(78u8);
+    msg.push(97u8);
+    msg.push(109u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, (900061 as i64));
+}
+
+fn __go_zip_err_long_extra() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(70u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(72u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(46u8);
+    msg.push(69u8);
+    msg.push(120u8);
+    msg.push(116u8);
+    msg.push(114u8);
+    msg.push(97u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, (900062 as i64));
+}
+
+fn __go_zip_err_comment_len() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(105u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(111u8);
+    msg.push(109u8);
+    msg.push(109u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    msg.push(116u8);
+    msg.push(104u8);
+    return go_errors_new_with_id(msg, (900063 as i64));
+}
+
+fn __go_zip_err_writer_closed() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(119u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(119u8);
+    msg.push(105u8);
+    msg.push(99u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900064 as i64));
+}
+
+fn __go_zip_err_write_closed_file() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(119u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900065 as i64));
+}
+
+fn __go_zip_err_file_closed_twice() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(102u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(99u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(115u8);
+    msg.push(101u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(119u8);
+    msg.push(105u8);
+    msg.push(99u8);
+    msg.push(101u8);
+    return go_errors_new_with_id(msg, (900066 as i64));
+}
+
+fn __go_zip_err_write_dir() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(119u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(100u8);
+    msg.push(105u8);
+    msg.push(114u8);
+    msg.push(101u8);
+    msg.push(99u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(114u8);
+    msg.push(121u8);
+    return go_errors_new_with_id(msg, (900067 as i64));
+}
+
+fn __go_zip_err_comment_too_long() -> ptr {
+    let msg = Vec::new();
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(87u8);
+    msg.push(114u8);
+    msg.push(105u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    msg.push(46u8);
+    msg.push(67u8);
+    msg.push(111u8);
+    msg.push(109u8);
+    msg.push(109u8);
+    msg.push(101u8);
+    msg.push(110u8);
+    msg.push(116u8);
+    msg.push(32u8);
+    msg.push(116u8);
+    msg.push(111u8);
+    msg.push(111u8);
+    msg.push(32u8);
+    msg.push(108u8);
+    msg.push(111u8);
+    msg.push(110u8);
+    msg.push(103u8);
+    return go_errors_new_with_id(msg, (900068 as i64));
+}
+
+fn __go_zip_err_dup_header() -> ptr {
+    let msg = Vec::new();
+    msg.push(97u8);
+    msg.push(114u8);
+    msg.push(99u8);
+    msg.push(104u8);
+    msg.push(105u8);
+    msg.push(118u8);
+    msg.push(101u8);
+    msg.push(47u8);
+    msg.push(122u8);
+    msg.push(105u8);
+    msg.push(112u8);
+    msg.push(58u8);
+    msg.push(32u8);
+    msg.push(105u8);
+    msg.push(110u8);
+    msg.push(118u8);
+    msg.push(97u8);
+    msg.push(108u8);
+    msg.push(105u8);
+    msg.push(100u8);
+    msg.push(32u8);
+    msg.push(100u8);
+    msg.push(117u8);
+    msg.push(112u8);
+    msg.push(108u8);
+    msg.push(105u8);
+    msg.push(99u8);
+    msg.push(97u8);
+    msg.push(116u8);
+    msg.push(101u8);
+    msg.push(32u8);
+    msg.push(70u8);
+    msg.push(105u8);
+    msg.push(108u8);
+    msg.push(101u8);
+    msg.push(72u8);
+    msg.push(101u8);
+    msg.push(97u8);
+    msg.push(100u8);
+    msg.push(101u8);
+    msg.push(114u8);
+    return go_errors_new_with_id(msg, (900069 as i64));
+}
+
+// ---------- byte helpers ----------
+
+fn __go_zip_slice(v: Vec<u8>, start: i64, end: i64) -> Vec<u8> {
+    let out = Vec::new();
+    let i = start;
+    while i < end {
+        out.push(v[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn __go_zip_append(dst: Vec<u8>, src: Vec<u8>) -> void {
+    let i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1;
+    }
+    return;
+}
+
+// Little-endian readers over a Vec<u8> at an offset.
+fn __go_zip_le16(b: Vec<u8>, off: i64) -> u64 {
+    return (b[off] as u64) | ((b[off + 1] as u64) << 8);
+}
+
+fn __go_zip_le32(b: Vec<u8>, off: i64) -> u64 {
+    return (b[off] as u64)
+        | ((b[off + 1] as u64) << 8)
+        | ((b[off + 2] as u64) << 16)
+        | ((b[off + 3] as u64) << 24);
+}
+
+fn __go_zip_le64(b: Vec<u8>, off: i64) -> u64 {
+    return (b[off] as u64)
+        | ((b[off + 1] as u64) << 8)
+        | ((b[off + 2] as u64) << 16)
+        | ((b[off + 3] as u64) << 24)
+        | ((b[off + 4] as u64) << 32)
+        | ((b[off + 5] as u64) << 40)
+        | ((b[off + 6] as u64) << 48)
+        | ((b[off + 7] as u64) << 56);
+}
+
+// Little-endian writers: append to dst.
+fn __go_zip_put_u16(dst: Vec<u8>, v: u64) -> void {
+    dst.push((v & (255 as u64)) as u8);
+    dst.push(((v >> 8) & (255 as u64)) as u8);
+    return;
+}
+
+fn __go_zip_put_u32(dst: Vec<u8>, v: u64) -> void {
+    dst.push((v & (255 as u64)) as u8);
+    dst.push(((v >> 8) & (255 as u64)) as u8);
+    dst.push(((v >> 16) & (255 as u64)) as u8);
+    dst.push(((v >> 24) & (255 as u64)) as u8);
+    return;
+}
+
+fn __go_zip_put_u64(dst: Vec<u8>, v: u64) -> void {
+    dst.push((v & (255 as u64)) as u8);
+    dst.push(((v >> 8) & (255 as u64)) as u8);
+    dst.push(((v >> 16) & (255 as u64)) as u8);
+    dst.push(((v >> 24) & (255 as u64)) as u8);
+    dst.push(((v >> 32) & (255 as u64)) as u8);
+    dst.push(((v >> 40) & (255 as u64)) as u8);
+    dst.push(((v >> 48) & (255 as u64)) as u8);
+    dst.push(((v >> 56) & (255 as u64)) as u8);
+    return;
+}
+
+struct GoZipUtf8 {
+    valid: bool,
+    require: bool,
+}
+
+// Go's detectUTF8: (valid, require). valid=false when
+// the bytes are not valid UTF-8; require=true when a
+// non-ASCII printable rune forces the UTF-8 flag.
+fn __go_zip_detect_utf8(s: Vec<u8>) -> GoZipUtf8 {
+    let require = false;
+    let i = 0;
+    while i < len(s) {
+        let rest = __go_zip_slice(s, i, len(s));
+        let d = go_utf8_decode_rune(rest);
+        i = i + d.size;
+        if d.r < 32 || d.r > 125 || d.r == 92 {
+            if !go_utf8_valid_rune(d.r) || (d.r == go_utf8_rune_error() && d.size == 1) {
+                return GoZipUtf8 { valid: false, require: false };
+            };
+            require = true;
+        };
+    }
+    return GoZipUtf8 { valid: true, require: require };
+}
+
+// ---------- MS-DOS time ----------
+// Days from civil (Howard Hinnant's algorithm), days
+// since 1970-01-01. MS-DOS years are 1980-2107, so
+// the era division never sees a negative year.
+fn __go_zip_days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let yy = y;
+    if m <= 2 {
+        yy = yy - 1;
+    };
+    let era = yy / 400;
+    let yoe = yy - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// Go's msDosTimeToTime: MS-DOS date/time words to a
+// GoTime (UTC; see divergence D1).
+fn __go_zip_msdos_to_time(date: u64, timew: u64) -> GoTime {
+    let seconds = ((timew & (31 as u64)) * 2)
+        + (((timew >> 5) & (63 as u64)) * 60)
+        + (((timew >> 11) & (31 as u64)) * 3600);
+    let year = 1980 + ((date >> 9) & (127 as u64)) as i64;
+    let month = ((date >> 5) & (15 as u64)) as i64;
+    let day = (date & (31 as u64)) as i64;
+    let days = __go_zip_days_from_civil(year, month, day);
+    return go_time_unix(days * 86400 + (seconds as i64), (0 as i64));
+}
+
+// Go's timeToMsDosTime: GoTime to MS-DOS date/time
+// words. Seconds are halved (2-second resolution);
+// the year is clamped to the 1980-2107 range by
+// masking to 7 bits, as in Go (time.Date normalises
+// out-of-range fields there; here the accessors give
+// in-range values for real times).
+fn __go_zip_time_to_msdos(t: GoTime) -> GoZipMsDos {
+    let year = go_time_year(&t);
+    let month = go_time_month(&t);
+    let day = go_time_day(&t);
+    let hour = go_time_hour(&t);
+    let minute = go_time_minute(&t);
+    let second = go_time_second(&t);
+    let y = year - 1980;
+    if y < 0 { y = 0; };
+    if y > 127 { y = 127; };
+    let date = ((y as u64) << 9) | ((month as u64) << 5) | (day as u64);
+    let timew = ((hour as u64) << 11) | ((minute as u64) << 5) | ((second as u64) / 2);
+    return GoZipMsDos { date: date, time: timew };
+}
+
+// Go's FileHeader.ModTime(): the MS-DOS words decoded.
+fn go_archive_zip_file_header_mod_time(h: GosZipFileHeader) -> GoTime {
+    return __go_zip_msdos_to_time(h.modified_date, h.modified_time);
+}
+
+// Go's FileHeader.SetModTime(t): Modified = t, and the
+// MS-DOS words are recomputed. Returns the updated
+// header (value semantics; Go mutates in place).
+fn go_archive_zip_file_header_set_mod_time(h: GosZipFileHeader, t: GoTime) -> GosZipFileHeader {
+    let msdos = __go_zip_time_to_msdos(t);
+    h.modified = t;
+    h.modified_set = true;
+    h.modified_date = msdos.date;
+    h.modified_time = msdos.time;
+    return h;
+}
+
+// Zero FileHeader (Go's zero value, with the MS-DOS
+// epoch as Modified).
+fn go_archive_zip_file_header_new() -> GosZipFileHeader {
+    return GosZipFileHeader {
+        name: Vec::new(),
+        comment: Vec::new(),
+        extra: Vec::new(),
+        creator_version: (0 as u64),
+        reader_version: (0 as u64),
+        flags: (0 as u64),
+        method: (0 as u64),
+        modified_time: (0 as u64),
+        modified_date: (0 as u64),
+        modified: __go_zip_msdos_to_time((0 as u64), (0 as u64)),
+        modified_set: false,
+        crc32: (0 as u64),
+        compressed_size: (0 as u64),
+        uncompressed_size: (0 as u64),
+        external_attrs: (0 as u64),
+        disk_number: (0 as u64),
+        non_utf8: false,
+    };
+}
+
+// Go's FileHeader.IsDir: name ends in "/".
+fn go_archive_zip_file_header_is_dir(h: GosZipFileHeader) -> bool {
+    if len(h.name) == 0 { return false; };
+    return h.name[len(h.name) - 1] == 47u8;
+}
+
+fn go_archive_zip_file_is_dir(f: GosZipFile) -> bool {
+    return go_archive_zip_file_header_is_dir(f.header);
+}
+
+fn go_archive_zip_file_name(f: GosZipFile) -> Vec<u8> {
+    return go_bytes_clone(f.header.name);
+}
+
+fn go_archive_zip_file_header(f: GosZipFile) -> GosZipFileHeader {
+    return f.header;
+}
+
+// ---------- extra-field parsing ----------
+// Go's FileHeader.parseExtras, over the header's
+// Extra bytes. Returns the header with zip64 sizes
+// and the header offset possibly overridden, the
+// best extended Modified time (NTFS / Unix /
+// ext-time, later fields win), and ErrFormat for a
+// truncated zip64 extra. The MS-DOS time itself is
+// applied by the caller (readDirectoryHeader).
+fn __go_zip_parse_extras(h: GosZipFileHeader, file_offset: i64) -> GoZipExtraResult {
+    let extra = h.extra;
+    let modified = go_time_unix((0 as i64), (0 as i64));
+    let has_modified = false;
+    let offset = file_offset;
+    let err = go_errors_nil();
+    let cursor = 0;
+    while len(extra) - cursor >= 4 {
+        let tag = __go_zip_le16(extra, cursor);
+        let size = __go_zip_le16(extra, cursor + 2) as i64;
+        if len(extra) - (cursor + 4) < size {
+            break;
+        };
+        let field_start = cursor + 4;
+        let field_end = field_start + size;
+        if tag == GO_ZIP_EXTRA_ZIP64 {
+            let fc = field_start;
+            if h.uncompressed_size == GO_ZIP_U32MAX {
+                if field_end - fc < 8 {
+                    err = go_archive_zip_err_format();
+                    break;
+                };
+                h.uncompressed_size = __go_zip_le64(extra, fc);
+                fc = fc + 8;
+            };
+            if h.compressed_size == GO_ZIP_U32MAX {
+                if field_end - fc < 8 {
+                    err = go_archive_zip_err_format();
+                    break;
+                };
+                h.compressed_size = __go_zip_le64(extra, fc);
+                fc = fc + 8;
+            };
+            if offset == (GO_ZIP_U32MAX as i64) {
+                if field_end - fc < 8 {
+                    err = go_archive_zip_err_format();
+                    break;
+                };
+                offset = __go_zip_le64(extra, fc) as i64;
+                fc = fc + 8;
+            };
+        } else if tag == GO_ZIP_EXTRA_NTFS {
+            if field_end - field_start >= 4 {
+                let ac = field_start + 4;
+                let skip_outer = false;
+                while field_end - ac >= 4 && !skip_outer {
+                    let attr_tag = __go_zip_le16(extra, ac);
+                    let attr_size = __go_zip_le16(extra, ac + 2) as i64;
+                    if field_end - (ac + 4) < attr_size {
+                        skip_outer = true;
+                        break;
+                    };
+                    let attr_start = ac + 4;
+                    ac = ac + 4 + attr_size;
+                    if attr_tag != 1 || attr_size != 24 {
+                        continue;
+                    };
+                    let ts = __go_zip_le64(extra, attr_start) as i64;
+                    let secs = ts / 10000000;
+                    let nsecs = 100 * (ts % 10000000);
+                    let ntfs_secs = (0 as i64) - 11644473600 + secs;
+                    modified = go_time_unix(ntfs_secs, nsecs);
+                    has_modified = true;
+                }
+            };
+        } else if tag == GO_ZIP_EXTRA_UNIX || tag == GO_ZIP_EXTRA_INFOZIP_UNIX {
+            if field_end - field_start >= 8 {
+                let ts = __go_zip_le32(extra, field_start + 4) as i64;
+                modified = go_time_unix(ts, (0 as i64));
+                has_modified = true;
+            };
+        } else if tag == GO_ZIP_EXTRA_EXT_TIME {
+            if field_end - field_start >= 5 {
+                let flags = extra[field_start];
+                if (flags & 1u8) == 1u8 {
+                    let ts = __go_zip_le32(extra, field_start + 1) as i64;
+                    modified = go_time_unix(ts, (0 as i64));
+                    has_modified = true;
+                };
+            };
+        };
+        cursor = field_end;
+    }
+    return GoZipExtraResult {
+        header: h,
+        modified: modified,
+        has_modified: has_modified,
+        header_offset: offset,
+        err: err,
+    };
+}
+
+// ---------- path safety ----------
+// Go's filepath.IsLocal, as used by the strict reader:
+// clean the name (path.Clean semantics via
+// go_path_clean) and require it to be non-empty,
+// not absolute, and not ".." or "../"-prefixed.
+// Mirrors tar's __go_tar_is_local.
+fn __go_zip_is_local(name: Vec<u8>) -> bool {
+    let clean = go_path_clean(name);
+    if len(clean) == 0 { return false; };
+    if clean[0] == 47u8 { return false; };
+    if len(clean) == 2 && clean[0] == 46u8 && clean[1] == 46u8 { return false; };
+    if len(clean) > 3 && clean[0] == 46u8 && clean[1] == 46u8 && clean[2] == 47u8 { return false; };
+    return true;
+}
+
+fn __go_zip_contains_backslash(name: Vec<u8>) -> bool {
+    let i = 0;
+    while i < len(name) {
+        if name[i] == 92u8 { return true; };
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------- directory-end parsing ----------
+// Go's findSignatureInBlock: scan backwards for the
+// EOCD signature; a candidate whose comment would
+// run past the block end fails the whole search.
+fn __go_zip_find_signature(b: Vec<u8>) -> i64 {
+    let i = len(b) - GO_ZIP_EOCD_LEN;
+    while i >= 0 {
+        if b[i] == 80u8 && b[i + 1] == 75u8 && b[i + 2] == 5u8 && b[i + 3] == 6u8 {
+            let n = __go_zip_le16(b, i + 20) as i64;
+            if n + GO_ZIP_EOCD_LEN + i > len(b) {
+                return -1;
+            };
+            return i;
+        };
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Go's findDirectory64End: the zip64 locator sits
+// 20 bytes before the EOCD. Returns the zip64 EOCD
+// offset, or -1 when there is none; err propagates
+// a short read.
+fn __go_zip_find_directory64_end(data: Vec<u8>, eocd_offset: i64) -> GoZipHeaderResult {
+    let loc_offset = eocd_offset - GO_ZIP_ZIP64_LOCATOR_LEN;
+    if loc_offset < 0 {
+        return GoZipHeaderResult { offset: -1, err: go_errors_nil() };
+    };
+    let res = go_io_read_full(data, loc_offset, GO_ZIP_ZIP64_LOCATOR_LEN);
+    if !__go_zip_is_nil(res.err) {
+        return GoZipHeaderResult { offset: -1, err: res.err };
+    };
+    let b = res.v;
+    if __go_zip_le32(b, 0) != GO_ZIP_SIG_ZIP64_LOCATOR {
+        return GoZipHeaderResult { offset: -1, err: go_errors_nil() };
+    };
+    if __go_zip_le32(b, 4) != 0 {
+        return GoZipHeaderResult { offset: -1, err: go_errors_nil() };
+    };
+    let p = __go_zip_le64(b, 8) as i64;
+    if __go_zip_le32(b, 16) != 1 {
+        return GoZipHeaderResult { offset: -1, err: go_errors_nil() };
+    };
+    return GoZipHeaderResult { offset: p, err: go_errors_nil() };
+}
+
+// Go's readDirectory64End: fill the directory-end
+// fields from the 56-byte zip64 EOCD record.
+fn __go_zip_read_directory64_end(data: Vec<u8>, offset: i64, d: &GosZipDirEnd) -> ptr {
+    let res = go_io_read_full(data, offset, GO_ZIP_ZIP64_EOCD_LEN);
+    if !__go_zip_is_nil(res.err) {
+        return res.err;
+    };
+    let b = res.v;
+    if __go_zip_le32(b, 0) != GO_ZIP_SIG_ZIP64_EOCD {
+        return go_archive_zip_err_format();
+    };
+    d.records = __go_zip_le64(b, 32);
+    d.size = __go_zip_le64(b, 40);
+    d.offset = __go_zip_le64(b, 48);
+    return go_errors_nil();
+}
+
+// Go's readDirectoryEnd: locate and parse the EOCD
+// (and the zip64 EOCD when the 16/32-bit fields are
+// maxed), compute the base offset, and apply the
+// baseOffset==0 fallback probe.
+fn __go_zip_read_directory_end(data: Vec<u8>, size: i64) -> GosZipDirEnd {
+    let d = GosZipDirEnd {
+        records: (0 as u64),
+        size: (0 as u64),
+        offset: (0 as u64),
+        comment: Vec::new(),
+        end_offset: 0,
+        base_offset: 0,
+        err: go_errors_nil(),
+    };
+    let tail = Vec::new();
+    let tail_off = 0;
+    let found = false;
+    let try1 = 1024;
+    if try1 > size { try1 = size; };
+    let r1 = go_io_read_full(data, size - try1, try1);
+    if __go_zip_is_nil(r1.err) || __go_zip_is_unexpected_eof(r1.err) {
+        tail = r1.v;
+        tail_off = size - try1;
+        let p = __go_zip_find_signature(tail);
+        if p >= 0 {
+            found = true;
+            d.end_offset = tail_off + p;
+            tail = __go_zip_slice(tail, p, len(tail));
+        };
+    };
+    if !found {
+        let try2 = 66560;
+        if try2 > size { try2 = size; };
+        let r2 = go_io_read_full(data, size - try2, try2);
+        if __go_zip_is_nil(r2.err) || __go_zip_is_unexpected_eof(r2.err) {
+            tail = r2.v;
+            tail_off = size - try2;
+            let p = __go_zip_find_signature(tail);
+            if p >= 0 {
+                found = true;
+                d.end_offset = tail_off + p;
+                tail = __go_zip_slice(tail, p, len(tail));
+            };
+        };
+    };
+    if !found {
+        d.err = go_archive_zip_err_format();
+        return d;
+    };
+    if len(tail) < GO_ZIP_EOCD_LEN {
+        d.err = go_archive_zip_err_format();
+        return d;
+    };
+    d.records = __go_zip_le16(tail, 10);
+    d.size = __go_zip_le32(tail, 12);
+    d.offset = __go_zip_le32(tail, 16);
+    let comment_len = __go_zip_le16(tail, 20) as i64;
+    if comment_len > len(tail) - GO_ZIP_EOCD_LEN {
+        d.err = __go_zip_err_comment_len();
+        return d;
+    };
+    d.comment = __go_zip_slice(tail, GO_ZIP_EOCD_LEN, GO_ZIP_EOCD_LEN + comment_len);
+    if d.records == GO_ZIP_U16MAX || d.size == GO_ZIP_U32MAX || d.offset == GO_ZIP_U32MAX {
+        let loc = __go_zip_find_directory64_end(data, d.end_offset);
+        if !__go_zip_is_nil(loc.err) {
+            d.err = loc.err;
+            return d;
+        };
+        if loc.offset >= 0 {
+            let e64 = __go_zip_read_directory64_end(data, loc.offset, &d);
+            if !__go_zip_is_nil(e64) {
+                d.err = e64;
+                return d;
+            };
+        };
+    };
+    if d.size > (9223372036854775807 as u64) || d.offset > (9223372036854775807 as u64) {
+        d.err = go_archive_zip_err_format();
+        return d;
+    };
+    d.base_offset = d.end_offset - (d.size as i64) - (d.offset as i64);
+    let o = d.base_offset + (d.offset as i64);
+    if o < 0 || o >= size {
+        d.err = go_archive_zip_err_format();
+        return d;
+    };
+    if d.base_offset > 0 {
+        let probe = __go_zip_read_dir_header(data, d.offset as i64);
+        if __go_zip_is_nil(probe.err) {
+            d.base_offset = 0;
+        };
+    };
+    return d;
+}
+
+// ---------- central-directory header ----------
+// Go's readDirectoryHeader, over the archive bytes
+// at pos. Returns the parsed file and the position
+// just past its name/extra/comment.
+fn __go_zip_zero_file() -> GosZipFile {
+    return GosZipFile { header: go_archive_zip_file_header_new(), header_offset: 0 };
+}
+
+fn __go_zip_read_dir_header(data: Vec<u8>, pos: i64) -> GoZipDirHeaderResult {
+    let res46 = go_io_read_full(data, pos, GO_ZIP_CENTRAL_HEADER_LEN);
+    if !__go_zip_is_nil(res46.err) {
+        return GoZipDirHeaderResult { file: __go_zip_zero_file(), next_pos: pos, err: res46.err };
+    };
+    let b = res46.v;
+    if __go_zip_le32(b, 0) != GO_ZIP_SIG_CENTRAL {
+        return GoZipDirHeaderResult { file: __go_zip_zero_file(), next_pos: pos, err: go_archive_zip_err_format() };
+    };
+    let creator = __go_zip_le16(b, 4);
+    let reader_v = __go_zip_le16(b, 6);
+    let flags = __go_zip_le16(b, 8);
+    let method = __go_zip_le16(b, 10);
+    let mod_time = __go_zip_le16(b, 12);
+    let mod_date = __go_zip_le16(b, 14);
+    let crc = __go_zip_le32(b, 16);
+    let comp_size = __go_zip_le32(b, 20);
+    let uncomp_size = __go_zip_le32(b, 24);
+    let name_len = __go_zip_le16(b, 28) as i64;
+    let extra_len = __go_zip_le16(b, 30) as i64;
+    let comment_len = __go_zip_le16(b, 32) as i64;
+    let ext_attrs = __go_zip_le32(b, 38);
+    let header_offset = __go_zip_le32(b, 42) as i64;
+    let total = name_len + extra_len + comment_len;
+    let resd = go_io_read_full(data, pos + GO_ZIP_CENTRAL_HEADER_LEN, total);
+    if !__go_zip_is_nil(resd.err) {
+        return GoZipDirHeaderResult { file: __go_zip_zero_file(), next_pos: pos, err: resd.err };
+    };
+    let dd = resd.v;
+    let name = __go_zip_slice(dd, 0, name_len);
+    let extra = __go_zip_slice(dd, name_len, name_len + extra_len);
+    let comment = __go_zip_slice(dd, name_len + extra_len, total);
+    let h = go_archive_zip_file_header_new();
+    h.name = name;
+    h.comment = comment;
+    h.extra = extra;
+    h.creator_version = creator;
+    h.reader_version = reader_v;
+    h.flags = flags;
+    h.method = method;
+    h.modified_time = mod_time;
+    h.modified_date = mod_date;
+    h.crc32 = crc;
+    h.compressed_size = comp_size;
+    h.uncompressed_size = uncomp_size;
+    h.external_attrs = ext_attrs;
+    h.disk_number = (0 as u64);
+    let det1 = __go_zip_detect_utf8(h.name);
+    let det2 = __go_zip_detect_utf8(h.comment);
+    if !det1.valid || !det2.valid {
+        h.non_utf8 = true;
+    } else if !det1.require && !det2.require {
+        h.non_utf8 = false;
+    } else {
+        h.non_utf8 = (h.flags & GO_ZIP_FLAG_UTF8) == (0 as u64);
+    };
+    let ex = __go_zip_parse_extras(h, header_offset);
+    if !__go_zip_is_nil(ex.err) {
+        return GoZipDirHeaderResult { file: __go_zip_zero_file(), next_pos: pos, err: ex.err };
+    };
+    let hh = ex.header;
+    let modified = __go_zip_msdos_to_time(hh.modified_date, hh.modified_time);
+    if ex.has_modified {
+        modified = ex.modified;
+    };
+    hh.modified = modified;
+    hh.modified_set = true;
+    let f = GosZipFile { header: hh, header_offset: ex.header_offset };
+    return GoZipDirHeaderResult {
+        file: f,
+        next_pos: pos + GO_ZIP_CENTRAL_HEADER_LEN + total,
+        err: go_errors_nil(),
+    };
+}
+
+// ---------- Reader construction ----------
+// Go's (*Reader).init, over the archive bytes.
+// strict selects the insecure-path check (the
+// NewReaderStrict form; Go gates it behind
+// GODEBUG zipinsecurepath=0).
+fn __go_zip_empty_reader() -> GosZipReader {
+    return GosZipReader {
+        data: Vec::new(),
+        files: Vec::new(),
+        comment: Vec::new(),
+        base_offset: 0,
+    };
+}
+
+fn __go_zip_new_reader_inner(data: Vec<u8>, strict: bool) -> GoZipReaderResult {
+    let size = len(data);
+    let end = __go_zip_read_directory_end(data, size);
+    if !__go_zip_is_nil(end.err) {
+        return GoZipReaderResult { reader: __go_zip_empty_reader(), err: end.err };
+    };
+    let files = Vec::new();
+    let pos = end.base_offset + (end.offset as i64);
+    let last_err = go_errors_nil();
+    let done = false;
+    while !done {
+        let hdr = __go_zip_read_dir_header(data, pos);
+        if __go_zip_is_nil(hdr.err) {
+            let f = hdr.file;
+            f.header_offset = f.header_offset + end.base_offset;
+            files.push(f);
+            pos = hdr.next_pos;
+            continue;
+        };
+        if go_errors_is(hdr.err, go_archive_zip_err_format()) || __go_zip_is_unexpected_eof(hdr.err) {
+            last_err = hdr.err;
+            done = true;
+            break;
+        };
+        return GoZipReaderResult { reader: __go_zip_empty_reader(), err: hdr.err };
+    }
+    if ((len(files) as u64) & GO_ZIP_U16MAX) != (end.records & GO_ZIP_U16MAX) {
+        return GoZipReaderResult { reader: __go_zip_empty_reader(), err: last_err };
+    };
+    let r = GosZipReader {
+        data: data,
+        files: files,
+        comment: end.comment,
+        base_offset: end.base_offset,
+    };
+    if strict {
+        let i = 0;
+        while i < len(r.files) {
+            let name = r.files[i].header.name;
+            if len(name) != 0 {
+                if !__go_zip_is_local(name) || __go_zip_contains_backslash(name) {
+                    return GoZipReaderResult { reader: __go_zip_empty_reader(), err: go_archive_zip_err_insecure_path() };
+                };
+            };
+            i = i + 1;
+        }
+    };
+    return GoZipReaderResult { reader: r, err: go_errors_nil() };
+}
+
+// Go's archive/zip.NewReader(r, size): the archive
+// bytes are handed over directly (divergence D0).
+fn go_archive_zip_new_reader(data: Vec<u8>) -> GoZipReaderResult {
+    return __go_zip_new_reader_inner(data, false);
+}
+
+// Go's archive/zip.NewReaderStrict: enforces the
+// insecure-path check (Go's default leaves it off).
+fn go_archive_zip_new_reader_strict(data: Vec<u8>) -> GoZipReaderResult {
+    return __go_zip_new_reader_inner(data, true);
+}
+
+fn go_archive_zip_reader_comment(r: GosZipReader) -> Vec<u8> {
+    return go_bytes_clone(r.comment);
+}
+
+fn go_archive_zip_reader_file_count(r: GosZipReader) -> i64 {
+    return len(r.files);
+}
+
+fn go_archive_zip_reader_get(r: GosZipReader, i: i64) -> GosZipFile {
+    return r.files[i];
+}
+
+fn go_archive_zip_reader_base_offset(r: GosZipReader) -> i64 {
+    return r.base_offset;
+}
+
+// ---------- File opening ----------
+// Go's (*File).findBodyOffset: the offset of the
+// file data within the archive, past the local
+// header (30 bytes + name + extra).
+fn __go_zip_find_body_offset(data: Vec<u8>, f: GosZipFile) -> GoZipHeaderResult {
+    let res = go_io_read_full(data, f.header_offset, GO_ZIP_LOCAL_HEADER_LEN);
+    if !__go_zip_is_nil(res.err) {
+        return GoZipHeaderResult { offset: 0, err: res.err };
+    };
+    let b = res.v;
+    if __go_zip_le32(b, 0) != GO_ZIP_SIG_LOCAL {
+        return GoZipHeaderResult { offset: 0, err: go_archive_zip_err_format() };
+    };
+    let name_len = __go_zip_le16(b, 26) as i64;
+    let extra_len = __go_zip_le16(b, 28) as i64;
+    return GoZipHeaderResult {
+        offset: GO_ZIP_LOCAL_HEADER_LEN + name_len + extra_len,
+        err: go_errors_nil(),
+    };
+}
+
+fn __go_zip_empty_file_reader() -> GosZipFileReader {
+    return GosZipFileReader {
+        data: Vec::new(),
+        start: 0,
+        pos: 0,
+        end: 0,
+        header: go_archive_zip_file_header_new(),
+        desc_pos: 0,
+        has_desc: false,
+        nread: 0,
+        is_dir: false,
+        dir_err: go_errors_nil(),
+        err: go_errors_nil(),
+    };
+}
+
+fn __go_zip_empty_raw_reader() -> GosZipRawReader {
+    return GosZipRawReader {
+        data: Vec::new(),
+        pos: 0,
+        end: 0,
+        err: go_errors_nil(),
+    };
+}
+
+// Go's (*File).DataOffset: the offset of the file's
+// data in the archive.
+fn go_archive_zip_file_data_offset(r: GosZipReader, f: GosZipFile) -> GoZipHeaderResult {
+    let body = __go_zip_find_body_offset(r.data, f);
+    if !__go_zip_is_nil(body.err) {
+        return GoZipHeaderResult { offset: 0, err: body.err };
+    };
+    return GoZipHeaderResult { offset: f.header_offset + body.offset, err: go_errors_nil() };
+}
+
+// Go's (*File).Open: a reader over the file's
+// (Store) data with size and CRC32 verification at
+// EOF. Deflate returns ErrAlgorithm (divergence D2);
+// directory entries return a dirReader (EOF, or
+// ErrFormat when the entry claims uncompressed data).
+fn go_archive_zip_file_open(r: GosZipReader, f: GosZipFile) -> GoZipFileReaderResult {
+    let body = __go_zip_find_body_offset(r.data, f);
+    if !__go_zip_is_nil(body.err) {
+        return GoZipFileReaderResult { reader: __go_zip_empty_file_reader(), err: body.err };
+    };
+    if go_archive_zip_file_is_dir(f) {
+        let dir_err = go_io_eof();
+        if f.header.uncompressed_size != 0 {
+            dir_err = go_archive_zip_err_format();
+        };
+        let fr = __go_zip_empty_file_reader();
+        fr.data = r.data;
+        fr.is_dir = true;
+        fr.dir_err = dir_err;
+        fr.header = f.header;
+        return GoZipFileReaderResult { reader: fr, err: go_errors_nil() };
+    };
+    if f.header.method != GO_ZIP_METHOD_STORE {
+        return GoZipFileReaderResult { reader: __go_zip_empty_file_reader(), err: go_archive_zip_err_algorithm() };
+    };
+    let start = f.header_offset + body.offset;
+    let end = start + (f.header.compressed_size as i64);
+    let has_desc = (f.header.flags & GO_ZIP_FLAG_DESC) != (0 as u64);
+    let fr = GosZipFileReader {
+        data: r.data,
+        start: start,
+        pos: start,
+        end: end,
+        header: f.header,
+        desc_pos: end,
+        has_desc: has_desc,
+        nread: 0,
+        is_dir: false,
+        dir_err: go_errors_nil(),
+        err: go_errors_nil(),
+    };
+    return GoZipFileReaderResult { reader: fr, err: go_errors_nil() };
+}
+
+// Go's (*File).OpenRaw: the raw compressed bytes,
+// no decompression, no CRC check.
+fn go_archive_zip_file_open_raw(r: GosZipReader, f: GosZipFile) -> GoZipRawReaderResult {
+    let body = __go_zip_find_body_offset(r.data, f);
+    if !__go_zip_is_nil(body.err) {
+        return GoZipRawReaderResult { reader: __go_zip_empty_raw_reader(), err: body.err };
+    };
+    let start = f.header_offset + body.offset;
+    let end = start + (f.header.compressed_size as i64);
+    let rr = GosZipRawReader {
+        data: r.data,
+        pos: start,
+        end: end,
+        err: go_errors_nil(),
+    };
+    return GoZipRawReaderResult { reader: rr, err: go_errors_nil() };
+}
+
+// Go's checksumReader.Read, over the stored span.
+// Returns (n, nil) for data reads; at EOF it
+// verifies the size and the CRC32 (and the data
+// descriptor when present) and returns (0, EOF) or
+// (0, the verification error). Errors are sticky.
+fn go_archive_zip_file_reader_read(fr: &GosZipFileReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if !__go_zip_is_nil(fr.err) {
+        return GoIoResult { n: 0, err: fr.err };
+    };
+    if fr.is_dir {
+        fr.err = fr.dir_err;
+        return GoIoResult { n: 0, err: fr.err };
+    };
+    let avail_end = fr.end;
+    if avail_end > len(fr.data) { avail_end = len(fr.data); };
+    if fr.pos >= avail_end {
+        if fr.nread != (fr.header.uncompressed_size as i64) {
+            fr.err = go_io_err_unexpected_eof();
+        } else if fr.has_desc {
+            let res8 = go_io_read_full(fr.data, fr.desc_pos, 8);
+            if !__go_zip_is_nil(res8.err) {
+                fr.err = res8.err;
+            } else {
+                let db = res8.v;
+                let crc = __go_zip_le32(db, 0);
+                if crc == GO_ZIP_SIG_DATA_DESC {
+                    crc = __go_zip_le32(db, 4);
+                };
+                if crc != fr.header.crc32 {
+                    fr.err = go_archive_zip_err_checksum();
+                } else {
+                    fr.err = go_io_eof();
+                };
+            };
+        } else if fr.header.crc32 != 0 {
+            let span = __go_zip_slice(fr.data, fr.start, fr.end);
+            let crc = go_crc32_checksum_ieee(span);
+            if crc != fr.header.crc32 {
+                fr.err = go_archive_zip_err_checksum();
+            } else {
+                fr.err = go_io_eof();
+            };
+        } else {
+            fr.err = go_io_eof();
+        };
+        return GoIoResult { n: 0, err: fr.err };
+    };
+    let n = max;
+    if n > avail_end - fr.pos { n = avail_end - fr.pos; };
+    let i = 0;
+    while i < n {
+        dst.push(fr.data[fr.pos + i]);
+        i = i + 1;
+    }
+    fr.pos = fr.pos + n;
+    fr.nread = fr.nread + n;
+    if fr.nread > (fr.header.uncompressed_size as i64) {
+        fr.err = go_archive_zip_err_format();
+        return GoIoResult { n: n, err: fr.err };
+    };
+    return GoIoResult { n: n, err: go_errors_nil() };
+}
+
+// Go's checksumReader.Close: closes the underlying
+// reader, which is a no-op here; returns nil.
+fn go_archive_zip_file_reader_close(fr: &GosZipFileReader) -> ptr {
+    return go_errors_nil();
+}
+
+// Raw reader: the stored bytes as-is, EOF at the
+// end of the span. Errors are sticky.
+fn go_archive_zip_raw_reader_read(rr: &GosZipRawReader, dst: &Vec<u8>, max: i64) -> GoIoResult {
+    if !__go_zip_is_nil(rr.err) {
+        return GoIoResult { n: 0, err: rr.err };
+    };
+    let avail_end = rr.end;
+    if avail_end > len(rr.data) { avail_end = len(rr.data); };
+    if rr.pos >= avail_end {
+        rr.err = go_io_eof();
+        return GoIoResult { n: 0, err: go_io_eof() };
+    };
+    let n = max;
+    if n > avail_end - rr.pos { n = avail_end - rr.pos; };
+    let i = 0;
+    while i < n {
+        dst.push(rr.data[rr.pos + i]);
+        i = i + 1;
+    }
+    rr.pos = rr.pos + n;
+    return GoIoResult { n: n, err: go_errors_nil() };
+}
+
+fn go_archive_zip_raw_reader_close(rr: &GosZipRawReader) -> ptr {
+    return go_errors_nil();
+}
+
+// ---------- Writer ----------
+// Go's archive/zip.NewWriter(w): the sink is a
+// GosIoWriter (no buffering in gostd; see D3).
+fn go_archive_zip_new_writer(w: GosIoWriter) -> GosZipWriter {
+    return GosZipWriter {
+        sink: w,
+        dir: Vec::new(),
+        last: GosZipWriterState {
+            header: go_archive_zip_file_header_new(),
+            offset: 0,
+            raw: false,
+            is_dir: false,
+            closed: false,
+            crc: (0 as u64),
+            raw_count: 0,
+            comp_count: 0,
+        },
+        last_open: false,
+        closed: false,
+        comment: Vec::new(),
+        count: 0,
+        used_zip64: false,
+        crc_tab: go_crc32_ieee_table(),
+    };
+}
+
+// Sink write with the byte count tracked (Go's
+// countWriter).
+fn __go_zip_writer_write_bytes(w: &GosZipWriter, p: Vec<u8>) -> GoIoResult {
+    let res = go_io_writer_write(&w.sink, p);
+    w.count = w.count + res.n;
+    return res;
+}
+
+// Go's writeHeader: the 30-byte local header plus
+// name, extra, and the zip64 extra when the sizes
+// are known (raw, no descriptor) and exceed 32 bits.
+fn __go_zip_writer_write_header(w: &GosZipWriter, h: GosZipFileHeader, is_raw: bool) -> ptr {
+    if len(h.name) > 65535 {
+        return __go_zip_err_long_name();
+    };
+    if len(h.extra) > 65535 {
+        return __go_zip_err_long_extra();
+    };
+    let no_desc = is_raw && (h.flags & GO_ZIP_FLAG_DESC) == (0 as u64);
+    let reader_version = h.reader_version;
+    let zip64_extra = Vec::new();
+    if no_desc && (h.compressed_size > GO_ZIP_U32MAX || h.uncompressed_size > GO_ZIP_U32MAX) {
+        if reader_version < GO_ZIP_VERSION_45 {
+            reader_version = GO_ZIP_VERSION_45;
+        };
+        __go_zip_put_u16(zip64_extra, GO_ZIP_EXTRA_ZIP64);
+        __go_zip_put_u16(zip64_extra, (16 as u64));
+        __go_zip_put_u64(zip64_extra, h.uncompressed_size);
+        __go_zip_put_u64(zip64_extra, h.compressed_size);
+    };
+    let buf = Vec::new();
+    __go_zip_put_u32(buf, GO_ZIP_SIG_LOCAL);
+    __go_zip_put_u16(buf, reader_version);
+    __go_zip_put_u16(buf, h.flags);
+    __go_zip_put_u16(buf, h.method);
+    __go_zip_put_u16(buf, h.modified_time);
+    __go_zip_put_u16(buf, h.modified_date);
+    if no_desc {
+        __go_zip_put_u32(buf, h.crc32);
+        if len(zip64_extra) > 0 {
+            __go_zip_put_u32(buf, GO_ZIP_U32MAX);
+            __go_zip_put_u32(buf, GO_ZIP_U32MAX);
+        } else {
+            __go_zip_put_u32(buf, h.compressed_size & GO_ZIP_U32MAX);
+            __go_zip_put_u32(buf, h.uncompressed_size & GO_ZIP_U32MAX);
+        };
+    } else {
+        __go_zip_put_u32(buf, (0 as u64));
+        __go_zip_put_u32(buf, (0 as u64));
+        __go_zip_put_u32(buf, (0 as u64));
+    };
+    __go_zip_put_u16(buf, len(h.name) as u64);
+    __go_zip_put_u16(buf, (len(h.extra) + len(zip64_extra)) as u64);
+    let res = __go_zip_writer_write_bytes(w, buf);
+    if !__go_zip_is_nil(res.err) {
+        return res.err;
+    };
+    let res2 = __go_zip_writer_write_bytes(w, h.name);
+    if !__go_zip_is_nil(res2.err) {
+        return res2.err;
+    };
+    let res3 = __go_zip_writer_write_bytes(w, h.extra);
+    if !__go_zip_is_nil(res3.err) {
+        return res3.err;
+    };
+    let res4 = __go_zip_writer_write_bytes(w, zip64_extra);
+    if !__go_zip_is_nil(res4.err) {
+        return res4.err;
+    };
+    return go_errors_nil();
+}
+
+// Go's (*fileWriter).writeDataDescriptor: the
+// 16-byte (or 24-byte zip64) descriptor after the
+// file data, when the 0x8 flag is set.
+fn __go_zip_writer_write_descriptor(w: &GosZipWriter, h: GosZipFileHeader) -> ptr {
+    if (h.flags & GO_ZIP_FLAG_DESC) == (0 as u64) {
+        return go_errors_nil();
+    };
+    let buf = Vec::new();
+    __go_zip_put_u32(buf, GO_ZIP_SIG_DATA_DESC);
+    __go_zip_put_u32(buf, h.crc32);
+    if h.compressed_size > GO_ZIP_U32MAX || h.uncompressed_size > GO_ZIP_U32MAX {
+        __go_zip_put_u64(buf, h.compressed_size);
+        __go_zip_put_u64(buf, h.uncompressed_size);
+    } else {
+        __go_zip_put_u32(buf, h.compressed_size & GO_ZIP_U32MAX);
+        __go_zip_put_u32(buf, h.uncompressed_size & GO_ZIP_U32MAX);
+    };
+    let res = __go_zip_writer_write_bytes(w, buf);
+    return res.err;
+}
+
+// Go's (*Writer).prepare: close the previous file.
+// (The duplicate-FileHeader pointer check is
+// skipped: Go compares pointers, unrepresentable
+// in SLA values.)
+fn __go_zip_writer_prepare(w: &GosZipWriter) -> ptr {
+    if w.last_open && !w.last.closed {
+        let err = go_archive_zip_writer_close_file(w);
+        if !__go_zip_is_nil(err) {
+            return err;
+        };
+    };
+    return go_errors_nil();
+}
+
+// Go's (*Writer).CreateHeader, with the UTF-8 flag,
+// version, Modified/ext-time, directory, and
+// compressor handling of the oracle.
+fn go_archive_zip_writer_create_header(w: &GosZipWriter, h_in: GosZipFileHeader) -> ptr {
+    let err = __go_zip_writer_prepare(w);
+    if !__go_zip_is_nil(err) {
+        return err;
+    };
+    let h = h_in;
+    let det1 = __go_zip_detect_utf8(h.name);
+    let det2 = __go_zip_detect_utf8(h.comment);
+    if h.non_utf8 {
+        h.flags = h.flags & ((0 as u64) - GO_ZIP_FLAG_UTF8 - 1);
+    } else if (det1.require || det2.require) && det1.valid && det2.valid {
+        h.flags = h.flags | GO_ZIP_FLAG_UTF8;
+    };
+    h.creator_version = (h.creator_version & (65280 as u64)) | GO_ZIP_VERSION_20;
+    h.reader_version = GO_ZIP_VERSION_20;
+    if h.modified_set {
+        let msdos = __go_zip_time_to_msdos(h.modified);
+        h.modified_date = msdos.date;
+        h.modified_time = msdos.time;
+        let unix = go_time_unix_sec(&h.modified);
+        __go_zip_put_u16(h.extra, GO_ZIP_EXTRA_EXT_TIME);
+        __go_zip_put_u16(h.extra, (5 as u64));
+        h.extra.push(1u8);
+        __go_zip_put_u32(h.extra, unix as u64);
+    };
+    if go_archive_zip_file_header_is_dir(h) {
+        h.method = GO_ZIP_METHOD_STORE;
+        h.flags = h.flags & ((0 as u64) - GO_ZIP_FLAG_DESC - 1);
+        h.compressed_size = (0 as u64);
+        h.uncompressed_size = (0 as u64);
+        h.crc32 = (0 as u64);
+        let off = w.count;
+        let herr = __go_zip_writer_write_header(w, h, false);
+        if !__go_zip_is_nil(herr) {
+            return herr;
+        };
+        w.last = GosZipWriterState {
+            header: h,
+            offset: off,
+            raw: false,
+            is_dir: true,
+            closed: false,
+            crc: (0 as u64),
+            raw_count: 0,
+            comp_count: 0,
+        };
+        w.last_open = true;
+        return go_errors_nil();
+    };
+    h.flags = h.flags | GO_ZIP_FLAG_DESC;
+    if h.method != GO_ZIP_METHOD_STORE {
+        return go_archive_zip_err_algorithm();
+    };
+    let off = w.count;
+    let herr = __go_zip_writer_write_header(w, h, false);
+    if !__go_zip_is_nil(herr) {
+        return herr;
+    };
+    w.last = GosZipWriterState {
+        header: h,
+        offset: off,
+        raw: false,
+        is_dir: false,
+        closed: false,
+        crc: (0 as u64),
+        raw_count: 0,
+        comp_count: 0,
+    };
+    w.last_open = true;
+    return go_errors_nil();
+}
+
+// Go's (*Writer).Create: defaults to Deflate in Go;
+// gostd defaults to Store instead (divergence D2b:
+// Deflate is unimplemented until compress/flate
+// lands, and a Create that always errors would make
+// the writer unusable).
+fn go_archive_zip_writer_create(w: &GosZipWriter, name: Vec<u8>) -> ptr {
+    let h = go_archive_zip_file_header_new();
+    h.name = name;
+    h.method = GO_ZIP_METHOD_STORE;
+    return go_archive_zip_writer_create_header(w, h);
+}
+
+// Go's (*Writer).CreateRaw: the header is used
+// as-is (no UTF-8/version/Modified handling, no
+// method check, no forced descriptor flag).
+fn go_archive_zip_writer_create_raw(w: &GosZipWriter, h_in: GosZipFileHeader) -> ptr {
+    let err = __go_zip_writer_prepare(w);
+    if !__go_zip_is_nil(err) {
+        return err;
+    };
+    let h = h_in;
+    let is_dir = go_archive_zip_file_header_is_dir(h);
+    let off = w.count;
+    let herr = __go_zip_writer_write_header(w, h, true);
+    if !__go_zip_is_nil(herr) {
+        return herr;
+    };
+    w.last = GosZipWriterState {
+        header: h,
+        offset: off,
+        raw: true,
+        is_dir: is_dir,
+        closed: false,
+        crc: (0 as u64),
+        raw_count: 0,
+        comp_count: 0,
+    };
+    w.last_open = true;
+    return go_errors_nil();
+}
+
+// Go's (*fileWriter).Write: CRC + counts for
+// streamed files, direct sink write for raw files,
+// "zip: write to closed file" when closed, "zip:
+// write to directory" for directory entries.
+fn go_archive_zip_writer_write(w: &GosZipWriter, p: Vec<u8>) -> GoIoResult {
+    if !w.last_open || w.last.closed {
+        return GoIoResult { n: 0, err: __go_zip_err_write_closed_file() };
+    };
+    if w.last.is_dir {
+        return GoIoResult { n: 0, err: __go_zip_err_write_dir() };
+    };
+    if w.last.raw {
+        return __go_zip_writer_write_bytes(w, p);
+    };
+    w.last.crc = go_crc32_update(w.last.crc, w.crc_tab, p);
+    let res = __go_zip_writer_write_bytes(w, p);
+    w.last.comp_count = w.last.comp_count + res.n;
+    w.last.raw_count = w.last.raw_count + res.n;
+    return res;
+}
+
+// Go's (*fileWriter).close: finalise the header
+// (CRC32, sizes, ReaderVersion 45 when zip64),
+// write the data descriptor, and record the
+// central-directory entry.
+fn go_archive_zip_writer_close_file(w: &GosZipWriter) -> ptr {
+    if !w.last_open {
+        return go_errors_nil();
+    };
+    if w.last.closed {
+        return __go_zip_err_file_closed_twice();
+    };
+    w.last.closed = true;
+    let h = w.last.header;
+    if w.last.is_dir {
+        let e = GosZipDirEntry { header: h, offset: w.last.offset };
+        w.dir.push(e);
+        w.last_open = false;
+        return go_errors_nil();
+    };
+    if !w.last.raw {
+        h.crc32 = w.last.crc;
+        h.compressed_size = w.last.comp_count as u64;
+        h.uncompressed_size = w.last.raw_count as u64;
+        if h.compressed_size > GO_ZIP_U32MAX || h.uncompressed_size > GO_ZIP_U32MAX {
+            if h.reader_version < GO_ZIP_VERSION_45 {
+                h.reader_version = GO_ZIP_VERSION_45;
+            };
+        };
+    };
+    let derr = __go_zip_writer_write_descriptor(w, h);
+    if !__go_zip_is_nil(derr) {
+        return derr;
+    };
+    let e = GosZipDirEntry { header: h, offset: w.last.offset };
+    w.dir.push(e);
+    w.last_open = false;
+    return go_errors_nil();
+}
+
+// ---------- Writer close ----------
+
+fn __go_zip_min_u64(a: u64, b: u64) -> u64 {
+    if a < b { return a; };
+    return b;
+}
+
+// Go's (*Writer).Close: close the last file, then
+// write the central directory, the zip64 EOCD +
+// locator when needed, and the EOCD record.
+fn go_archive_zip_writer_close(w: &GosZipWriter) -> ptr {
+    if w.last_open && !w.last.closed {
+        let err = go_archive_zip_writer_close_file(w);
+        if !__go_zip_is_nil(err) {
+            return err;
+        };
+    };
+    if w.closed {
+        return __go_zip_err_writer_closed();
+    };
+    w.closed = true;
+    let start = w.count;
+    let used_zip64 = false;
+    let i = 0;
+    while i < len(w.dir) {
+        let e = w.dir[i];
+        let h = e.header;
+        let off = e.offset;
+        let reader_version = h.reader_version;
+        let extra = go_bytes_clone(h.extra);
+        if h.compressed_size >= GO_ZIP_U32MAX || h.uncompressed_size >= GO_ZIP_U32MAX || (off as u64) >= GO_ZIP_U32MAX {
+            used_zip64 = true;
+            if reader_version < GO_ZIP_VERSION_45 {
+                reader_version = GO_ZIP_VERSION_45;
+            };
+            let field = Vec::new();
+            if h.uncompressed_size >= GO_ZIP_U32MAX {
+                __go_zip_put_u64(field, h.uncompressed_size);
+            };
+            if h.compressed_size >= GO_ZIP_U32MAX {
+                __go_zip_put_u64(field, h.compressed_size);
+            };
+            if (off as u64) >= GO_ZIP_U32MAX {
+                __go_zip_put_u64(field, off as u64);
+            };
+            __go_zip_put_u16(extra, GO_ZIP_EXTRA_ZIP64);
+            __go_zip_put_u16(extra, len(field) as u64);
+            __go_zip_append(extra, field);
+        };
+        let buf = Vec::new();
+        __go_zip_put_u32(buf, GO_ZIP_SIG_CENTRAL);
+        __go_zip_put_u16(buf, h.creator_version);
+        __go_zip_put_u16(buf, reader_version);
+        __go_zip_put_u16(buf, h.flags);
+        __go_zip_put_u16(buf, h.method);
+        __go_zip_put_u16(buf, h.modified_time);
+        __go_zip_put_u16(buf, h.modified_date);
+        __go_zip_put_u32(buf, h.crc32);
+        __go_zip_put_u32(buf, __go_zip_min_u64(h.compressed_size, GO_ZIP_U32MAX));
+        __go_zip_put_u32(buf, __go_zip_min_u64(h.uncompressed_size, GO_ZIP_U32MAX));
+        __go_zip_put_u16(buf, len(h.name) as u64);
+        __go_zip_put_u16(buf, len(extra) as u64);
+        __go_zip_put_u16(buf, len(h.comment) as u64);
+        __go_zip_put_u16(buf, (0 as u64));
+        __go_zip_put_u16(buf, (0 as u64));
+        __go_zip_put_u32(buf, h.external_attrs);
+        __go_zip_put_u32(buf, __go_zip_min_u64(off as u64, GO_ZIP_U32MAX));
+        let res = __go_zip_writer_write_bytes(w, buf);
+        if !__go_zip_is_nil(res.err) {
+            return res.err;
+        };
+        let res2 = __go_zip_writer_write_bytes(w, h.name);
+        if !__go_zip_is_nil(res2.err) {
+            return res2.err;
+        };
+        let res3 = __go_zip_writer_write_bytes(w, extra);
+        if !__go_zip_is_nil(res3.err) {
+            return res3.err;
+        };
+        let res4 = __go_zip_writer_write_bytes(w, h.comment);
+        if !__go_zip_is_nil(res4.err) {
+            return res4.err;
+        };
+        i = i + 1;
+    }
+    let end = w.count;
+    let records = len(w.dir) as u64;
+    let size = (end - start) as u64;
+    let offset = start as u64;
+    if used_zip64 || records >= GO_ZIP_U16MAX || size >= GO_ZIP_U32MAX || offset >= GO_ZIP_U32MAX {
+        w.used_zip64 = true;
+        let zip64_off = w.count;
+        let buf = Vec::new();
+        __go_zip_put_u32(buf, GO_ZIP_SIG_ZIP64_EOCD);
+        __go_zip_put_u64(buf, (44 as u64));
+        __go_zip_put_u16(buf, GO_ZIP_VERSION_45);
+        __go_zip_put_u16(buf, GO_ZIP_VERSION_45);
+        __go_zip_put_u32(buf, (0 as u64));
+        __go_zip_put_u32(buf, (0 as u64));
+        __go_zip_put_u64(buf, records);
+        __go_zip_put_u64(buf, records);
+        __go_zip_put_u64(buf, size);
+        __go_zip_put_u64(buf, offset);
+        __go_zip_put_u32(buf, GO_ZIP_SIG_ZIP64_LOCATOR);
+        __go_zip_put_u32(buf, (0 as u64));
+        __go_zip_put_u64(buf, zip64_off as u64);
+        __go_zip_put_u32(buf, (1 as u64));
+        let res = __go_zip_writer_write_bytes(w, buf);
+        if !__go_zip_is_nil(res.err) {
+            return res.err;
+        };
+    };
+    let buf = Vec::new();
+    __go_zip_put_u32(buf, GO_ZIP_SIG_EOCD);
+    __go_zip_put_u16(buf, (0 as u64));
+    __go_zip_put_u16(buf, (0 as u64));
+    __go_zip_put_u16(buf, __go_zip_min_u64(records, GO_ZIP_U16MAX));
+    __go_zip_put_u16(buf, __go_zip_min_u64(records, GO_ZIP_U16MAX));
+    __go_zip_put_u32(buf, __go_zip_min_u64(size, GO_ZIP_U32MAX));
+    __go_zip_put_u32(buf, __go_zip_min_u64(offset, GO_ZIP_U32MAX));
+    __go_zip_put_u16(buf, len(w.comment) as u64);
+    let res = __go_zip_writer_write_bytes(w, buf);
+    if !__go_zip_is_nil(res.err) {
+        return res.err;
+    };
+    let comment = w.comment;
+    let res2 = __go_zip_writer_write_bytes(w, comment);
+    if !__go_zip_is_nil(res2.err) {
+        return res2.err;
+    };
+    return go_errors_nil();
+}
+
+// Go's (*Writer).SetOffset: panics 77453 when data
+// has already been written ("zip: SetOffset called
+// after data was written").
+fn go_archive_zip_writer_set_offset(w: &GosZipWriter, n: i64) -> void {
+    if w.count != 0 {
+        panic(77453);
+    };
+    w.count = n;
+    return;
+}
+
+// Go's (*Writer).Flush flushes a bufio.Writer;
+// GosIoWriter has no buffering, so this is a no-op
+// returning nil (divergence D3).
+fn go_archive_zip_writer_flush(w: &GosZipWriter) -> ptr {
+    return go_errors_nil();
+}
+
+// Go's (*Writer).SetComment.
+fn go_archive_zip_writer_set_comment(w: &GosZipWriter, comment: Vec<u8>) -> ptr {
+    if len(comment) > 65535 {
+        return __go_zip_err_comment_too_long();
+    };
+    w.comment = go_bytes_clone(comment);
+    return go_errors_nil();
+}
+
+// Go's (*Writer).Copy: raw-copy one file from a
+// reader into this writer (OpenRaw + CreateRaw +
+// chunked copy). Does NOT close the file; the next
+// Create/Close does that, as in Go.
+fn go_archive_zip_writer_copy(w: &GosZipWriter, r: GosZipReader, f: GosZipFile) -> ptr {
+    let raw_res = go_archive_zip_file_open_raw(r, f);
+    if !__go_zip_is_nil(raw_res.err) {
+        return raw_res.err;
+    };
+    let rr = raw_res.reader;
+    let err = go_archive_zip_writer_create_raw(w, f.header);
+    if !__go_zip_is_nil(err) {
+        return err;
+    };
+    let done = false;
+    while !done {
+        let chunk = Vec::new();
+        let res = go_archive_zip_raw_reader_read(&rr, &chunk, 32768);
+        if res.n > 0 {
+            let wres = go_archive_zip_writer_write(w, chunk);
+            if !__go_zip_is_nil(wres.err) {
+                return wres.err;
+            };
+        };
+        if __go_zip_is_eof(res.err) {
+            done = true;
+            break;
+        };
+        if !__go_zip_is_nil(res.err) {
+            return res.err;
+        };
+    }
+    return go_errors_nil();
+}
+
+// ---------- Corpus example ----------
+// go_archive_zip_demo_roundtrip writes a three-file
+// Store archive (a file, a directory, a file with a
+// SetModTime header) into an in-memory multi-writer
+// sink, reads it back, verifies names, contents,
+// the directory flag, the comment, the ModTime, and
+// the CRC (checked at EOF by the file reader), then
+// exercises Writer.Copy into a second archive.
+// Returns true when every check holds.
+fn go_archive_zip_demo_roundtrip() -> bool {
+    let sink1 = Vec::new();
+    let sinks1 = Vec::new();
+    sinks1.push(sink1);
+    let iw1 = go_io_writer_from_multi(go_io_multi_writer(sinks1));
+    let w1 = go_archive_zip_new_writer(iw1);
+    let comment = Vec::new();
+    comment.push(104u8);
+    comment.push(105u8);
+    if !__go_zip_is_nil(go_archive_zip_writer_set_comment(&w1, comment)) {
+        return false;
+    };
+    let name1 = Vec::new();
+    name1.push(104u8);
+    name1.push(101u8);
+    name1.push(108u8);
+    name1.push(108u8);
+    name1.push(111u8);
+    name1.push(46u8);
+    name1.push(116u8);
+    name1.push(120u8);
+    name1.push(116u8);
+    if !__go_zip_is_nil(go_archive_zip_writer_create(&w1, name1)) {
+        return false;
+    };
+    let data1 = Vec::new();
+    data1.push(104u8);
+    data1.push(101u8);
+    data1.push(108u8);
+    data1.push(108u8);
+    data1.push(111u8);
+    let wr = go_archive_zip_writer_write(&w1, data1);
+    if !__go_zip_is_nil(wr.err) || wr.n != 5 {
+        return false;
+    };
+    if !__go_zip_is_nil(go_archive_zip_writer_close_file(&w1)) {
+        return false;
+    };
+    let dirname = Vec::new();
+    dirname.push(100u8);
+    dirname.push(105u8);
+    dirname.push(114u8);
+    dirname.push(47u8);
+    if !__go_zip_is_nil(go_archive_zip_writer_create(&w1, dirname)) {
+        return false;
+    };
+    if !__go_zip_is_nil(go_archive_zip_writer_close_file(&w1)) {
+        return false;
+    };
+    let name2 = Vec::new();
+    name2.push(115u8);
+    name2.push(101u8);
+    name2.push(99u8);
+    name2.push(111u8);
+    name2.push(110u8);
+    name2.push(100u8);
+    name2.push(46u8);
+    name2.push(98u8);
+    name2.push(105u8);
+    name2.push(110u8);
+    let h2 = go_archive_zip_file_header_new();
+    h2.name = go_bytes_clone(name2);
+    h2.method = GO_ZIP_METHOD_STORE;
+    h2 = go_archive_zip_file_header_set_mod_time(h2, go_time_unix(1700000000, 0));
+    if !__go_zip_is_nil(go_archive_zip_writer_create_header(&w1, h2)) {
+        return false;
+    };
+    let data2 = Vec::new();
+    let k = 0;
+    while k < 10 {
+        data2.push(k as u8);
+        k = k + 1;
+    }
+    let wr2 = go_archive_zip_writer_write(&w1, data2);
+    if !__go_zip_is_nil(wr2.err) || wr2.n != 10 {
+        return false;
+    };
+    if !__go_zip_is_nil(go_archive_zip_writer_close_file(&w1)) {
+        return false;
+    };
+    if !__go_zip_is_nil(go_archive_zip_writer_close(&w1)) {
+        return false;
+    };
+    let archive = sinks1[0];
+    let rr1 = go_archive_zip_new_reader(archive);
+    if !__go_zip_is_nil(rr1.err) {
+        return false;
+    };
+    let r1 = rr1.reader;
+    if go_archive_zip_reader_file_count(r1) != 3 {
+        return false;
+    };
+    if !go_bytes_equal(go_archive_zip_reader_comment(r1), comment) {
+        return false;
+    };
+    let f0 = go_archive_zip_reader_get(r1, 0);
+    if go_archive_zip_file_is_dir(f0) {
+        return false;
+    };
+    if !go_bytes_equal(go_archive_zip_file_name(f0), name1) {
+        return false;
+    };
+    let open0 = go_archive_zip_file_open(r1, f0);
+    if !__go_zip_is_nil(open0.err) {
+        return false;
+    };
+    let fr0 = open0.reader;
+    let got1 = Vec::new();
+    let rd1 = go_archive_zip_file_reader_read(&fr0, &got1, 100);
+    if !__go_zip_is_nil(rd1.err) || rd1.n != 5 {
+        return false;
+    };
+    if !go_bytes_equal(got1, data1) {
+        return false;
+    };
+    let rd1b = go_archive_zip_file_reader_read(&fr0, &got1, 100);
+    if !__go_zip_is_eof(rd1b.err) {
+        return false;
+    };
+    let f1 = go_archive_zip_reader_get(r1, 1);
+    if !go_archive_zip_file_is_dir(f1) {
+        return false;
+    };
+    let open1 = go_archive_zip_file_open(r1, f1);
+    if !__go_zip_is_nil(open1.err) {
+        return false;
+    };
+    let fr1 = open1.reader;
+    let gotd = Vec::new();
+    let rdd = go_archive_zip_file_reader_read(&fr1, &gotd, 100);
+    if !__go_zip_is_eof(rdd.err) || rdd.n != 0 {
+        return false;
+    };
+    let f2 = go_archive_zip_reader_get(r1, 2);
+    if !go_bytes_equal(go_archive_zip_file_name(f2), name2) {
+        return false;
+    };
+    if go_time_unix_sec(&f2.header.modified) != 1700000000 {
+        return false;
+    };
+    let open2 = go_archive_zip_file_open_raw(r1, f2);
+    if !__go_zip_is_nil(open2.err) {
+        return false;
+    };
+    let raw2 = open2.reader;
+    let got2 = Vec::new();
+    let rd2 = go_archive_zip_raw_reader_read(&raw2, &got2, 100);
+    if !__go_zip_is_nil(rd2.err) || rd2.n != 10 {
+        return false;
+    };
+    if !go_bytes_equal(got2, data2) {
+        return false;
+    };
+    let sink2 = Vec::new();
+    let sinks2 = Vec::new();
+    sinks2.push(sink2);
+    let iw2 = go_io_writer_from_multi(go_io_multi_writer(sinks2));
+    let w2 = go_archive_zip_new_writer(iw2);
+    if !__go_zip_is_nil(go_archive_zip_writer_copy(&w2, r1, f0)) {
+        return false;
+    };
+    if !__go_zip_is_nil(go_archive_zip_writer_close(&w2)) {
+        return false;
+    };
+    let rr2 = go_archive_zip_new_reader(sinks2[0]);
+    if !__go_zip_is_nil(rr2.err) {
+        return false;
+    };
+    let r2 = rr2.reader;
+    if go_archive_zip_reader_file_count(r2) != 1 {
+        return false;
+    };
+    let cf0 = go_archive_zip_reader_get(r2, 0);
+    let copen = go_archive_zip_file_open(r2, cf0);
+    if !__go_zip_is_nil(copen.err) {
+        return false;
+    };
+    let cfr = copen.reader;
+    let cgot = Vec::new();
+    let crd = go_archive_zip_file_reader_read(&cfr, &cgot, 100);
+    if !__go_zip_is_nil(crd.err) || crd.n != 5 {
+        return false;
+    };
+    if !go_bytes_equal(cgot, data1) {
+        return false;
+    };
+    return true;
+}
